@@ -1,0 +1,59 @@
+# ────────────────────────────────────────────────────────────
+# MOAXY — Example Configuration
+# ────────────────────────────────────────────────────────────
+# Copy this file to config.yaml and customize for your environment.
+#
+# Quick start:
+#   1. cp config.example.yaml config.yaml
+#   2. python -m moaxy --config config.yaml
+#
+# All values support ${ENV_VAR} substitution (e.g. "${OPENAI_API_KEY}").
+
+# ── Server ─────────────────────────────────────────────────
+listen: "0.0.0.0"
+port: 8000
+log_level: "info"
+
+# ── Backends ────────────────────────────────────────────────
+# Define each upstream API provider here.
+backends:
+  - name: "ollama-local"
+    adapter: "ollama"
+    base_url: "http://localhost:11434"
+    timeout: 30.0
+
+  # - name: "openai"
+  #   adapter: "openai"
+  #   base_url: "https://api.openai.com/v1"
+  #   api_key: "${OPENAI_API_KEY}"
+  #   timeout: 30.0
+
+# ── Routes ──────────────────────────────────────────────────
+# The first matching route wins. Evaluated top-to-bottom.
+routes:
+  - name: "catch-all"
+    match:
+      model: "*"
+      path: "/*"
+    strategy: "single"
+    backend: "ollama-local"
+
+# ── Plugins ─────────────────────────────────────────────────
+# plugins:
+#   - name: "demo-router"
+#     path: ""
+#     config:
+#       module: "plugins.demo_router.plugin"
+#       class: "DemoRouter"
+#   - name: "demo-transformer"
+#     path: ""
+#     config:
+#       module: "plugins.demo_transformer.plugin"
+#       class: "DemoTransformer"
+
+# ── Auth ────────────────────────────────────────────────────
+# auth:
+#   enabled: false
+#   exempt_paths:
+#     - "/health"
+#   admin_key: "${MOA_ADMIN_API_KEY}"
