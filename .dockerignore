@@ -11,3 +11,6 @@ tests
 .env
 Dockerfile
 .dockerignore
+my.ini
+ruff.toml
+*.egg-info

@@ -1,11 +1,13 @@
+# Stage 1 — Builder
 FROM python:3.12-slim AS builder
 
 WORKDIR /app
 COPY pyproject.toml ./
+COPY README.md ./
 COPY src/ ./src/
-COPY plugins/ ./plugins/
 RUN pip install --no-cache-dir .
 
+# Stage 2 — Runtime
 FROM python:3.12-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl && \
@@ -22,6 +24,6 @@ USER moaxy
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "from moaxy import __version__" || exit 1
+    CMD curl -sf http://localhost:8000/health || exit 1
 
-CMD ["python", "-c", "from moaxy.plugins import base, discovery, manager, types; print('moaxy ready')"]
+CMD ["python", "-c", "import moaxy; print(f'moaxy v{moaxy.__version__} ready')"]
