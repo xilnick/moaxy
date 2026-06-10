@@ -14,8 +14,12 @@ every piece of state the orchestrator needs to dispatch a request:
 * ``resolved_model`` — the alias-resolved real model name. If the request
   model is in the route's ``aliases`` map, the value is rewritten; if not,
   the original model is passed through unchanged. A miss never raises.
-* ``backend`` — the route's configured backend name; looked up in
-  :class:`~moaxy.adapters.registry.AdapterRegistry`.
+* ``backend`` — the route's selected backend name, looked up in
+  :class:`~moaxy.adapters.registry.AdapterRegistry`. For a single-backend
+  route (``strategy: single``) this is the route's ``backend`` field.
+  For a multi-backend route (``strategy: weighted`` or
+  ``strategy: round_robin``) this is the name selected from
+  ``route.backends`` by the per-route backend selector.
 * ``reflection``, ``advisor``, ``aliases`` — copied verbatim from the
   matched route's :class:`RouteConfig`.
 * ``fallbacks`` and ``retry`` — the **effective** values after applying
@@ -56,6 +60,7 @@ need to distinguish between the two.
 
 from __future__ import annotations
 
+import random
 from collections.abc import Mapping
 from dataclasses import dataclass
 from fnmatch import fnmatch
@@ -89,7 +94,16 @@ class RouteMatch:
     """The alias-resolved real model name (e.g. ``"minimax-m3:cloud"``)."""
 
     backend: str | None
-    """The route's configured backend name, or ``None`` for multi-backend routes."""
+    """The route's selected backend name, or ``None`` when no backend is configured.
+
+    For ``strategy: single`` routes, this is the route's ``backend``
+    field verbatim. For ``strategy: weighted`` and
+    ``strategy: round_robin`` routes, this is the name selected from
+    ``route.backends`` by the matcher's per-route selector. The
+    selector's state lives on the matcher; the value is captured here
+    so the orchestrator and HTTP handler see a stable string for the
+    lifetime of the request.
+    """
 
     path: str
     """The request path the matcher evaluated."""
@@ -147,7 +161,12 @@ class RouteMatcher:
     request are ignored.
     """
 
-    def __init__(self, config: MoaxyConfig | Mapping[str, Any] | list[RouteConfig]) -> None:
+    def __init__(
+        self,
+        config: MoaxyConfig | Mapping[str, Any] | list[RouteConfig],
+        *,
+        random_seed: int | None = None,
+    ) -> None:
         """Build a matcher from a config object, a config-like mapping, or a route list.
 
         Args:
@@ -167,6 +186,12 @@ class RouteMatcher:
                   lowest-level form, used by tests that already have a
                   route list. No ``models`` defaults are available;
                   the matcher uses each route's own fields as-is.
+            random_seed: Optional seed for the internal
+                :class:`random.Random` instance used by the
+                ``weighted`` strategy. When set, weighted selection is
+                deterministic across processes (useful for tests and
+                for reproducible load distribution). When omitted, the
+                matcher uses the platform-default random source.
         """
         if isinstance(config, list):
             self._routes: list[RouteConfig] = list(config)
@@ -188,6 +213,8 @@ class RouteMatcher:
                 "RouteMatcher expects a MoaxyConfig, a mapping with a 'routes' key, "
                 f"or a list of RouteConfig; got {type(config).__name__}"
             )
+        self._selectors: dict[str, _BackendSelector] = {}
+        self._random_seed = random_seed
 
     @property
     def routes(self) -> list[RouteConfig]:
@@ -211,6 +238,11 @@ class RouteMatcher:
         is enforced here for runtime CRUD). The caller is expected to
         catch the exception and translate it into the appropriate
         HTTP error envelope.
+
+        A fresh :class:`_BackendSelector` is created for the new route
+        with its own round-robin counter and weighted-selection state.
+        Existing routes' selectors are untouched, so the round-robin
+        cycle and weighted distribution continue uninterrupted.
         """
         if any(existing.name == route.name for existing in self._routes):
             raise ValueError(
@@ -218,6 +250,9 @@ class RouteMatcher:
                 "or remove the existing route first"
             )
         self._routes.append(route)
+        self._selectors[route.name] = _BackendSelector(
+            route, random_seed=self._random_seed
+        )
 
     def remove_route(self, name: str) -> bool:
         """Remove a route by name.
@@ -226,10 +261,15 @@ class RouteMatcher:
         and removed; ``False`` when no such route exists. The matcher
         performs a linear scan; routes are small (typically < 100
         entries), so the cost is negligible.
+
+        The route's per-route :class:`_BackendSelector` is dropped
+        along with the route. Adding a new route with the same name
+        later starts a fresh selection cycle.
         """
         for index, existing in enumerate(self._routes):
             if existing.name == name:
                 del self._routes[index]
+                self._selectors.pop(name, None)
                 return True
         return False
 
@@ -244,6 +284,16 @@ class RouteMatcher:
 
         Alias resolution happens at match time, not at construction time,
         so the matcher always reflects the routes' current alias table.
+
+        For a matched route, the returned :class:`RouteMatch`'s
+        ``backend`` field is the name selected by the route's per-route
+        :class:`_BackendSelector`:
+
+        * ``strategy: single`` → ``route.backend`` (a single string).
+        * ``strategy: weighted`` → a backend picked at random from
+          ``route.backends``, proportional to each entry's ``weight``.
+        * ``strategy: round_robin`` → the next entry in ``route.backends``
+          in order, advancing the route's round-robin counter.
 
         Args:
             request: A mapping with at least ``"model"`` and ``"path"``
@@ -262,11 +312,17 @@ class RouteMatcher:
         for route in self._routes:
             if not self._route_matches(route, model=model, path=path):
                 continue
+            selector = self._selectors.get(route.name)
+            if selector is None:
+                selector = _BackendSelector(route, random_seed=self._random_seed)
+                self._selectors[route.name] = selector
+            selected_backend = selector.select()
             return self._build_route_match(
                 route,
                 original_model=model,
                 path=path,
                 models_defaults=self._models_defaults,
+                selected_backend=selected_backend,
             )
         return None
 
@@ -289,6 +345,7 @@ class RouteMatcher:
         original_model: str,
         path: str,
         models_defaults: ModelDefaults,
+        selected_backend: str | None,
     ) -> RouteMatch:
         resolved_model = route.aliases.get(original_model, original_model)
         effective_fallbacks = _resolve_fallbacks(
@@ -301,7 +358,7 @@ class RouteMatcher:
             route=route,
             original_model=original_model,
             resolved_model=resolved_model,
-            backend=route.backend,
+            backend=selected_backend,
             path=path,
             reflection=route.reflection,
             advisor=route.advisor,
@@ -375,6 +432,104 @@ def _resolve_retry(
     if "retry" in route.model_fields_set:
         return int(route.retry)
     return int(models_defaults.retry.get(resolved_model, 0))
+
+
+class _BackendSelector:
+    """Per-route backend selection state for the multi-backend strategies.
+
+    A :class:`RouteMatcher` owns one :class:`_BackendSelector` per
+    :class:`RouteConfig`. The selector encapsulates the per-route
+    state required by the ``weighted`` and ``round_robin`` strategies
+    (a private :class:`random.Random` instance and a round-robin
+    counter, respectively) and exposes a single :meth:`select` method
+    that returns the backend name to use for the next match.
+
+    The selector is intentionally NOT re-entrant safe across
+    concurrent coroutines: Python's GIL makes each individual
+    statement atomic, but a single round-robin ``select()`` is a
+    short read-modify-write sequence. The moaxy data plane is
+    structured as one :class:`RouteMatcher` per process and the
+    per-route counter is shared across all requests that match the
+    route. A worst-case race only causes occasional repeated
+    selection of the same backend, which is benign for load
+    distribution. Callers that need strict per-request
+    determinism can construct a fresh matcher per request.
+    """
+
+    def __init__(
+        self,
+        route: RouteConfig,
+        *,
+        random_seed: int | None = None,
+    ) -> None:
+        self._route = route
+        self._random = random.Random(random_seed)
+        self._round_robin_index = 0
+
+    def select(self) -> str | None:
+        """Return the backend name to use for the next match.
+
+        The selection algorithm depends on the route's ``strategy``:
+
+        * ``single`` — returns ``route.backend`` (which may be
+          ``None`` if the route has no single backend configured).
+        * ``weighted`` — picks one entry of ``route.backends`` at
+          random, with probability proportional to each entry's
+          ``weight``. Degenerate inputs (empty ``backends`` or all
+          zero weights) fall back to ``route.backend`` or the first
+          entry's name, respectively, so the selector never crashes
+          on malformed routes.
+        * ``round_robin`` — returns the next entry of ``route.backends``
+          in order, wrapping around at the end. The internal counter
+          advances by one on every call. An empty ``backends`` list
+          falls back to ``route.backend``.
+
+        The round-robin counter is process-local; it is not shared
+        across processes. Multi-process deployments will distribute
+        independently from each other, which is the desired
+        behaviour for a stateless proxy.
+        """
+        strategy = self._route.strategy
+        if strategy == "weighted":
+            return self._select_weighted()
+        if strategy == "round_robin":
+            return self._select_round_robin()
+        # ``single`` and any future strategy: defer to the route's
+        # configured single backend. This is the historical default.
+        return self._route.backend
+
+    def _select_weighted(self) -> str | None:
+        backends = self._route.backends
+        if not backends:
+            return self._route.backend
+        total_weight = sum(ref.weight for ref in backends)
+        if total_weight <= 0:
+            # All weights are zero (or the only entry has weight 0).
+            # The selection is undefined; degrade to the first
+            # backend so the call site still gets a usable name
+            # rather than ``None``. The route's ``backends`` list
+            # was already validated by Pydantic to have at least
+            # one entry by the time we get here, so this fallback
+            # is always safe.
+            return backends[0].name
+        target = self._random.uniform(0.0, total_weight)
+        cumulative = 0.0
+        for ref in backends:
+            cumulative += ref.weight
+            if target < cumulative:
+                return ref.name
+        # Floating-point edge: target == total_weight (the loop's
+        # last strict-less-than check failed). Return the last
+        # entry's name to keep the selection well-defined.
+        return backends[-1].name
+
+    def _select_round_robin(self) -> str | None:
+        backends = self._route.backends
+        if not backends:
+            return self._route.backend
+        index = self._round_robin_index % len(backends)
+        self._round_robin_index += 1
+        return backends[index].name
 
 
 __all__ = ["RouteMatch", "RouteMatcher"]

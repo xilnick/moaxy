@@ -15,6 +15,7 @@ import pytest
 from moaxy.models.config import (
     AdapterConfig,
     AdvisorConfig,
+    BackendRef,
     MoaxyConfig,
     ModelDefaults,
     ReflectionConfig,
@@ -41,6 +42,8 @@ def _route(
     model_pattern: str = "*",
     path_pattern: str = "/v1/chat/completions",
     backend: str | None = "olloma-local",
+    strategy: str = "single",
+    backends: list[BackendRef] | None = None,
     aliases: dict[str, str] | None = None,
     fallbacks: list[str] | None = None,
     retry: int = 0,
@@ -51,7 +54,9 @@ def _route(
     return RouteConfig(
         name=name,
         match=ConfigRouteMatch(model=model_pattern, path=path_pattern),
+        strategy=strategy,  # type: ignore[arg-type]
         backend=backend,
+        backends=backends or [],
         aliases=aliases or {},
         fallbacks=fallbacks or [],
         retry=retry,
@@ -60,9 +65,19 @@ def _route(
     )
 
 
-def _config(*routes: RouteConfig) -> MoaxyConfig:
-    """Wrap a list of routes in a :class:`MoaxyConfig` with a single backend."""
-    return MoaxyConfig(backends=[_backend()], routes=list(routes))
+def _config(*routes: RouteConfig, backends: list[AdapterConfig] | None = None) -> MoaxyConfig:
+    """Wrap a list of routes in a :class:`MoaxyConfig` with a single backend by default.
+
+    Args:
+        routes: The route list.
+        backends: Optional list of :class:`AdapterConfig`. When
+            omitted, a single backend named ``"olloma-local"`` is
+            used. The default is fine for single-backend routes; the
+            multi-backend strategy tests pass an explicit list.
+    """
+    if backends is None:
+        backends = [_backend()]
+    return MoaxyConfig(backends=backends, routes=list(routes))
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -886,6 +901,612 @@ class TestModelsFallbacksNotReAliased:
             "minimax-m2.7:cloud",
             "deepseek-v4-pro:cloud",
         ]
+
+
+# ────────────────────────────────────────────────────────────────────
+# Backend selection strategies (single / weighted / round_robin)
+# M4: implement weighted and round_robin strategies.
+# ────────────────────────────────────────────────────────────────────
+
+
+def _multi_backend_config(
+    *routes: RouteConfig,
+    backend_names: list[str] | None = None,
+) -> MoaxyConfig:
+    """Build a config with several named backends for the multi-backend tests.
+
+    The default backend set is ``["b1", "b2", "b3"]``; the tests
+    override this when they need a different number of backends.
+    The single helper exists so the test code can be terse: it
+    always builds a valid :class:`MoaxyConfig` that the routes can
+    reference.
+    """
+    names = backend_names or ["b1", "b2", "b3"]
+    backends = [
+        AdapterConfig(
+            name=name, adapter="ollama", base_url=f"http://127.0.0.1:9{idx}"
+        )
+        for idx, name in enumerate(names)
+    ]
+    return MoaxyConfig(backends=backends, routes=list(routes))
+
+
+# ────────────────────────────────────────────────────────────────────
+# VAL-M4 (single): single strategy uses route.backend
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestSingleStrategy:
+    """``strategy: single`` returns the route's ``backend`` field."""
+
+    def test_single_strategy_returns_route_backend(self):
+        route = _route(
+            name="r",
+            strategy="single",
+            backend="olloma-local",
+            backends=[],  # no multi-backend entries
+        )
+        cfg = _config(route)
+        matcher = RouteMatcher(cfg)
+        result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+        assert result is not None
+        assert result.backend == "olloma-local"
+
+    def test_single_strategy_does_not_consult_backends_list(self):
+        """Even if ``backends`` is populated, ``single`` ignores it.
+
+        This codifies the contract that ``strategy: single`` is the
+        historical default and is orthogonal to the multi-backend
+        strategies: a route may have a populated ``backends`` list
+        for documentation or future use, and ``single`` still picks
+        the ``backend`` field.
+        """
+        route = _route(
+            name="r",
+            strategy="single",
+            backend="primary-backend",
+            backends=[
+                BackendRef(name="extra-1", weight=1),
+                BackendRef(name="extra-2", weight=1),
+            ],
+        )
+        cfg = _multi_backend_config(
+            route, backend_names=["primary-backend", "extra-1", "extra-2"]
+        )
+        matcher = RouteMatcher(cfg)
+        result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+        assert result is not None
+        assert result.backend == "primary-backend"
+
+    def test_single_strategy_is_default(self):
+        """A route that does not declare a strategy defaults to ``single``."""
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+            backend="olloma-local",
+        )
+        cfg = _config(route)
+        matcher = RouteMatcher(cfg)
+        result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+        assert result is not None
+        assert result.backend == "olloma-local"
+
+    def test_single_strategy_with_no_backend(self):
+        """A ``single`` route with no ``backend`` set yields ``None``."""
+        route = _route(name="r", strategy="single", backend=None)
+        cfg = _config(route)
+        matcher = RouteMatcher(cfg)
+        result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+        assert result is not None
+        assert result.backend is None
+
+    def test_single_strategy_is_stable_across_calls(self):
+        """Repeated matches return the same backend name."""
+        route = _route(name="r", strategy="single", backend="olloma-local")
+        cfg = _config(route)
+        matcher = RouteMatcher(cfg)
+        for _ in range(10):
+            result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+            assert result is not None
+            assert result.backend == "olloma-local"
+
+
+# ────────────────────────────────────────────────────────────────────
+# VAL-M4 (weighted): random selection proportional to weight
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestWeightedStrategy:
+    """``strategy: weighted`` returns a random backend from ``route.backends``."""
+
+    def test_weighted_strategy_returns_one_of_route_backends(self):
+        route = _route(
+            name="r",
+            strategy="weighted",
+            backend=None,
+            backends=[
+                BackendRef(name="b1", weight=1),
+                BackendRef(name="b2", weight=1),
+                BackendRef(name="b3", weight=1),
+            ],
+        )
+        cfg = _multi_backend_config(route)
+        matcher = RouteMatcher(cfg, random_seed=42)
+        result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+        assert result is not None
+        assert result.backend in {"b1", "b2", "b3"}
+
+    def test_weighted_strategy_with_seeded_random_is_deterministic(self):
+        """A fixed seed makes weighted selection reproducible."""
+        route = _route(
+            name="r",
+            strategy="weighted",
+            backend=None,
+            backends=[
+                BackendRef(name="b1", weight=1),
+                BackendRef(name="b2", weight=1),
+            ],
+        )
+        cfg = _multi_backend_config(route, backend_names=["b1", "b2"])
+        matcher1 = RouteMatcher(cfg, random_seed=123)
+        matcher2 = RouteMatcher(cfg, random_seed=123)
+        # Run several calls; the sequences must match across the
+        # two matchers because they share the same seed.
+        seq1 = [
+            matcher1.match({"model": "m", "path": "/v1/chat/completions"}).backend
+            for _ in range(20)
+        ]
+        seq2 = [
+            matcher2.match({"model": "m", "path": "/v1/chat/completions"}).backend
+            for _ in range(20)
+        ]
+        assert seq1 == seq2
+
+    def test_weighted_distribution_matches_weights_statistically(self):
+        """Over many trials, the observed distribution approximates the weights.
+
+        We use 3 backends with weights 1, 2, 3 (so the expected
+        fractions are 1/6, 2/6, 3/6 = ~0.167, ~0.333, ~0.500). With
+        6,000 trials, the standard error on each proportion is
+        below 0.01; we assert the observed fractions are within
+        0.02 of the expected values, leaving a wide margin to
+        keep the test robust to normal RNG behaviour.
+        """
+        weights = [1, 2, 3]
+        names = ["b1", "b2", "b3"]
+        route = _route(
+            name="r",
+            strategy="weighted",
+            backend=None,
+            backends=[
+                BackendRef(name=n, weight=w) for n, w in zip(names, weights, strict=True)
+            ],
+        )
+        cfg = _multi_backend_config(route)
+        matcher = RouteMatcher(cfg, random_seed=20240610)
+        trials = 6000
+        counts: dict[str, int] = {n: 0 for n in names}
+        for _ in range(trials):
+            result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+            assert result is not None
+            counts[result.backend] += 1
+        total_weight = sum(weights)
+        for n, w in zip(names, weights, strict=True):
+            expected = w / total_weight
+            observed = counts[n] / trials
+            assert abs(observed - expected) < 0.02, (
+                f"weight for {n!r} (={w}) expected ~{expected:.3f}, "
+                f"observed {observed:.3f} over {trials} trials"
+            )
+
+    def test_weighted_strategy_does_not_select_backends_with_zero_weight(self):
+        """A backend with weight 0 should be effectively never selected.
+
+        With weights [0, 1, 1] over 2000 trials, the zero-weight
+        backend should be selected 0 times (the uniform draw falls
+        into the non-zero cumulative range every time).
+        """
+        route = _route(
+            name="r",
+            strategy="weighted",
+            backend=None,
+            backends=[
+                BackendRef(name="zero", weight=0),
+                BackendRef(name="a", weight=1),
+                BackendRef(name="b", weight=1),
+            ],
+        )
+        cfg = _multi_backend_config(route, backend_names=["zero", "a", "b"])
+        matcher = RouteMatcher(cfg, random_seed=7)
+        for _ in range(2000):
+            result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+            assert result is not None
+            assert result.backend != "zero"
+
+    def test_weighted_strategy_does_not_starve_low_weight(self):
+        """A low-weight backend must still be selectable.
+
+        With weights [1, 100] over 5000 trials, the low-weight
+        backend must be selected at least once. The expected
+        fraction is ~0.0099, so a tight lower bound like 0.005
+        (i.e. 25/5000) catches starvation but tolerates normal
+        statistical noise.
+        """
+        route = _route(
+            name="r",
+            strategy="weighted",
+            backend=None,
+            backends=[
+                BackendRef(name="rare", weight=1),
+                BackendRef(name="common", weight=100),
+            ],
+        )
+        cfg = _multi_backend_config(route, backend_names=["rare", "common"])
+        matcher = RouteMatcher(cfg, random_seed=99)
+        counts = {"rare": 0, "common": 0}
+        for _ in range(5000):
+            result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+            assert result is not None
+            counts[result.backend] += 1
+        assert counts["rare"] >= 25
+        assert counts["common"] >= 4500
+
+    def test_weighted_strategy_with_all_zero_weights_falls_back(self):
+        """When every weight is 0, the selector returns the first entry."""
+        route = _route(
+            name="r",
+            strategy="weighted",
+            backend=None,
+            backends=[
+                BackendRef(name="b1", weight=0),
+                BackendRef(name="b2", weight=0),
+            ],
+        )
+        cfg = _multi_backend_config(route, backend_names=["b1", "b2"])
+        matcher = RouteMatcher(cfg, random_seed=1)
+        # Degenerate weights: the selector falls back to the first entry.
+        for _ in range(10):
+            result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+            assert result is not None
+            assert result.backend == "b1"
+
+    def test_weighted_strategy_with_empty_backends_uses_route_backend(self):
+        """Empty ``backends`` list falls back to the route's ``backend``."""
+        route = _route(
+            name="r",
+            strategy="weighted",
+            backend="olloma-local",
+            backends=[],
+        )
+        cfg = _config(route)
+        matcher = RouteMatcher(cfg, random_seed=1)
+        result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+        assert result is not None
+        assert result.backend == "olloma-local"
+
+    def test_weighted_strategy_uses_seeded_random_across_matchers(self):
+        """Two matchers with the same seed produce the same first pick."""
+        route = _route(
+            name="r",
+            strategy="weighted",
+            backend=None,
+            backends=[
+                BackendRef(name="b1", weight=1),
+                BackendRef(name="b2", weight=1),
+                BackendRef(name="b3", weight=1),
+            ],
+        )
+        cfg = _multi_backend_config(route)
+        a = RouteMatcher(cfg, random_seed=0)
+        b = RouteMatcher(cfg, random_seed=0)
+        a_first = a.match({"model": "m", "path": "/v1/chat/completions"}).backend
+        b_first = b.match({"model": "m", "path": "/v1/chat/completions"}).backend
+        assert a_first == b_first
+
+
+# ────────────────────────────────────────────────────────────────────
+# VAL-M4 (round_robin): cycle through route.backends in order
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestRoundRobinStrategy:
+    """``strategy: round_robin`` cycles through ``route.backends`` in order."""
+
+    def test_round_robin_cycles_through_backends_in_order(self):
+        route = _route(
+            name="r",
+            strategy="round_robin",
+            backend=None,
+            backends=[
+                BackendRef(name="b1", weight=1),
+                BackendRef(name="b2", weight=1),
+                BackendRef(name="b3", weight=1),
+            ],
+        )
+        cfg = _multi_backend_config(route)
+        matcher = RouteMatcher(cfg)
+        sequence = [
+            matcher.match({"model": "m", "path": "/v1/chat/completions"}).backend
+            for _ in range(6)
+        ]
+        assert sequence == ["b1", "b2", "b3", "b1", "b2", "b3"]
+
+    def test_round_robin_two_backends(self):
+        route = _route(
+            name="r",
+            strategy="round_robin",
+            backend=None,
+            backends=[
+                BackendRef(name="a", weight=1),
+                BackendRef(name="b", weight=1),
+            ],
+        )
+        cfg = _multi_backend_config(route, backend_names=["a", "b"])
+        matcher = RouteMatcher(cfg)
+        sequence = [
+            matcher.match({"model": "m", "path": "/v1/chat/completions"}).backend
+            for _ in range(4)
+        ]
+        assert sequence == ["a", "b", "a", "b"]
+
+    def test_round_robin_ignores_weight_values(self):
+        """The order in ``backends`` is what matters, not the weights."""
+        route = _route(
+            name="r",
+            strategy="round_robin",
+            backend=None,
+            backends=[
+                BackendRef(name="b1", weight=10),
+                BackendRef(name="b2", weight=1),
+                BackendRef(name="b3", weight=100),
+            ],
+        )
+        cfg = _multi_backend_config(route)
+        matcher = RouteMatcher(cfg)
+        sequence = [
+            matcher.match({"model": "m", "path": "/v1/chat/completions"}).backend
+            for _ in range(6)
+        ]
+        assert sequence == ["b1", "b2", "b3", "b1", "b2", "b3"]
+
+    def test_round_robin_single_backend_always_returns_same(self):
+        """With one entry, the cycle never advances and is constant."""
+        route = _route(
+            name="r",
+            strategy="round_robin",
+            backend=None,
+            backends=[BackendRef(name="solo", weight=1)],
+        )
+        cfg = _multi_backend_config(route, backend_names=["solo"])
+        matcher = RouteMatcher(cfg)
+        for _ in range(5):
+            result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+            assert result is not None
+            assert result.backend == "solo"
+
+    def test_round_robin_with_empty_backends_uses_route_backend(self):
+        """Empty ``backends`` falls back to ``route.backend``."""
+        route = _route(
+            name="r",
+            strategy="round_robin",
+            backend="olloma-local",
+            backends=[],
+        )
+        cfg = _config(route)
+        matcher = RouteMatcher(cfg)
+        for _ in range(3):
+            result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+            assert result is not None
+            assert result.backend == "olloma-local"
+
+    def test_round_robin_state_persists_across_routes(self):
+        """A match against a different route must not reset this route's cycle."""
+        rr = _route(
+            name="rr",
+            strategy="round_robin",
+            backend=None,
+            backends=[
+                BackendRef(name="b1", weight=1),
+                BackendRef(name="b2", weight=1),
+            ],
+        )
+        plain = _route(
+            name="plain",
+            model_pattern="other",
+            strategy="single",
+            backend="olloma-local",
+        )
+        cfg = _multi_backend_config(
+            rr, plain, backend_names=["b1", "b2", "olloma-local"]
+        )
+        matcher = RouteMatcher(cfg)
+        # First two calls hit the rr route and cycle.
+        r1 = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+        r2 = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+        assert r1.backend == "b1"
+        assert r2.backend == "b2"
+        # The next rr call should continue from index 2 (mod 2 == 0 -> b1).
+        r3 = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+        assert r3.backend == "b1"
+
+    def test_round_robin_per_route_independent_cycles(self):
+        """Two different round-robin routes have independent counters."""
+        rr1 = _route(
+            name="rr1",
+            model_pattern="groupA-*",
+            strategy="round_robin",
+            backend=None,
+            backends=[
+                BackendRef(name="a", weight=1),
+                BackendRef(name="b", weight=1),
+            ],
+        )
+        rr2 = _route(
+            name="rr2",
+            model_pattern="groupB-*",
+            strategy="round_robin",
+            backend=None,
+            backends=[
+                BackendRef(name="x", weight=1),
+                BackendRef(name="y", weight=1),
+            ],
+        )
+        cfg = _multi_backend_config(rr1, rr2, backend_names=["a", "b", "x", "y"])
+        matcher = RouteMatcher(cfg)
+        # First call against rr1 -> "a"; first call against rr2 -> "x".
+        first_rr1 = matcher.match({"model": "groupA-1", "path": "/v1/chat/completions"})
+        first_rr2 = matcher.match({"model": "groupB-1", "path": "/v1/chat/completions"})
+        assert first_rr1.backend == "a"
+        assert first_rr2.backend == "x"
+        # Each route cycles independently.
+        second_rr1 = matcher.match({"model": "groupA-2", "path": "/v1/chat/completions"})
+        second_rr2 = matcher.match({"model": "groupB-2", "path": "/v1/chat/completions"})
+        assert second_rr1.backend == "b"
+        assert second_rr2.backend == "y"
+
+    def test_round_robin_count_advances_per_call(self):
+        """The internal counter is exposed indirectly: repeated cycles match."""
+        route = _route(
+            name="r",
+            strategy="round_robin",
+            backend=None,
+            backends=[
+                BackendRef(name="a", weight=1),
+                BackendRef(name="b", weight=1),
+                BackendRef(name="c", weight=1),
+            ],
+        )
+        cfg = _multi_backend_config(route, backend_names=["a", "b", "c"])
+        matcher = RouteMatcher(cfg)
+        # 9 calls = 3 full cycles. The cycle index modulo 3 must
+        # match the call number modulo 3.
+        for call_index in range(9):
+            result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+            assert result is not None
+            expected_idx = call_index % 3
+            expected = ["a", "b", "c"][expected_idx]
+            assert result.backend == expected
+
+
+# ────────────────────────────────────────────────────────────────────
+# Selector lifecycle (add_route / remove_route interactions)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestSelectorLifecycle:
+    """Selector state is created on first match and managed by add/remove."""
+
+    def test_add_route_creates_fresh_selector(self):
+        """Adding a new round-robin route starts its counter at 0."""
+        cfg = _config()
+        matcher = RouteMatcher(cfg)
+        route = _route(
+            name="rr",
+            strategy="round_robin",
+            backend=None,
+            backends=[
+                BackendRef(name="a", weight=1),
+                BackendRef(name="b", weight=1),
+            ],
+        )
+        matcher.add_route(route)
+        result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+        assert result is not None
+        # First call of a fresh cycle -> index 0.
+        assert result.backend == "a"
+
+    def test_remove_route_drops_selector(self):
+        """Removing a round-robin route clears its cycle state."""
+        route = _route(
+            name="rr",
+            strategy="round_robin",
+            backend=None,
+            backends=[
+                BackendRef(name="a", weight=1),
+                BackendRef(name="b", weight=1),
+            ],
+        )
+        cfg = _multi_backend_config(route, backend_names=["a", "b"])
+        matcher = RouteMatcher(cfg)
+        # Advance the cycle.
+        matcher.match({"model": "m", "path": "/v1/chat/completions"})
+        matcher.match({"model": "m", "path": "/v1/chat/completions"})
+        # Remove and re-add: the new selector should start at "a".
+        assert matcher.remove_route("rr") is True
+        matcher.add_route(route)
+        result = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+        assert result is not None
+        assert result.backend == "a"
+
+    def test_add_route_does_not_disturb_existing_selectors(self):
+        """Adding a route after matches does not reset earlier selectors."""
+        first = _route(
+            name="first",
+            strategy="round_robin",
+            backend=None,
+            backends=[
+                BackendRef(name="a", weight=1),
+                BackendRef(name="b", weight=1),
+            ],
+        )
+        cfg = _multi_backend_config(first, backend_names=["a", "b"])
+        matcher = RouteMatcher(cfg)
+        # Cycle "first" once.
+        r1 = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+        assert r1.backend == "a"
+        # Add a new route.
+        second = _route(
+            name="second",
+            model_pattern="other",
+            strategy="round_robin",
+            backend=None,
+            backends=[BackendRef(name="c", weight=1)],
+        )
+        matcher.add_route(second)
+        # The first route's cycle should advance normally.
+        r2 = matcher.match({"model": "m", "path": "/v1/chat/completions"})
+        assert r2.backend == "b"
+
+    def test_add_route_rejects_duplicate_name(self):
+        cfg = _config(_route(name="dup"))
+        matcher = RouteMatcher(cfg)
+        with pytest.raises(ValueError, match="already exists"):
+            matcher.add_route(_route(name="dup"))
+
+
+# ────────────────────────────────────────────────────────────────────
+# Strategy interacts correctly with alias resolution
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestStrategyWithAliases:
+    """Backend selection is independent of alias resolution."""
+
+    def test_alias_resolution_unaffected_by_strategy(self):
+        route = _route(
+            name="r",
+            strategy="round_robin",
+            backend=None,
+            aliases={"coder-pro": "minimax-m3:cloud"},
+            backends=[
+                BackendRef(name="b1", weight=1),
+                BackendRef(name="b2", weight=1),
+            ],
+        )
+        cfg = _multi_backend_config(route, backend_names=["b1", "b2"])
+        matcher = RouteMatcher(cfg)
+        r1 = matcher.match({"model": "coder-pro", "path": "/v1/chat/completions"})
+        r2 = matcher.match({"model": "coder-pro", "path": "/v1/chat/completions"})
+        assert r1 is not None
+        assert r2 is not None
+        # Alias resolution is independent of the backend selector.
+        assert r1.original_model == "coder-pro"
+        assert r1.resolved_model == "minimax-m3:cloud"
+        assert r2.original_model == "coder-pro"
+        assert r2.resolved_model == "minimax-m3:cloud"
+        # The round-robin cycle is unaffected.
+        assert r1.backend == "b1"
+        assert r2.backend == "b2"
 
 
 # ────────────────────────────────────────────────────────────────────
