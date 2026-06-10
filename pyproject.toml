@@ -5,6 +5,9 @@ description = "Mixture of Agent proxy"
 requires-python = ">=3.11"
 readme = "README.md"
 license = { file = "LICENSE" }
+dependencies = [
+    "pydantic>=2.0",
+]
 
 [project.optional-dependencies]
 dev = [
