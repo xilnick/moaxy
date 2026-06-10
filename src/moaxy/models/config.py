@@ -169,6 +169,14 @@ class RouteConfig(BaseModel):
     reflection: ReflectionConfig = Field(default_factory=ReflectionConfig)
     advisor: AdvisorConfig = Field(default_factory=AdvisorConfig)
 
+    @field_validator("aliases", mode="before")
+    @classmethod
+    def _aliases_none_to_empty(cls, value: Any) -> Any:
+        # An explicit YAML ``aliases: null`` is equivalent to omitting the
+        # field. Pydantic would otherwise reject ``None`` for a non-Optional
+        # ``dict`` type.
+        return {} if value is None else value
+
 
 class ModelDefaults(BaseModel):
     """Per-model fallback and retry defaults shared across routes."""
