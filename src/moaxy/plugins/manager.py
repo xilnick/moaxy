@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from moaxy.plugins.base import Plugin
 from moaxy.plugins.discovery import discover_plugins, load_plugin_instance
 from moaxy.plugins.types import PluginType
 
 logger = logging.getLogger(__name__)
+
+_ASYNC_PLUGIN_TYPES: frozenset[PluginType] = frozenset(
+    {PluginType.REFLECTOR, PluginType.ADVISOR}
+)
 
 
 class PluginManager:
@@ -69,7 +73,11 @@ class PluginManager:
             plugin_configs: Optional per-plugin config dict keyed by plugin class name.
 
         Returns:
-            List of validation error messages (empty = all good).
+            Flat list of error messages. Each message has the format
+            ``"<plugin_name>: <error_message>"``. An empty list means all
+            plugins loaded successfully. Failures during ``init()`` are
+            captured here; the failing plugin is not registered but other
+            plugins are still loaded.
         """
         if self._loaded:
             logger.warning("Plugins already loaded; skipping duplicate load()")
@@ -81,7 +89,16 @@ class PluginManager:
         for cls in plugin_classes:
             config = (plugin_configs or {}).get(cls.__name__, {})
             instance = load_plugin_instance(cls, config)
-            instance.init()
+            try:
+                instance.init()
+            except Exception as exc:
+                errors.append(f"{instance.name}: {exc}")
+                logger.error(
+                    "Plugin %s raised during init() and was not registered: %s",
+                    instance.name,
+                    exc,
+                )
+                continue
             validation_errors = instance.validate()
             if validation_errors:
                 errors.extend(f"{instance.name}: {e}" for e in validation_errors)
@@ -91,6 +108,45 @@ class PluginManager:
         self._loaded = True
         logger.info("Loaded %d plugin(s)", self.plugin_count)
         return errors
+
+    async def run(
+        self,
+        context: dict[str, Any],
+        plugin_types: Iterable[PluginType] | None = None,
+    ) -> dict[str, Any]:
+        """Run the registered plugins of the requested types against ``context``.
+
+        For each requested type, every registered plugin of that type is
+        invoked. Plugins of type :class:`PluginType.REFLECTOR` and
+        :class:`PluginType.ADVISOR` are dispatched to their async
+        ``process_async`` hook; the four legacy types
+        (ROUTER, TRANSFORMER, AUTH, MIDDLEWARE) are dispatched to the
+        synchronous ``process`` hook.
+
+        Args:
+            context: Mutable context dict shared across all plugins in the
+                run. Plugins are expected to return the same dict they
+                receive (mutations are visible to subsequent plugins).
+            plugin_types: Iterable of plugin types to run. When ``None`` or
+                empty, this method is a no-op and the context is returned
+                unchanged.
+
+        Returns:
+            The same ``context`` dict, after every selected plugin has run.
+        """
+        if plugin_types is None:
+            return context
+        types = list(plugin_types)
+        if not types:
+            return context
+
+        for plugin_type in types:
+            for plugin in self.get_plugins_by_type(plugin_type):
+                if plugin.plugin_type in _ASYNC_PLUGIN_TYPES:
+                    context = await plugin.process_async(context)
+                else:
+                    context = plugin.process(context)
+        return context
 
     def shutdown(self) -> None:
         """Clean up all plugins and release resources."""

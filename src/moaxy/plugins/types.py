@@ -8,3 +8,5 @@ class PluginType(Enum):
     TRANSFORMER = "transformer"
     AUTH = "auth"
     MIDDLEWARE = "middleware"
+    REFLECTOR = "reflector"
+    ADVISOR = "advisor"
