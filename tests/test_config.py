@@ -18,15 +18,14 @@ from moaxy.models.config import (
     ApiKey,
     AuthConfig,
     BackendRef,
-    ModelDefaults,
     MoaxyConfig,
+    ModelDefaults,
     PluginConfig,
     ReflectionConfig,
     RouteConfig,
     RouteMatch,
     ServerConfig,
 )
-
 
 # ── Importability ─────────────────────────────────────────────────────────
 
@@ -39,8 +38,8 @@ class TestImports:
             ApiKey,
             AuthConfig,
             BackendRef,
-            ModelDefaults,
             MoaxyConfig,
+            ModelDefaults,
             PluginConfig,
             ReflectionConfig,
             RouteConfig,

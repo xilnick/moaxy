@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from moaxy.plugins.base import Plugin
 from moaxy.plugins.discovery import discover_plugins, load_plugin_instance

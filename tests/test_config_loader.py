@@ -27,7 +27,6 @@ from moaxy.config import (
 from moaxy.config.loader import CONFIG_PATH_ENV_VAR, DEFAULT_CANDIDATE_NAMES
 from moaxy.models.config import MoaxyConfig
 
-
 # ── envsubst: SubstitutionError ──────────────────────────────────────────
 
 

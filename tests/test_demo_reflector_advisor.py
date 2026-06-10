@@ -155,9 +155,9 @@ class TestDemoReflectorPlugin:
         assert plugin.validated is True
 
     def test_process_async_is_coroutine_function(self):
-        from plugins.demo_reflector.plugin import DemoReflectorPlugin
-
         import inspect
+
+        from plugins.demo_reflector.plugin import DemoReflectorPlugin
 
         assert inspect.iscoroutinefunction(DemoReflectorPlugin.process_async)
 
@@ -266,9 +266,9 @@ class TestDemoAdvisorPlugin:
         assert plugin.validated is True
 
     def test_process_async_is_coroutine_function(self):
-        from plugins.demo_advisor.plugin import DemoAdvisorPlugin
-
         import inspect
+
+        from plugins.demo_advisor.plugin import DemoAdvisorPlugin
 
         assert inspect.iscoroutinefunction(DemoAdvisorPlugin.process_async)
 

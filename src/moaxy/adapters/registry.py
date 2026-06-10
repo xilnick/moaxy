@@ -15,7 +15,7 @@ the orchestrator's concern, not the adapter's.
 from __future__ import annotations
 
 import logging
-from typing import Callable, Iterable
+from collections.abc import Callable, Iterable
 
 from moaxy.adapters.base import Adapter
 from moaxy.adapters.ollama import OllamaAdapter
@@ -85,7 +85,7 @@ class AdapterRegistry:
         self.adapters: dict[str, Adapter] = dict(adapters) if adapters else {}
 
     @classmethod
-    def build(cls, configs: Iterable[AdapterConfig]) -> "AdapterRegistry":
+    def build(cls, configs: Iterable[AdapterConfig]) -> AdapterRegistry:
         """Construct an :class:`AdapterRegistry` from a sequence of configs.
 
         Each :class:`AdapterConfig` is mapped to a concrete adapter

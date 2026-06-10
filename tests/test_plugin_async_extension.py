@@ -9,12 +9,11 @@ from __future__ import annotations
 import asyncio
 import inspect
 from pathlib import Path
-from unittest.mock import Mock
 
 import pytest
 
 from moaxy.plugins.base import Plugin
-from moaxy.plugins.discovery import discover_plugins, load_plugin_instance
+from moaxy.plugins.discovery import discover_plugins
 from moaxy.plugins.manager import PluginManager
 from moaxy.plugins.types import PluginType
 

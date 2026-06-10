@@ -33,7 +33,6 @@ from moaxy.adapters.base import (
 )
 from moaxy.adapters.ollama import OllamaAdapter
 
-
 # ────────────────────────────────────────────────────────────────────
 # AdapterKind / base types
 # ────────────────────────────────────────────────────────────────────

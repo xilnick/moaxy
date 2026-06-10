@@ -23,7 +23,6 @@ from moaxy.adapters.ollama import OllamaAdapter
 from moaxy.adapters.registry import AdapterRegistry, build_registry
 from moaxy.models.config import AdapterConfig, MoaxyConfig
 
-
 # ────────────────────────────────────────────────────────────────────
 # Test fixtures and helpers
 # ────────────────────────────────────────────────────────────────────
