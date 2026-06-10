@@ -8,6 +8,7 @@ the pipeline composes them per request.
 """
 
 from moaxy.pipeline.context import PipelineContext, PipelineEvent
+from moaxy.pipeline.fallback import UpstreamExhaustedError, call_with_fallbacks
 from moaxy.pipeline.message_builders import (
     build_advisor_messages,
     build_reflection_messages,
@@ -23,7 +24,9 @@ __all__ = [
     "DEFAULT_REFLECT_PROMPT",
     "PipelineContext",
     "PipelineEvent",
+    "UpstreamExhaustedError",
     "build_advisor_messages",
     "build_reflection_messages",
     "build_revision_messages",
+    "call_with_fallbacks",
 ]
