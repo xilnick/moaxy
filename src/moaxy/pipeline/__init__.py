@@ -18,6 +18,7 @@ from moaxy.pipeline.prompts import (
     DEFAULT_ADVISOR_PROMPT,
     DEFAULT_REFLECT_PROMPT,
 )
+from moaxy.pipeline.reflector import parse_confidence, reflect_turn
 
 __all__ = [
     "DEFAULT_ADVISOR_PROMPT",
@@ -29,4 +30,6 @@ __all__ = [
     "build_reflection_messages",
     "build_revision_messages",
     "call_with_fallbacks",
+    "parse_confidence",
+    "reflect_turn",
 ]
