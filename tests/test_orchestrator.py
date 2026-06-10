@@ -912,6 +912,135 @@ class TestFallbackChain:
 
 
 # ────────────────────────────────────────────────────────────────────
+# Routing-fallback integration (VAL-RT-011..018, VAL-HTTP-023, VAL-CROSS-004)
+# The orchestrator reads the effective fallbacks/retry off
+# ``ctx.route`` and threads them through ``call_with_fallbacks`` at
+# every LLM call site. The tests below prove the override flows
+# end-to-end through the orchestrator (not just the matcher).
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestRouteFallbacksUsedByOrchestrator:
+    """``RouteMatch.fallbacks`` (already override-resolved) drives the walker."""
+
+    @pytest.mark.asyncio
+    async def test_route_fallbacks_used_for_initial_call(self):
+        """The initial call walks the route's effective fallbacks on 5xx."""
+        from moaxy.adapters.base import UpstreamError
+        adapter = ScriptedAdapter(
+            [
+                UpstreamError("primary failed", status_code=500, body="err"),
+                _response("from fallback", model="minimax-m2.7:cloud"),
+            ]
+        )
+        route = _build_route(
+            fallbacks=["minimax-m2.7:cloud"],
+            retry=0,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The walker called the primary, then the route's fallback.
+        assert len(adapter.calls) == 2
+        assert adapter.calls[0]["model"] == "minimax-m3:cloud"
+        assert adapter.calls[1]["model"] == "minimax-m2.7:cloud"
+        # The header is populated from the walker's findings.
+        assert ctx.__dict__.get("fallbacks_used") == ["minimax-m2.7:cloud"]
+
+    @pytest.mark.asyncio
+    async def test_route_fallbacks_used_for_reflection_calls(self):
+        """Reflection critique+revision each walk the route's fallbacks.
+
+        With ``retry=0`` and a primary that fails on the critique and
+        revision calls, the walker should advance to the route's
+        fallback model for both. The orchestrator aggregates the
+        fallbacks used across all LLM call sites.
+        """
+        from moaxy.adapters.base import UpstreamError
+        adapter = ScriptedAdapter(
+            [
+                # Initial: primary succeeds.
+                _response("initial", model="minimax-m3:cloud"),
+                # Critique: primary fails, fallback succeeds.
+                UpstreamError("critique primary fail", status_code=500, body="e"),
+                _response("c\nREFLECT_CONFIDENCE: 0.5", model="minimax-m2.7:cloud"),
+                # Revision: primary fails, fallback succeeds.
+                UpstreamError("revision primary fail", status_code=500, body="e"),
+                _response("revised", model="minimax-m2.7:cloud"),
+            ]
+        )
+        route = _build_route(
+            fallbacks=["minimax-m2.7:cloud"],
+            retry=0,
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The critique and revision both invoked the route's fallback.
+        assert adapter.calls[2]["model"] == "minimax-m2.7:cloud"
+        assert adapter.calls[4]["model"] == "minimax-m2.7:cloud"
+        # The orchestrator aggregates fallbacks used across all sites.
+        fallbacks_used = ctx.__dict__.get("fallbacks_used", [])
+        # Two fallbacks were used (critique + revision).
+        assert fallbacks_used == ["minimax-m2.7:cloud", "minimax-m2.7:cloud"]
+
+    @pytest.mark.asyncio
+    async def test_route_fallbacks_used_for_advisor_call(self):
+        """The advisor LLM call walks the route's fallbacks too."""
+        from moaxy.adapters.base import UpstreamError
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", model="minimax-m3:cloud"),
+                # Advisor: primary fails, fallback succeeds.
+                UpstreamError("advisor failed", status_code=500, body="err"),
+                _response("ADVISOR_APPROVE", model="minimax-m2.7:cloud"),
+            ]
+        )
+        route = _build_route(
+            fallbacks=["minimax-m2.7:cloud"],
+            retry=0,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The advisor's primary is the configured advisor model.
+        assert adapter.calls[1]["model"] == "deepseek-v4-pro:cloud"
+        # The walker fell back to the route's fallback.
+        assert adapter.calls[2]["model"] == "minimax-m2.7:cloud"
+        # The header captures the advisor's fallback.
+        assert ctx.__dict__.get("fallbacks_used") == ["minimax-m2.7:cloud"]
+
+
+class TestRouteRetryUsedByOrchestrator:
+    """``RouteMatch.retry`` (already override-resolved) drives the walker."""
+
+    @pytest.mark.asyncio
+    async def test_route_retry_used_for_initial_call(self):
+        """``retry=2`` on the route yields 1+2=3 calls on the primary."""
+        from moaxy.adapters.base import UpstreamError
+        # Three failures, then a success on the fallback.
+        adapter = ScriptedAdapter(
+            [
+                UpstreamError("fail", status_code=500, body="e"),
+                UpstreamError("fail", status_code=500, body="e"),
+                UpstreamError("fail", status_code=500, body="e"),
+                _response("from fallback", model="minimax-m2.7:cloud"),
+            ]
+        )
+        route = _build_route(fallbacks=["minimax-m2.7:cloud"], retry=2)
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The primary was called 1+2 times, then the fallback.
+        assert len(adapter.calls) == 4
+        assert adapter.calls[0]["model"] == "minimax-m3:cloud"
+        assert adapter.calls[1]["model"] == "minimax-m3:cloud"
+        assert adapter.calls[2]["model"] == "minimax-m3:cloud"
+        assert adapter.calls[3]["model"] == "minimax-m2.7:cloud"
+
+
+# ────────────────────────────────────────────────────────────────────
 # Sampling parameters forwarded (VAL-PIPE-042)
 # ────────────────────────────────────────────────────────────────────
 

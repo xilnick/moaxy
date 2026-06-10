@@ -16,6 +16,7 @@ from moaxy.models.config import (
     AdapterConfig,
     AdvisorConfig,
     MoaxyConfig,
+    ModelDefaults,
     ReflectionConfig,
     RouteConfig,
 )
@@ -552,6 +553,339 @@ class TestConstruction:
         r2 = matcher.match({"model": "m", "path": "/v1/chat/completions"})
         assert r1 is not r2
         assert r1 == r2
+
+
+# ────────────────────────────────────────────────────────────────────
+# VAL-RT-015..018: models.fallbacks / models.retry defaults
+# ────────────────────────────────────────────────────────────────────
+
+
+def _config_with_models(
+    *routes: RouteConfig,
+    models: ModelDefaults | None = None,
+) -> MoaxyConfig:
+    """Wrap routes in a MoaxyConfig with optional models defaults."""
+    return MoaxyConfig(
+        backends=[_backend()],
+        routes=list(routes),
+        models=models or ModelDefaults(),
+    )
+
+
+class TestModelsFallbacksDefault:
+    """``models.fallbacks[model]`` is used when the route omits ``fallbacks``."""
+
+    def test_models_fallbacks_used_when_route_omits_field(self):
+        """VAL-RT-015: global default kicks in when the route has no list.
+
+        The route is built without ever passing ``fallbacks=`` to
+        Pydantic, so the field is in the route's default state (i.e.
+        it is NOT in ``model_fields_set``). The matcher falls back to
+        ``models.fallbacks[resolved_model]``.
+        """
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+        )
+        cfg = _config_with_models(
+            route,
+            models=ModelDefaults(
+                fallbacks={"minimax-m3:cloud": ["deepseek-v4-pro:cloud"]},
+            ),
+        )
+        matcher = RouteMatcher(cfg)
+        result = matcher.match(
+            {"model": "minimax-m3:cloud", "path": "/v1/chat/completions"}
+        )
+        assert result is not None
+        assert result.fallbacks == ["deepseek-v4-pro:cloud"]
+        # The raw route.fallbacks is still empty (no mutation).
+        assert result.route.fallbacks == []
+        # Confirm the field was NOT in the route's model_fields_set —
+        # the test was specifically about the "absent" case.
+        assert "fallbacks" not in route.model_fields_set
+
+    def test_models_fallbacks_keyed_by_resolved_model(self):
+        """The lookup uses the alias-resolved model name, not the client's."""
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+            aliases={"coder-pro": "minimax-m3:cloud"},
+        )
+        cfg = _config_with_models(
+            route,
+            models=ModelDefaults(
+                fallbacks={"minimax-m3:cloud": ["deepseek-v4-pro:cloud"]},
+            ),
+        )
+        matcher = RouteMatcher(cfg)
+        result = matcher.match(
+            {"model": "coder-pro", "path": "/v1/chat/completions"}
+        )
+        assert result is not None
+        # The fallback list comes from models.fallbacks[minimax-m3:cloud].
+        assert result.fallbacks == ["deepseek-v4-pro:cloud"]
+        assert result.resolved_model == "minimax-m3:cloud"
+
+    def test_models_fallbacks_unrelated_model_yields_empty(self):
+        """A model not in the table resolves to an empty fallback list."""
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+        )
+        cfg = _config_with_models(
+            route,
+            models=ModelDefaults(
+                fallbacks={"some-other-model": ["x"]},
+            ),
+        )
+        matcher = RouteMatcher(cfg)
+        result = matcher.match(
+            {"model": "minimax-m3:cloud", "path": "/v1/chat/completions"}
+        )
+        assert result is not None
+        assert result.fallbacks == []
+
+    def test_models_fallbacks_default_is_empty_dict(self):
+        """With no models defaults at all, fallbacks is empty."""
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+        )
+        cfg = _config_with_models(route)
+        matcher = RouteMatcher(cfg)
+        result = matcher.match(
+            {"model": "minimax-m3:cloud", "path": "/v1/chat/completions"}
+        )
+        assert result is not None
+        assert result.fallbacks == []
+
+
+class TestRouteFallbacksOverride:
+    """``route.fallbacks`` wins over ``models.fallbacks[model]``."""
+
+    def test_route_fallbacks_wins_when_both_set(self):
+        """VAL-RT-016: route.fallbacks wins over models.fallbacks[model]."""
+        route = _route(fallbacks=["kimi-k2.6:cloud"])
+        cfg = _config_with_models(
+            route,
+            models=ModelDefaults(
+                fallbacks={"minimax-m3:cloud": ["deepseek-v4-pro:cloud"]},
+            ),
+        )
+        matcher = RouteMatcher(cfg)
+        result = matcher.match(
+            {"model": "minimax-m3:cloud", "path": "/v1/chat/completions"}
+        )
+        assert result is not None
+        # The route's list is the one used, not the models default.
+        assert result.fallbacks == ["kimi-k2.6:cloud"]
+
+    def test_route_fallbacks_empty_list_wins_over_models_default(self):
+        """An explicit empty ``fallbacks: []`` on the route means no fallbacks.
+
+        This is the "explicitly set to empty" path — the route author
+        declared ``fallbacks: []`` deliberately, so the models default
+        is NOT consulted.
+        """
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+            fallbacks=[],
+        )
+        cfg = _config_with_models(
+            route,
+            models=ModelDefaults(
+                fallbacks={"minimax-m3:cloud": ["deepseek-v4-pro:cloud"]},
+            ),
+        )
+        matcher = RouteMatcher(cfg)
+        result = matcher.match(
+            {"model": "minimax-m3:cloud", "path": "/v1/chat/completions"}
+        )
+        assert result is not None
+        assert result.fallbacks == []
+        # The raw value is the empty list (explicitly set).
+        assert result.route.fallbacks == []
+        # Confirm the field WAS in model_fields_set.
+        assert "fallbacks" in route.model_fields_set
+
+    def test_route_fallbacks_multi_entry_wins(self):
+        """A multi-entry route.fallbacks is used verbatim."""
+        route = _route(
+            fallbacks=["minimax-m2.7:cloud", "kimi-k2.6:cloud"],
+        )
+        cfg = _config_with_models(
+            route,
+            models=ModelDefaults(
+                fallbacks={
+                    "minimax-m3:cloud": ["deepseek-v4-pro:cloud"],
+                },
+            ),
+        )
+        matcher = RouteMatcher(cfg)
+        result = matcher.match(
+            {"model": "minimax-m3:cloud", "path": "/v1/chat/completions"}
+        )
+        assert result is not None
+        assert result.fallbacks == ["minimax-m2.7:cloud", "kimi-k2.6:cloud"]
+
+
+class TestModelsRetryDefault:
+    """``models.retry[model]`` is used when the route omits ``retry``."""
+
+    def test_models_retry_used_when_route_omits_field(self):
+        """VAL-RT-017: global retry budget kicks in when the route has none.
+
+        The route is built without ever passing ``retry=`` to Pydantic,
+        so the field is in the route's default state (i.e. it is NOT
+        in ``model_fields_set``). The matcher falls back to
+        ``models.retry[resolved_model]``.
+        """
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+        )
+        cfg = _config_with_models(
+            route,
+            models=ModelDefaults(retry={"minimax-m3:cloud": 2}),
+        )
+        matcher = RouteMatcher(cfg)
+        result = matcher.match(
+            {"model": "minimax-m3:cloud", "path": "/v1/chat/completions"}
+        )
+        assert result is not None
+        assert result.retry == 2
+        # The raw route.retry is still 0 (no mutation).
+        assert result.route.retry == 0
+        # Confirm the field was NOT in the route's model_fields_set.
+        assert "retry" not in route.model_fields_set
+
+    def test_models_retry_keyed_by_resolved_model(self):
+        """The lookup uses the alias-resolved model name."""
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+            aliases={"coder-pro": "minimax-m3:cloud"},
+        )
+        cfg = _config_with_models(
+            route,
+            models=ModelDefaults(retry={"minimax-m3:cloud": 3}),
+        )
+        matcher = RouteMatcher(cfg)
+        result = matcher.match(
+            {"model": "coder-pro", "path": "/v1/chat/completions"}
+        )
+        assert result is not None
+        assert result.retry == 3
+
+    def test_models_retry_unrelated_model_yields_zero(self):
+        """A model not in the table resolves to a zero budget."""
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+        )
+        cfg = _config_with_models(
+            route,
+            models=ModelDefaults(retry={"some-other-model": 2}),
+        )
+        matcher = RouteMatcher(cfg)
+        result = matcher.match(
+            {"model": "minimax-m3:cloud", "path": "/v1/chat/completions"}
+        )
+        assert result is not None
+        assert result.retry == 0
+
+
+class TestRouteRetryOverride:
+    """``route.retry`` wins over ``models.retry[model]``."""
+
+    def test_route_retry_zero_overrides_models_retry(self):
+        """VAL-RT-018: route.retry=0 wins over models.retry=2."""
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+            retry=0,
+        )
+        cfg = _config_with_models(
+            route,
+            models=ModelDefaults(retry={"minimax-m3:cloud": 2}),
+        )
+        matcher = RouteMatcher(cfg)
+        result = matcher.match(
+            {"model": "minimax-m3:cloud", "path": "/v1/chat/completions"}
+        )
+        assert result is not None
+        assert result.retry == 0
+        # The raw route value is also 0 (explicitly set).
+        assert result.route.retry == 0
+        # Confirm the field WAS in model_fields_set.
+        assert "retry" in route.model_fields_set
+
+    def test_route_retry_nonzero_overrides_models_retry(self):
+        """A non-zero route.retry wins over a different models.retry."""
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+            retry=5,
+        )
+        cfg = _config_with_models(
+            route,
+            models=ModelDefaults(retry={"minimax-m3:cloud": 2}),
+        )
+        matcher = RouteMatcher(cfg)
+        result = matcher.match(
+            {"model": "minimax-m3:cloud", "path": "/v1/chat/completions"}
+        )
+        assert result is not None
+        assert result.retry == 5
+
+
+# ────────────────────────────────────────────────────────────────────
+# Aliases are not re-applied to fallback model names
+# (VAL-RT-019: alias map applies to the request's model field only,
+# not to the entries in route.fallbacks or models.fallbacks.)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestModelsFallbacksNotReAliased:
+    """The alias map is NOT re-applied to entries in models.fallbacks."""
+
+    def test_models_fallbacks_passed_through_verbatim(self):
+        """An alias target that happens to be a fallback key is unchanged.
+
+        The alias map rewrites only ``request["model"]``; the entries
+        in ``models.fallbacks[primary]`` are walked verbatim, even if
+        their names happen to also be aliases on the same route.
+        """
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+            aliases={"coder-pro": "minimax-m3:cloud"},
+        )
+        # The models.fallbacks key "minimax-m3:cloud" is also an alias
+        # target on this route, but that should be irrelevant.
+        cfg = _config_with_models(
+            route,
+            models=ModelDefaults(
+                fallbacks={
+                    "minimax-m3:cloud": [
+                        "minimax-m2.7:cloud",
+                        "deepseek-v4-pro:cloud",
+                    ],
+                },
+            ),
+        )
+        matcher = RouteMatcher(cfg)
+        result = matcher.match(
+            {"model": "coder-pro", "path": "/v1/chat/completions"}
+        )
+        assert result is not None
+        # The list is used verbatim — the alias map is not re-applied.
+        assert result.fallbacks == [
+            "minimax-m2.7:cloud",
+            "deepseek-v4-pro:cloud",
+        ]
 
 
 # ────────────────────────────────────────────────────────────────────

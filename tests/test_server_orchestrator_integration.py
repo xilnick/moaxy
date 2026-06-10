@@ -14,6 +14,7 @@ Routing & Aliases" (VAL-RT-007, 008) for the data plane, and the
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -787,3 +788,180 @@ class TestAdvisorIntegration:
             )
         assert response.status_code == 200
         assert "x-moaxy-advisor-model" not in response.headers
+
+
+# ────────────────────────────────────────────────────────────────────
+# Concurrent requests on different routes (VAL-CROSS-006)
+# The proxy is stateless per request; in-flight requests must not
+# share mutable state across contexts. The test below fires two
+# parallel POSTs against distinct routes and confirms the responses
+# are well-formed and request-isolated.
+# ────────────────────────────────────────────────────────────────────
+
+
+def _build_multi_route_app(
+    adapter: Adapter,
+    routes: list[RouteConfig],
+    *,
+    backend_name: str = "olloma-local",
+) -> Any:
+    """Build a FastAPI app with the scripted adapter and multiple routes."""
+    cfg = MoaxyConfig(
+        backends=[AdapterConfig(name=backend_name, adapter="ollama", base_url="http://x")],
+        routes=routes,
+    )
+    registry = AdapterRegistry({backend_name: adapter})
+    return create_app(config=cfg, adapters=registry)
+
+
+class TestConcurrentRequestIsolation:
+    """Concurrent requests on different routes stay isolated.
+
+    The proxy threads each request through a fresh
+    :class:`PipelineContext`; the orchestrator mutates the context in
+    place. The test below fires two parallel POSTs against two distinct
+    routes (a reflective route and a plain catch-all) and asserts that
+    each response reflects only its own prompt — no cross-talk.
+    """
+
+    @pytest.mark.asyncio
+    async def test_parallel_requests_on_distinct_routes_are_isolated(self):
+        # Script: initial, critique, revised (for the reflective route).
+        # Each LLM call is recorded with the call's model name so the
+        # test can assert the orchestrator took the right path for
+        # each request.
+        adapter = ScriptedAdapter(
+            [
+                # Reflective route, request 1
+                _response("reflective-initial", model="reflective"),
+                _response("c\nREFLECT_CONFIDENCE: 0.5", model="reflective"),
+                _response("reflective-revised", model="reflective"),
+                # Plain route, request 2
+                _response("plain-answer", model="plain"),
+            ]
+        )
+        reflective = _build_route_config(
+            name="reflective",
+            match_model="reflective",
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+        )
+        plain = _build_route_config(
+            name="plain",
+            match_model="*",
+            backend="olloma-local",
+            reflection_turns=0,
+        )
+        app = _build_multi_route_app(adapter, [reflective, plain])
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            r1, r2 = await asyncio.gather(
+                client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "reflective",
+                        "messages": [{"role": "user", "content": "reflective-prompt"}],
+                    },
+                    headers={"Content-Type": "application/json"},
+                ),
+                client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "plain",
+                        "messages": [{"role": "user", "content": "plain-prompt"}],
+                    },
+                    headers={"Content-Type": "application/json"},
+                ),
+            )
+
+        # Both responses succeed with distinct request ids.
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        assert r1.headers[REQUEST_ID_HEADER] != r2.headers[REQUEST_ID_HEADER]
+
+        # Each response carries its own content; no cross-talk.
+        body1 = r1.json()
+        body2 = r2.json()
+        assert body1["choices"][0]["message"]["content"] == "reflective-revised"
+        assert body2["choices"][0]["message"]["content"] == "plain-answer"
+
+        # The reflective route reports 1 turn; the plain route reports 0.
+        assert r1.headers["x-moaxy-reflect-turns"] == "1"
+        assert r2.headers["x-moaxy-reflect-turns"] == "0"
+
+        # The adapter received the right number of calls in order:
+        # 3 for the reflective request, 1 for the plain request.
+        assert len(adapter.calls) == 4
+        # The 4th call (plain route) is the only one against the
+        # plain model — no cross-route contamination.
+        assert adapter.calls[3]["model"] == "plain"
+        assert adapter.calls[3]["messages"][-1]["content"] == "plain-prompt"
+
+    @pytest.mark.asyncio
+    async def test_parallel_requests_share_no_fallbacks_used(self):
+        """Two parallel requests don't share ``ctx.fallbacks_used``.
+
+        The orchestrator stamps ``ctx.__dict__["fallbacks_used"]`` on
+        each context as a fresh list. With two parallel requests on
+        routes that have different fallbacks, each response's
+        ``x-moaxy-fallbacks-used`` header reflects only its own
+        context.
+        """
+        from moaxy.adapters.base import UpstreamError
+
+        adapter = ScriptedAdapter(
+            [
+                # Reflective route: primary fails, fallback succeeds.
+                UpstreamError("primary fail", status_code=500, body="e"),
+                _response("fallback answer", model="deepseek-v4-pro:cloud"),
+                # Plain route: no fallback (primary succeeds).
+                _response("plain answer", model="kimi-k2.6:cloud"),
+            ]
+        )
+        reflective = _build_route_config(
+            name="reflective",
+            match_model="reflective",
+            fallbacks=["deepseek-v4-pro:cloud"],
+            retry=0,
+            reflection_turns=0,
+        )
+        plain = _build_route_config(
+            name="plain",
+            match_model="*",
+            backend="olloma-local",
+            reflection_turns=0,
+        )
+        app = _build_multi_route_app(adapter, [reflective, plain])
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            r1, r2 = await asyncio.gather(
+                client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "reflective",
+                        "messages": [{"role": "user", "content": "ping-a"}],
+                    },
+                    headers={"Content-Type": "application/json"},
+                ),
+                client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "plain",
+                        "messages": [{"role": "user", "content": "ping-b"}],
+                    },
+                    headers={"Content-Type": "application/json"},
+                ),
+            )
+
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        # The reflective route used its fallback; the plain route did not.
+        assert json.loads(r1.headers["x-moaxy-fallbacks-used"]) == [
+            "deepseek-v4-pro:cloud"
+        ]
+        assert r2.headers["x-moaxy-fallbacks-used"] == "0"
