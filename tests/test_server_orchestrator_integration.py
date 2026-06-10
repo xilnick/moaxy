@@ -145,6 +145,21 @@ def _response(
     )
 
 
+def _critique_response(
+    body: str,
+    confidence: float | None,
+    *,
+    model: str = "minimax-m3:cloud",
+) -> ChatResponse:
+    """Build a critique response. ``confidence=None`` omits the line."""
+    if confidence is None:
+        text = body
+    else:
+        text = f"{body}\nREFLECT_CONFIDENCE: {confidence}"
+    return _response(text, model=model)
+
+
+
 def _build_route_config(
     *,
     name: str = "reflective-coder",
@@ -156,8 +171,10 @@ def _build_route_config(
     reflection_turns: int = 0,
     early_exit: bool = True,
     threshold: float = 0.85,
+    reflection_parallel: bool = False,
     advisor_model: str | None = None,
     advisor_turns: int = 0,
+    advisor_parallel: bool = False,
 ) -> RouteConfig:
     return RouteConfig(
         name=name,
@@ -170,8 +187,13 @@ def _build_route_config(
             turns=reflection_turns,
             early_exit=early_exit,
             threshold=threshold,
+            parallel=reflection_parallel,
         ),
-        advisor=AdvisorConfig(model=advisor_model, turns=advisor_turns),
+        advisor=AdvisorConfig(
+            model=advisor_model,
+            turns=advisor_turns,
+            parallel=advisor_parallel,
+        ),
     )
 
 
@@ -1244,3 +1266,119 @@ class TestConcurrentRequestIsolation:
             "deepseek-v4-pro:cloud"
         ]
         assert r2.headers["x-moaxy-fallbacks-used"] == "0"
+
+
+# ────────────────────────────────────────────────────────────────────
+# M4 parallel path (VAL-PIPE-009, VAL-PIPE-021, VAL-CROSS-005)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestServerParallelPath:
+    """The M4 parallel path is exposed through the FastAPI handler.
+
+    These tests verify the full data-plane roundtrip: the proxy
+    accepts a request, the orchestrator runs the parallel
+    ``asyncio.gather`` path, the response carries the same
+    ``x-moaxy-*`` headers as the sequential path, and the final
+    content is content-equivalent to the sequential reference.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reflection_parallel_end_to_end(self):
+        """``reflection.parallel: true, turns: 2`` end-to-end via HTTP."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial"),
+                _critique_response("c0", confidence=0.5),
+                _response("rev0"),
+                _critique_response("c1", confidence=0.5),
+                _response("rev1"),
+            ]
+        )
+        route = _build_route_config(
+            name="parallel-reflection",
+            match_model="*",
+            reflection_turns=2,
+            early_exit=True,
+            threshold=0.85,
+            reflection_parallel=True,
+        )
+        app = _build_app(adapter, route)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            r = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "ping"}],
+                },
+                headers={"Content-Type": "application/json"},
+            )
+        assert r.status_code == 200
+        body = r.json()
+        # The final content is the last revision; content equivalence
+        # to the sequential path is the contract.
+        assert body["choices"][0]["message"]["content"] == "rev1"
+        # The x-moaxy-* headers reflect the parallel path.
+        assert r.headers["x-moaxy-reflect-turns"] == "2"
+        assert r.headers["x-moaxy-fallbacks-used"] == "0"
+        # The events are recorded in source order: initial, then
+        # 2 critiques, then 2 revisions. We don't introspect the
+        # events from the response, but the response code is 200
+        # and the content is correct, which is the contract pin.
+        assert body["choices"][0]["message"]["role"] == "assistant"
+
+    @pytest.mark.asyncio
+    async def test_advisor_parallel_end_to_end(self):
+        """``advisor.parallel: true, reflection.parallel: true`` end-to-end."""
+        # Script: 6 calls. The advisor.parallel path runs the
+        # advisor and a self-reflection on the initial answer
+        # concurrently. The orchestrator consumes the queue in
+        # either order; the contract pins content equivalence.
+        adapter = ScriptedAdapter(
+            [
+                _response("initial"),
+                _critique_response("c0", confidence=0.5),
+                _response("rev0"),
+                _response("ADVISOR_APPROVE", model="deepseek-v4-pro:cloud"),
+                _critique_response("self_c0", confidence=0.5),
+                _response("self_rev0"),
+            ]
+        )
+        route = _build_route_config(
+            name="advisor-parallel",
+            match_model="*",
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            reflection_parallel=True,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+            advisor_parallel=True,
+        )
+        app = _build_app(adapter, route)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            r = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "ping"}],
+                },
+                headers={"Content-Type": "application/json"},
+            )
+        assert r.status_code == 200
+        body = r.json()
+        # The final content is the post-reflection revision; the
+        # advisor approved.
+        assert body["choices"][0]["message"]["content"] == "rev0"
+        # The advisor header is set.
+        assert r.headers["x-moaxy-advisor-model"] == "deepseek-v4-pro:cloud"
+        # The reflection turn counter reflects the total
+        # critique events emitted (1 from the main reflection +
+        # 1 from the self-reflection in advisor.parallel).
+        assert r.headers["x-moaxy-reflect-turns"] == "2"
+        # The request id header is present.
+        assert "x-moaxy-request-id" in r.headers

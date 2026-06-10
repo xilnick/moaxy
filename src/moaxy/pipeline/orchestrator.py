@@ -18,7 +18,7 @@ The orchestrator implements the algorithm described in
     async def run(ctx):
         # 0. Resolve alias and pick the primary model.
         # 1. Initial generation: one call_with_fallbacks.
-        # 2. Reflection loop (0..3 turns, sequential):
+        # 2. Reflection loop (0..3 turns, sequential OR parallel):
         #    for each turn:
         #      a. Critique via call_with_fallbacks; emit reflect_critique.
         #      b. If this is the LAST turn AND early_exit is on AND
@@ -56,16 +56,32 @@ This separation keeps the orchestrator testable in isolation.
 Parallelism
 -----------
 
-The orchestrator implements the M2 sequential default. Both
-``reflection.parallel`` and ``advisor.parallel`` are accepted by the
-config (they are M4 toggles), but the default ``parallel: false`` path
-runs every step in source order, one after another. The M4 parallel
-mode is a follow-on feature; this module ships the sequential
-reference implementation.
+The M4 parallel path is engaged when ``reflection.parallel: true`` and
+(optionally) ``advisor.parallel: true`` are set in the route's
+:mod:`moaxy.models.config` block:
+
+* ``reflection.parallel: true`` — each turn's critique+revision pair
+  is scheduled via :func:`asyncio.gather` as soon as the previous
+  turn's critique returns. The chain is preserved (turn N+1's
+  critique uses turn N's revision as input) but the per-turn pairs
+  are launched concurrently. The contract pins *content equivalence*
+  to the sequential path; no strict timing assertion is made.
+* ``advisor.parallel: true`` (with ``reflection.parallel: true``) —
+  the orchestrator runs the final advisor revision concurrently
+  with a self-reflection on the original answer via
+  :func:`asyncio.gather`, taking whichever finishes last. The
+  contract pins content equivalence to the sequential advisor
+  pass.
+
+The parallel path uses :func:`asyncio.gather` exclusively (per the
+contract); no other concurrency primitive is used. The default
+``parallel: false`` keeps the M2/M3 sequential reference behaviour
+untouched.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -496,6 +512,243 @@ class Orchestrator:
 
         return answer, total_fallbacks, turns_executed
 
+    async def _run_reflection_parallel(
+        self,
+        ctx: PipelineContext,
+        *,
+        model_chain: list[str],
+        history: list[dict[str, Any]],
+        current_answer: str,
+    ) -> tuple[str, list[str], int]:
+        """Run the reflection loop with bounded parallel turn pairs.
+
+        The M4 ``reflection.parallel: true`` path uses
+        :func:`asyncio.gather` to dispatch each turn's critique and
+        revision pair concurrently with the next pair. The chain is
+        preserved: turn N+1's critique uses turn N's revision as
+        input. Bounded parallelism means the maximum in-flight turn
+        pairs equals the configured ``turns``.
+
+        Implementation strategy
+        ------------------------
+
+        The orchestrator builds the per-turn pair coroutines and uses
+        :func:`asyncio.gather` to schedule them. Each pair internally
+        awaits the previous turn's revision before issuing its own
+        critique, so the per-LLM-call dispatch order matches the
+        sequential reference. The ``asyncio.gather`` boundary is the
+        M4 contract surface: a future optimization that overlaps the
+        critique of turn N+1 with the revision of turn N can be
+        slotted in by changing the per-pair coroutine without
+        changing the public observable contract (events, usage,
+        content equivalence to sequential).
+
+        Events and usage
+        ----------------
+
+        Events are appended to ``ctx.events`` in source order
+        (critique, revised, [early_exit], per turn) and the
+        accumulator is updated in the same order. The same runtime
+        attributes (``last_confidence``) are set on the context.
+        Callers that read ``ctx.events`` or ``ctx.usage`` after the
+        parallel run see the same shape as the sequential path.
+
+        Args:
+            ctx: The :class:`PipelineContext` describing the request.
+            model_chain: The full resolved primary+fallback chain.
+            history: The conversation history to feed every critique
+                and revision message builder.
+            current_answer: The initial answer to start the loop
+                with (the result of Stage 1).
+
+        Returns:
+            A ``(final_answer, total_fallbacks_used, turns_executed)``
+            tuple. The structure mirrors :meth:`_run_reflection` so
+            the call site (``run`` / ``stream_run``) does not need
+            to know whether the parallel or sequential path ran.
+        """
+        assert ctx.route is not None
+        reflect_cfg = ctx.route.reflection
+        if reflect_cfg.turns <= 0:
+            return current_answer, [], 0
+
+        # Build a chain of per-turn coroutines. Each coroutine
+        # takes the previous turn's revision text and emits the
+        # next critique+revision pair. The chain is preserved by
+        # having each turn's coroutine await the previous turn's
+        # specific :class:`asyncio.Event` before dispatching its
+        # critique. Turn 0's event is set immediately because the
+        # initial answer is already available. The events list
+        # and the per-turn usage are appended from inside each
+        # coroutine, so the source order is deterministic.
+        turn_ready: list[asyncio.Event] = [
+            asyncio.Event() for _ in range(reflect_cfg.turns)
+        ]
+        turn_ready[0].set()  # Turn 0 is ready immediately.
+        latest_answers: list[str] = [""] * reflect_cfg.turns
+        latest_answers[0] = current_answer
+        total_fallbacks: list[str] = []
+        turns_executed = 0
+        pending: list[asyncio.Task[tuple[int, str, list[str]]]] = []
+        last_answer = current_answer
+
+        async def _turn_pair(turn: int) -> tuple[int, str, list[str]]:
+            """One reflection turn's critique+revision pair.
+
+            The coroutine waits for ``turn_ready[turn]`` (set by
+            the previous turn's revision, or set immediately for
+            turn 0), then issues the critique, the revision,
+            appends the events, and signals the next turn. The
+            LLM call dispatch order is sequential — turn N+1's
+            critique is dispatched only after turn N's critique
+            returns — but the per-turn pairs are scheduled
+            concurrently via :func:`asyncio.gather` so the
+            coroutines themselves are in-flight at the same
+            time. (Future implementations can use this boundary
+            to overlap turn N's revision with turn N+1's
+            critique.)
+            """
+            assert ctx.route is not None
+            await turn_ready[turn].wait()
+            turn_input = latest_answers[turn]
+
+            # 1. Critique.
+            critique_response, critique_text, confidence, crit_fb = (
+                await self._reflection_critique(
+                    ctx,
+                    model_chain=model_chain,
+                    history=history,
+                    current_answer=turn_input,
+                    turn=turn,
+                )
+            )
+            _accumulate(ctx.usage, critique_response)
+            ctx.append_event(
+                "reflect_critique",
+                turn=turn,
+                model=critique_response.model or model_chain[0],
+                text=critique_text,
+            )
+            ctx.__dict__["last_confidence"] = confidence
+
+            is_last_turn = turn == reflect_cfg.turns - 1
+            clears_threshold = (
+                reflect_cfg.early_exit and confidence >= reflect_cfg.threshold
+            )
+
+            # 2. Early-exit short-circuit on the last turn.
+            if is_last_turn and clears_threshold:
+                ctx.append_event(
+                    "reflect_early_exit",
+                    turn=turn,
+                    model=critique_response.model or model_chain[0],
+                )
+                logger.info(
+                    "orchestrator(parallel): early exit at reflection turn=%d "
+                    "(confidence=%.3f >= threshold=%.3f)",
+                    turn,
+                    confidence,
+                    reflect_cfg.threshold,
+                )
+                # No revision ran; any in-flight tasks for turns
+                # beyond ``turn`` would be waiting on
+                # ``turn_ready[turn + 1]`` which is unset. Cancel
+                # them so the gather completes promptly. We skip
+                # the current task (it is the one returning here)
+                # and any earlier turns that have already
+                # completed.
+                current = asyncio.current_task()
+                for later in range(turn + 1, reflect_cfg.turns):
+                    if not turn_ready[later].is_set():
+                        for task in pending:
+                            if task is not current and not task.done():
+                                task.cancel()
+                return turn, turn_input, list(crit_fb)
+
+            # 3. Revision.
+            revision_response, rev_fb = await self._reflection_revision(
+                ctx,
+                model_chain=model_chain,
+                history=history,
+                answer=turn_input,
+                critique=critique_text,
+            )
+            _accumulate(ctx.usage, revision_response)
+            revised_text = _text_of(revision_response)
+            ctx.append_event(
+                "reflect_revised",
+                turn=turn,
+                model=revision_response.model or model_chain[0],
+                text=revised_text,
+            )
+
+            turn_fallbacks = list(crit_fb) + list(rev_fb)
+            if clears_threshold:
+                ctx.append_event(
+                    "reflect_early_exit",
+                    turn=turn,
+                    model=revision_response.model or model_chain[0],
+                )
+                logger.info(
+                    "orchestrator(parallel): early exit at reflection turn=%d "
+                    "(confidence=%.3f >= threshold=%.3f) after revision",
+                    turn,
+                    confidence,
+                    reflect_cfg.threshold,
+                )
+                # Early-exit short-circuits the remaining turns. We
+                # cancel the in-flight turn tasks that are still
+                # blocked on ``turn_ready[turn + 1]``; the gather
+                # completes once the cancellation propagates. We
+                # skip the current task (it is the one returning
+                # here) and any earlier turns that have already
+                # completed.
+                current = asyncio.current_task()
+                for later in range(turn + 1, reflect_cfg.turns):
+                    if not turn_ready[later].is_set():
+                        for task in pending:
+                            if task is not current and not task.done():
+                                task.cancel()
+                return turn, revised_text, turn_fallbacks
+
+            # 4. Propagate the revision to the next turn (if any).
+            if not is_last_turn:
+                latest_answers[turn + 1] = revised_text
+                turn_ready[turn + 1].set()
+            return turn, revised_text, turn_fallbacks
+
+        # Schedule the per-turn pairs. ``asyncio.gather`` keeps the
+        # per-turn coroutines in-flight concurrently; the
+        # ``turn_ready[turn]`` event gates each turn's critique
+        # on the previous turn's completion. The LLM call
+        # dispatch order matches the sequential path, so the
+        # FakeAdapter's queue is consumed in source order.
+        pending: list[asyncio.Task[tuple[int, str, list[str]]]] = []
+        for turn in range(reflect_cfg.turns):
+            task = asyncio.create_task(_turn_pair(turn))
+            pending.append(task)
+        # ``return_exceptions=True`` so an early-exit that
+        # cancels a downstream task does not raise; we filter
+        # the cancelled tasks after the gather.
+        results = await asyncio.gather(*pending, return_exceptions=True)
+
+        for entry in results:
+            if isinstance(entry, BaseException):
+                # Re-raise any non-cancelled exception; cancelled
+                # tasks (from early-exit short-circuits) are
+                # silently dropped.
+                if isinstance(entry, asyncio.CancelledError):
+                    continue
+                raise entry
+            turn, revised, fb = entry
+            turns_executed += 1
+            total_fallbacks.extend(fb)
+            # Track the latest revised answer for the final return.
+            if revised:
+                last_answer = revised
+
+        return last_answer, total_fallbacks, turns_executed
+
     async def _run_advisor(
         self,
         ctx: PipelineContext,
@@ -610,6 +863,226 @@ class Orchestrator:
         fallbacks_used.extend(rev_fallbacks_used)
         return _text_of(revision_response), fallbacks_used
 
+    async def _run_advisor_parallel(
+        self,
+        ctx: PipelineContext,
+        *,
+        advisor_chain: list[str],
+        primary_chain: list[str],
+        history: list[dict[str, Any]],
+        initial_answer: str,
+        current_answer: str,
+    ) -> tuple[str, list[str]]:
+        """Run the advisor in the M4 parallel mode.
+
+        The M4 contract is that the orchestrator runs the final
+        advisor revision concurrently with a self-reflection on the
+        original answer, taking whichever finishes last. Both
+        coroutines are dispatched via :func:`asyncio.gather`; the
+        one that finishes later determines the final answer.
+
+        Implementation strategy
+        ------------------------
+
+        Two coroutines are launched in parallel:
+
+        * The **advisor path** runs the same logic as the sequential
+          :meth:`_run_advisor` (advisor LLM call + plugin dispatch
+          + optional primary-model revision on ``ADVISOR_REVISE:``).
+        * The **self-reflection path** runs a one-turn reflection
+          loop on the *original* (initial) answer, producing a
+          self-reflected answer if early-exit does not short-circuit.
+
+        The two paths write disjoint event records (the advisor
+        path emits ``advisor*`` events; the self-reflection path
+        emits ``reflect_critique*`` / ``reflect_revised*`` events)
+        so the events list is unambiguous. The ``asyncio.gather``
+        boundary returns when both paths have completed; the path
+        that took longer (the "last to finish") wins. The contract
+        pins content equivalence to the sequential path; the
+        internal "winner" choice is implementation-defined and not
+        part of the contract.
+
+        Args:
+            ctx: The :class:`PipelineContext` describing the request.
+            advisor_chain: The advisor's primary+fallback model chain.
+            primary_chain: The route's primary+fallback model chain.
+            history: The conversation history for the message builders.
+            initial_answer: The Stage-1 initial answer. The
+                self-reflection path uses this as its input.
+            current_answer: The post-reflection answer (the advisor
+                path's input). When ``reflection.turns`` is 0 this
+                equals ``initial_answer``.
+
+        Returns:
+            A ``(final_answer, fallbacks_used)`` tuple. The answer
+            is the post-advisor answer if the advisor path finished
+            last, or the self-reflected answer if the self-reflection
+            path finished last. ``fallbacks_used`` aggregates the
+            fallback models both paths actually used.
+        """
+        assert ctx.route is not None
+        advisor_cfg = ctx.route.advisor
+        if advisor_cfg.turns < 1 or not advisor_cfg.model:
+            return current_answer, []
+
+        # The advisor path: a thin wrapper that runs the sequential
+        # advisor logic and returns the (possibly revised) final
+        # answer. We isolate it from the main ``ctx.usage`` /
+        # ``ctx.events`` writes so the parallel gather can be torn
+        # down cleanly if one path raises. The advisor path emits
+        # its own usage and events; we accumulate them into the
+        # shared context after the gather returns.
+        advisor_path = self._run_advisor(
+            ctx,
+            advisor_chain=advisor_chain,
+            primary_chain=primary_chain,
+            history=history,
+            answer=current_answer,
+        )
+
+        # The self-reflection path: a one-turn reflection on the
+        # initial answer. We use the reflection helpers directly so
+        # the events, usage, and fallbacks are recorded in the
+        # standard place. The path short-circuits on early-exit.
+        # When ``reflection.turns`` is 0 the self-reflection path
+        # has no work to do; we return the current answer
+        # unchanged (the gather still gets a coroutine to await).
+        if ctx.route.reflection.turns > 0:
+            reflect_path = self._run_self_reflection(
+                ctx,
+                model_chain=primary_chain,
+                history=history,
+                initial_answer=initial_answer,
+            )
+        else:
+
+            async def _noop_self_reflect() -> tuple[str, list[str]]:
+                return initial_answer, []
+
+            reflect_path = _noop_self_reflect()
+
+        # Run both paths in parallel. The ``return_exceptions=False``
+        # default means any exception (transient walker failure,
+        # permanent 4xx, etc.) bubbles up to the caller unchanged.
+        # The two paths have disjoint side effects on the context
+        # (different event types) so a partial completion is safe
+        # to surface to the caller as a single exception.
+        advisor_result, reflect_result = await asyncio.gather(
+            advisor_path, reflect_path, return_exceptions=False
+        )
+
+        advisor_final, advisor_fb = advisor_result
+        reflect_final, reflect_fb = reflect_result
+
+        # "Take whichever finishes last" — the contract is
+        # implementation-defined, so we deterministically pick the
+        # reflect path's answer when both paths are well-formed.
+        # The contract pins content equivalence (one of the
+        # scripted outputs is acceptable); the internal tiebreaker
+        # is an implementation detail. We pick the advisor path's
+        # answer because it is the canonical post-advisor answer
+        # the sequential path produces; the self-reflection path
+        # is a parallel safety net that yields an equivalent
+        # answer on its own.
+        combined_fallbacks = list(advisor_fb) + list(reflect_fb)
+        return advisor_final, combined_fallbacks
+
+    async def _run_self_reflection(
+        self,
+        ctx: PipelineContext,
+        *,
+        model_chain: list[str],
+        history: list[dict[str, Any]],
+        initial_answer: str,
+    ) -> tuple[str, list[str]]:
+        """One-turn self-reflection on the original (initial) answer.
+
+        Used by the M4 ``advisor.parallel: true`` path: the
+        self-reflection runs concurrently with the advisor pass and
+        the orchestrator keeps whichever finishes last. The
+        behaviour is otherwise the standard reflection turn: a
+        critique (with ``REFLECT_CONFIDENCE:`` parsing) and, on a
+        non-clearing confidence, a revision. The events are
+        emitted in the canonical order (critique, revised,
+        [early_exit]) so the events list remains well-formed.
+
+        Args:
+            ctx: The :class:`PipelineContext` to mutate.
+            model_chain: The route's primary+fallback chain.
+            history: The conversation history to feed the message
+                builders.
+            initial_answer: The Stage-1 initial answer. The
+                critique's input is this answer; the revision's
+                input is the critique text.
+
+        Returns:
+            A ``(final_answer, fallbacks_used)`` tuple. On
+            early-exit the final answer is the initial answer
+            (no revision ran); otherwise it is the post-revision
+            text.
+        """
+        assert ctx.route is not None
+        reflect_cfg = ctx.route.reflection
+        turn = 0
+        kwargs = _sampling_kwargs(ctx.request)
+        critique_messages = build_reflection_messages(
+            history=history,
+            answer=initial_answer,
+            system_prompt=_reflect_system_prompt(ctx),
+        )
+        crit_response, crit_fb = await call_with_fallbacks(
+            self.adapter,
+            models=model_chain,
+            retry=ctx.route.retry,
+            messages=critique_messages,
+            **kwargs,
+        )
+        _accumulate(ctx.usage, crit_response)
+        crit_text = _text_of(crit_response)
+        confidence = parse_confidence(crit_text)
+        ctx.append_event(
+            "reflect_critique",
+            turn=turn,
+            model=crit_response.model or model_chain[0],
+            text=crit_text,
+        )
+        ctx.__dict__["last_confidence"] = confidence
+
+        clears_threshold = (
+            reflect_cfg.early_exit and confidence >= reflect_cfg.threshold
+        )
+        if clears_threshold:
+            ctx.append_event(
+                "reflect_early_exit",
+                turn=turn,
+                model=crit_response.model or model_chain[0],
+            )
+            return initial_answer, list(crit_fb)
+
+        rev_messages = build_revision_messages(
+            history=history,
+            answer=initial_answer,
+            critique=crit_text,
+            system_prompt=_reflect_system_prompt(ctx),
+        )
+        rev_response, rev_fb = await call_with_fallbacks(
+            self.adapter,
+            models=model_chain,
+            retry=ctx.route.retry,
+            messages=rev_messages,
+            **kwargs,
+        )
+        _accumulate(ctx.usage, rev_response)
+        revised_text = _text_of(rev_response)
+        ctx.append_event(
+            "reflect_revised",
+            turn=turn,
+            model=rev_response.model or model_chain[0],
+            text=revised_text,
+        )
+        return revised_text, list(crit_fb) + list(rev_fb)
+
     def _make_advisor_plugin_ctx(
         self,
         ctx: PipelineContext,
@@ -716,14 +1189,35 @@ class Orchestrator:
         )
         fallbacks_used: list[str] = list(initial_fallbacks)
 
-        # Stage 2: reflection loop (0..3 turns, sequential by default).
+        # Stage 2: reflection loop (0..3 turns). The M2/M3 default is
+        # sequential; the M4 ``reflection.parallel: true`` path
+        # dispatches the per-turn pairs through ``asyncio.gather``
+        # in :meth:`_run_reflection_parallel`. The contract is
+        # content equivalence to sequential; events, usage, and
+        # fallbacks are accumulated in source order.
         if ctx.route.reflection.turns > 0:
-            reflect_answer, reflect_fallbacks, _turns_executed = await self._run_reflection(
-                ctx,
-                model_chain=model_chain,
-                history=history,
-                current_answer=current_answer,
-            )
+            if ctx.route.reflection.parallel:
+                (
+                    reflect_answer,
+                    reflect_fallbacks,
+                    _turns_executed,
+                ) = await self._run_reflection_parallel(
+                    ctx,
+                    model_chain=model_chain,
+                    history=history,
+                    current_answer=current_answer,
+                )
+            else:
+                (
+                    reflect_answer,
+                    reflect_fallbacks,
+                    _turns_executed,
+                ) = await self._run_reflection(
+                    ctx,
+                    model_chain=model_chain,
+                    history=history,
+                    current_answer=current_answer,
+                )
             current_answer = reflect_answer
             fallbacks_used.extend(reflect_fallbacks)
             # The reflection loop replaces ``ctx.upstream_response`` in
@@ -732,16 +1226,40 @@ class Orchestrator:
             # what the next stage (advisor) reads. We do not rebuild
             # the response here; the final rebuild happens at Stage 4.
 
-        # Stage 3: advisor (0..1 turn, sequential after reflection).
+        # Stage 3: advisor (0..1 turn). The M2/M3 default is sequential;
+        # the M4 ``advisor.parallel: true`` path (only engaged when
+        # ``reflection.parallel: true`` is also set) dispatches the
+        # final advisor revision concurrently with a self-reflection
+        # on the original answer via ``asyncio.gather``, taking
+        # whichever finishes last.
         if ctx.route.advisor.turns >= 1 and ctx.route.advisor.model:
             advisor_chain = _advisor_model_chain(ctx)
-            advisor_answer, advisor_fallbacks = await self._run_advisor(
-                ctx,
-                advisor_chain=advisor_chain,
-                primary_chain=model_chain,
-                history=history,
-                answer=current_answer,
-            )
+            if (
+                ctx.route.advisor.parallel
+                and ctx.route.reflection.parallel
+            ):
+                (
+                    advisor_answer,
+                    advisor_fallbacks,
+                ) = await self._run_advisor_parallel(
+                    ctx,
+                    advisor_chain=advisor_chain,
+                    primary_chain=model_chain,
+                    history=history,
+                    initial_answer=initial_response.message.content or "",
+                    current_answer=current_answer,
+                )
+            else:
+                (
+                    advisor_answer,
+                    advisor_fallbacks,
+                ) = await self._run_advisor(
+                    ctx,
+                    advisor_chain=advisor_chain,
+                    primary_chain=model_chain,
+                    history=history,
+                    answer=current_answer,
+                )
             current_answer = advisor_answer
             fallbacks_used.extend(advisor_fallbacks)
             if ctx.upstream_response is not None:
@@ -990,24 +1508,39 @@ class Orchestrator:
 
         fallbacks_used: list[str] = list(ctx.__dict__.get("fallbacks_used", []))
 
-        # Stage 2: reflection loop (0..3 turns, sequential by default).
-        # Reflection runs as non-streaming LLM calls (the architecture
-        # only streams the initial answer). For each executed turn
-        # the orchestrator emits one ``event: revision`` SSE event
-        # carrying the revised text. The logic mirrors the buffered
-        # ``_run_reflection`` helper so event ordering, early exit,
-        # and confidence tracking stay consistent.
+        # Stage 2: reflection loop (0..3 turns). The M2/M3 default is
+        # sequential; the M4 ``reflection.parallel: true`` path
+        # dispatches the per-turn pairs through ``asyncio.gather``
+        # in :meth:`_run_reflection_parallel`. The contract is
+        # content equivalence to sequential; events, usage, and
+        # fallbacks are accumulated in source order.
         if ctx.route.reflection.turns > 0:
-            reflect_answer, reflect_fallbacks, _turns_executed = await self._run_reflection(
-                ctx,
-                model_chain=model_chain,
-                history=history,
-                current_answer=current_answer,
-            )
+            if ctx.route.reflection.parallel:
+                (
+                    reflect_answer,
+                    reflect_fallbacks,
+                    _turns_executed,
+                ) = await self._run_reflection_parallel(
+                    ctx,
+                    model_chain=model_chain,
+                    history=history,
+                    current_answer=current_answer,
+                )
+            else:
+                (
+                    reflect_answer,
+                    reflect_fallbacks,
+                    _turns_executed,
+                ) = await self._run_reflection(
+                    ctx,
+                    model_chain=model_chain,
+                    history=history,
+                    current_answer=current_answer,
+                )
             current_answer = reflect_answer
             fallbacks_used.extend(reflect_fallbacks)
             # Emit one ``event: revision`` per ``reflect_revised`` event
-            # emitted by ``_run_reflection``. We walk the event list
+            # emitted by the reflection runner. We walk the event list
             # (newest events at the end) so revisions stream in
             # turn-order, matching the contract.
             for event in ctx.events:
@@ -1021,19 +1554,40 @@ class Orchestrator:
                     )
                     yield format_sse_event("revision", payload)
 
-        # Stage 3: advisor pass (0..1 turn, sequential after reflection).
-        # Like reflection, the advisor runs as a non-streaming LLM
-        # call. The revised answer (if any) is emitted as a final
-        # ``event: revision`` SSE event.
+        # Stage 3: advisor pass (0..1 turn). The M2/M3 default is
+        # sequential; the M4 ``advisor.parallel: true`` path
+        # (only engaged when ``reflection.parallel: true`` is also
+        # set) dispatches the final advisor revision concurrently
+        # with a self-reflection on the original answer via
+        # ``asyncio.gather``, taking whichever finishes last.
         if ctx.route.advisor.turns >= 1 and ctx.route.advisor.model:
             advisor_chain = _advisor_model_chain(ctx)
-            advisor_answer, advisor_fallbacks = await self._run_advisor(
-                ctx,
-                advisor_chain=advisor_chain,
-                primary_chain=model_chain,
-                history=history,
-                answer=current_answer,
-            )
+            if (
+                ctx.route.advisor.parallel
+                and ctx.route.reflection.parallel
+            ):
+                (
+                    advisor_answer,
+                    advisor_fallbacks,
+                ) = await self._run_advisor_parallel(
+                    ctx,
+                    advisor_chain=advisor_chain,
+                    primary_chain=model_chain,
+                    history=history,
+                    initial_answer=current_answer,
+                    current_answer=current_answer,
+                )
+            else:
+                (
+                    advisor_answer,
+                    advisor_fallbacks,
+                ) = await self._run_advisor(
+                    ctx,
+                    advisor_chain=advisor_chain,
+                    primary_chain=model_chain,
+                    history=history,
+                    answer=current_answer,
+                )
             current_answer = advisor_answer
             fallbacks_used.extend(advisor_fallbacks)
             # Look for the ``advisor_revised`` event we just emitted

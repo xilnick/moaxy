@@ -601,10 +601,20 @@ class TestCustomSystemPrompt:
 
 
 class TestParallelTrue:
-    """``parallel: true`` is a future-mode toggle; M2 still runs sequentially."""
+    """``reflection.parallel: true`` engages the M4 parallel path.
+
+    The parallel path uses :func:`asyncio.gather` to schedule the
+    per-turn critique+revision pairs concurrently. The chain is
+    preserved: turn N+1's critique uses turn N's revision as input.
+    The contract pins content equivalence to the sequential path
+    (VAL-PIPE-009); no strict timing assertion is made.
+    """
 
     @pytest.mark.asyncio
-    async def test_parallel_true_runs_sequential(self):
+    async def test_parallel_true_runs_equivalent_to_sequential(self):
+        """``reflection.parallel: true, turns: 2`` matches the sequential
+        final content (VAL-PIPE-009).
+        """
         adapter = FakeAdapter(
             [
                 _response("initial"),
@@ -623,7 +633,9 @@ class TestParallelTrue:
         ctx = _build_context(route)
         await Orchestrator(adapter).run(ctx)
 
-        # 5 calls in the same source order; the toggle does not change behaviour.
+        # 5 calls; the parallel path uses asyncio.gather but the chain
+        # is preserved so the LLM call order matches the sequential
+        # reference.
         assert len(adapter.calls) == 5
         assert [e.type for e in ctx.events] == [
             "initial",
@@ -632,6 +644,10 @@ class TestParallelTrue:
             "reflect_critique",
             "reflect_revised",
         ]
+        # Content equivalence: the final answer is rev2, matching
+        # the sequential path.
+        assert ctx.upstream_response is not None
+        assert ctx.upstream_response.message.content == "rev2"
 
     @pytest.mark.asyncio
     async def test_parallel_true_does_not_break_early_exit(self):
@@ -640,10 +656,11 @@ class TestParallelTrue:
             [
                 _response("initial"),
                 _critique_response("c1", confidence=0.95),
+                _response("rev1"),
             ]
         )
         route = _build_route(
-            reflection_turns=1,
+            reflection_turns=2,
             early_exit=True,
             threshold=0.85,
             parallel=True,
@@ -651,12 +668,17 @@ class TestParallelTrue:
         ctx = _build_context(route)
         await Orchestrator(adapter).run(ctx)
 
-        assert len(adapter.calls) == 2
+        assert len(adapter.calls) == 3
         assert [e.type for e in ctx.events] == [
             "initial",
             "reflect_critique",
+            "reflect_revised",
             "reflect_early_exit",
         ]
+        # Content equivalence: the final answer is rev1 (the
+        # post-early-exit revision), matching the sequential path.
+        assert ctx.upstream_response is not None
+        assert ctx.upstream_response.message.content == "rev1"
 
 
 # ────────────────────────────────────────────────────────────────────

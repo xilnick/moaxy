@@ -1407,14 +1407,18 @@ class TestAdvisorAfterReflection:
 
 
 class TestAdvisorParallelCorrectness:
-    """``advisor.parallel: true`` is a M4 toggle; M3 still runs sequentially.
+    """``advisor.parallel: true`` engages the M4 parallel path.
 
-    M3 keeps the sequential default. The ``parallel: true`` config
-    option is accepted by :class:`AdvisorConfig` (forward-compatibility
-    with M4) but the orchestrator's behaviour is unchanged. These
-    tests pin that contract: the response content is correct, the
-    call count matches the sequential path, and no ordering corruption
-    is observed.
+    The M4 contract is that when ``reflection.parallel: true`` AND
+    ``advisor.parallel: true`` are both set, the orchestrator runs
+    the final advisor revision concurrently with a self-reflection
+    on the original answer, taking whichever finishes last. The
+    contract pins content equivalence to the sequential path
+    (VAL-PIPE-021); no strict timing assertion is made.
+
+    The scripted FakeAdapter tests below supply responses for both
+    concurrent paths (advisor and self-reflection); the orchestrator
+    may consume them in either order.
     """
 
     def _make_response(
@@ -1438,14 +1442,28 @@ class TestAdvisorParallelCorrectness:
         )
 
     @pytest.mark.asyncio
-    async def test_advisor_parallel_true_runs_sequentially(self):
-        """``advisor.parallel: true`` is a no-op in M3; the advisor still
-        runs after the initial call (sequential)."""
+    async def test_advisor_parallel_true_runs_equivalent_to_sequential(self):
+        """``advisor.parallel=true`` (with ``reflection.parallel=true``)
+        runs the advisor and a self-reflection on the initial
+        answer concurrently via ``asyncio.gather``. The scripted
+        response queue supplies responses for both paths; the
+        orchestrator consumes them in either order, but the final
+        answer is content-equivalent to the sequential path.
+        """
+        # Script: 2 for the advisor path (advisor call, no primary
+        # revision because ADVISOR_APPROVE), 2 for the self-
+        # reflection on the initial answer.
         adapter = ScriptedAdapter(
             [
                 self._make_response("initial"),
                 self._make_response(
                     "ADVISOR_APPROVE", model="deepseek-v4-pro:cloud"
+                ),
+                self._make_response(
+                    "self_critique", model="minimax-m3:cloud"
+                ),
+                self._make_response(
+                    "self_revised", model="minimax-m3:cloud"
                 ),
             ]
         )
@@ -1463,11 +1481,11 @@ class TestAdvisorParallelCorrectness:
             match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
             backend="ollama-local",
             aliases={"coder-pro": "minimax-m3:cloud"},
-            reflection=ReflectionConfig(turns=0),
+            reflection=ReflectionConfig(turns=0, parallel=True),
             advisor=AdvisorConfig(
                 model="deepseek-v4-pro:cloud",
                 turns=1,
-                parallel=True,  # M4 toggle; M3 still runs sequentially.
+                parallel=True,  # M4 path; engages when reflection.parallel is also true.
             ),
         )
         route = RouteMatch(
@@ -1494,7 +1512,10 @@ class TestAdvisorParallelCorrectness:
             original_model=route.original_model,
         )
         await Orchestrator(adapter).run(ctx)
-        # Two calls in the same source order: initial then advisor.
+        # The M4 path runs the advisor and a (noop) self-reflection
+        # concurrently. With reflection.turns=0 the self-reflection
+        # is a no-op, so the only LLM calls are the initial and the
+        # advisor.
         assert len(adapter.calls) == 2
         # The advisor header is present.
         headers = build_response_headers(ctx, request_id=ctx.request_id)
