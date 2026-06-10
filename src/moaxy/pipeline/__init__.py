@@ -7,10 +7,12 @@ and walk the per-model fallback list. Adapters stay backend-agnostic;
 the pipeline composes them per request.
 """
 
+from moaxy.pipeline.advisor import advisor_turn, parse_advisor_response
 from moaxy.pipeline.context import PipelineContext, PipelineEvent
 from moaxy.pipeline.fallback import UpstreamExhaustedError, call_with_fallbacks
 from moaxy.pipeline.message_builders import (
     build_advisor_messages,
+    build_advisor_revision_messages,
     build_reflection_messages,
     build_revision_messages,
 )
@@ -28,11 +30,14 @@ __all__ = [
     "PipelineContext",
     "PipelineEvent",
     "UpstreamExhaustedError",
+    "advisor_turn",
     "build_advisor_messages",
+    "build_advisor_revision_messages",
     "build_reflection_messages",
     "build_response_headers",
     "build_revision_messages",
     "call_with_fallbacks",
+    "parse_advisor_response",
     "parse_confidence",
     "reflect_turn",
 ]

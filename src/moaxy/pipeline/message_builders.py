@@ -33,6 +33,7 @@ from typing import Any
 _REFLECT_PROMPT_PREFIX = "Please critique"
 _REVISE_PROMPT_PREFIX = "Please revise"
 _ADVISE_PROMPT_PREFIX = "advise on this"
+_ADVISOR_REVISE_PROMPT_PREFIX = "incorporate the advisor's feedback"
 
 
 def _copy_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -167,8 +168,59 @@ def build_advisor_messages(
     return messages
 
 
+def build_advisor_revision_messages(
+    history: list[dict[str, Any]],
+    answer: str,
+    advisor_feedback: str,
+    system_prompt: str | None,
+) -> list[dict[str, Any]]:
+    """Build the message list for the primary model's post-advisor revision.
+
+    The returned list contains, in order:
+
+    1. The reflector ``system_prompt`` (when non-empty). The
+       post-advisor revision is done by the primary model in the
+       reflector role, so the reflector system prompt is the
+       appropriate framing.
+    2. A deep copy of the client's ``history``.
+    3. A user-role message naming the post-reflection answer and
+       asking the primary model to critique it (the same content
+       used by :func:`build_reflection_messages`).
+    4. An assistant-role message holding the primary model's previous
+       answer so the revision call sees the full dialogue.
+    5. A user-role message asking the primary model to incorporate
+       the advisor's feedback into its previous answer
+       (``"Please incorporate the advisor's feedback into your
+       previous answer:\\n" + advisor_feedback``). The literal
+       prefix ``"incorporate the advisor's feedback"`` matches the
+       validation contract.
+
+    The input ``history`` list and its dicts are not mutated.
+    """
+    messages: list[dict[str, Any]] = []
+    messages.extend(_system_message(system_prompt))
+    messages.extend(_copy_history(history))
+    messages.append(
+        {
+            "role": "user",
+            "content": f"{_REFLECT_PROMPT_PREFIX} the following answer:\n{answer}",
+        }
+    )
+    messages.append({"role": "assistant", "content": answer})
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                f"Please {_ADVISOR_REVISE_PROMPT_PREFIX} into your previous answer:\n{advisor_feedback}"
+            ),
+        }
+    )
+    return messages
+
+
 __all__ = [
     "build_advisor_messages",
+    "build_advisor_revision_messages",
     "build_reflection_messages",
     "build_revision_messages",
 ]

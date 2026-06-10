@@ -75,10 +75,12 @@ from moaxy.adapters.base import (
     Message,
     UsageAccumulator,
 )
+from moaxy.pipeline.advisor import parse_advisor_response
 from moaxy.pipeline.context import PipelineContext
 from moaxy.pipeline.fallback import call_with_fallbacks
 from moaxy.pipeline.message_builders import (
     build_advisor_messages,
+    build_advisor_revision_messages,
     build_reflection_messages,
     build_revision_messages,
 )
@@ -87,6 +89,7 @@ from moaxy.pipeline.prompts import (
     DEFAULT_REFLECT_PROMPT,
 )
 from moaxy.pipeline.reflector import parse_confidence
+from moaxy.plugins.manager import PluginManager
 
 logger = logging.getLogger(__name__)
 
@@ -174,35 +177,14 @@ def _is_advisor_approval(text: str) -> bool:
     The advisor emits ``ADVISOR_APPROVE`` (optionally with trailing
     text/whitespace) when it has nothing to revise. Any other output
     is treated as a revision.
+
+    DEPRECATED: this helper is retained for backwards compatibility
+    with external callers; the M3 advisor stage uses
+    :func:`moaxy.pipeline.advisor.parse_advisor_response` instead.
     """
     if not isinstance(text, str) or not text:
         return False
     return "ADVISOR_APPROVE" in text
-
-
-def _advisor_revised_text(text: str) -> str:
-    """Extract the revised text after an ``ADVISOR_REVISE:`` marker.
-
-    The advisor's revised answer lives after the literal ``ADVISOR_REVISE:``
-    prefix on the first line. When the marker is missing, the entire
-    text is returned unchanged; that case should be rare (a model that
-    follows the intent but forgets the prefix), and the orchestrator
-    conservatively treats the whole thing as the revised answer.
-    """
-    if not isinstance(text, str):
-        return ""
-    marker = "ADVISOR_REVISE:"
-    idx = text.find(marker)
-    if idx < 0:
-        return text.strip()
-    return text[idx + len(marker):].lstrip("\n").strip()
-
-
-def _has_advice_marker(text: str) -> bool:
-    """Return True if the advisor's text contains the ``ADVISOR_REVISE:`` marker."""
-    if not isinstance(text, str) or not text:
-        return False
-    return "ADVISOR_REVISE:" in text
 
 
 class Orchestrator:
@@ -222,10 +204,23 @@ class Orchestrator:
             step, and the advisor pass; per-model retries and
             fallbacks are layered on top by
             :func:`moaxy.pipeline.fallback.call_with_fallbacks`.
+        plugin_manager: Optional :class:`moaxy.plugins.manager.PluginManager`
+            instance. When set, the orchestrator surfaces it on the
+            advisor's plugin context so :func:`moaxy.pipeline.advisor.advisor_turn`
+            can dispatch :class:`moaxy.plugins.types.PluginType.ADVISOR`
+            plugins per advisor pass. When ``None``, the advisor stage
+            runs without plugin dispatch (consistent with the
+            REFLECTOR-plugin path that lives inside the reflector
+            module).
     """
 
-    def __init__(self, adapter: Adapter) -> None:
+    def __init__(
+        self,
+        adapter: Adapter,
+        plugin_manager: PluginManager | None = None,
+    ) -> None:
         self.adapter = adapter
+        self.plugin_manager = plugin_manager
 
     async def _initial_call(
         self,
@@ -331,6 +326,11 @@ class Orchestrator:
         Builds the advisor message list, dispatches via the fallback
         walker, and returns the response and the fallback models
         actually used.
+
+        DEPRECATED: the M3 advisor stage inlines the call into
+        :meth:`_run_advisor` (so the parsed decision and the plugin
+        dispatch live in the same coroutine). The method is retained
+        for backwards compatibility with any external callers.
         """
         assert ctx.route is not None
         kwargs = _sampling_kwargs(ctx.request)
@@ -342,6 +342,41 @@ class Orchestrator:
         response, fallbacks_used = await call_with_fallbacks(
             self.adapter,
             models=advisor_chain,
+            retry=ctx.route.retry,
+            messages=messages,
+            **kwargs,
+        )
+        return response, fallbacks_used
+
+    async def _primary_advisor_revision(
+        self,
+        ctx: PipelineContext,
+        *,
+        model_chain: list[str],
+        history: list[dict[str, Any]],
+        answer: str,
+        advisor_feedback: str,
+    ) -> tuple[ChatResponse, list[str]]:
+        """Run the primary-model revision after an advisor REVISE.
+
+        When the advisor emits ``ADVISOR_REVISE:``, the orchestrator
+        re-prompts the primary model with the advisor's feedback to
+        produce the final revised answer. This helper builds the
+        revision message list with
+        :func:`moaxy.pipeline.message_builders.build_advisor_revision_messages`
+        and dispatches via the fallback walker.
+        """
+        assert ctx.route is not None
+        kwargs = _sampling_kwargs(ctx.request)
+        messages = build_advisor_revision_messages(
+            history=history,
+            answer=answer,
+            advisor_feedback=advisor_feedback,
+            system_prompt=_reflect_system_prompt(ctx),
+        )
+        response, fallbacks_used = await call_with_fallbacks(
+            self.adapter,
+            models=model_chain,
             retry=ctx.route.retry,
             messages=messages,
             **kwargs,
@@ -462,28 +497,52 @@ class Orchestrator:
         ctx: PipelineContext,
         *,
         advisor_chain: list[str],
+        primary_chain: list[str],
         history: list[dict[str, Any]],
         answer: str,
     ) -> tuple[str, list[str]]:
         """Run the 0..1-turn advisor pass and return the (possibly revised) answer.
 
+        The advisor makes one LLM call against ``advisor_chain`` and
+        either approves the post-reflection answer (in which case the
+        answer is returned unchanged) or revises it. On a revise, the
+        orchestrator issues a follow-up primary-model call against
+        ``primary_chain`` with the advisor's feedback baked into the
+        prompt; the primary model's response becomes the final answer.
+
         Returns:
-            A ``(final_answer, fallbacks_used)`` tuple. The advisor's
-            input is the post-reflection answer; its output either
-            approves the previous answer (in which case the input is
-            returned unchanged) or revises it (in which case the
-            post-``ADVISOR_REVISE:`` text is returned).
+            A ``(final_answer, fallbacks_used)`` tuple. ``final_answer``
+            is the assistant text to use as the response body. On
+            ``ADVISOR_APPROVE`` the post-reflection answer is returned
+            unchanged. On ``ADVISOR_REVISE:`` the post-primary-revision
+            text is returned. ``fallbacks_used`` aggregates the fallback
+            models the walker used across both the advisor and the
+            post-advisor primary revision.
         """
         assert ctx.route is not None
         advisor_cfg = ctx.route.advisor
         if advisor_cfg.turns < 1 or not advisor_cfg.model:
             return answer, []
 
-        response, fallbacks_used = await self._advisor_call(
-            ctx,
-            advisor_chain=advisor_chain,
+        # Stage 1: the advisor LLM call. The orchestrator dispatches
+        # through ``call_with_fallbacks`` for retry/fallback support,
+        # then delegates parsing and ADVISOR-plugin dispatch to
+        # :func:`moaxy.pipeline.advisor.advisor_turn` (the M3 advisor
+        # public API). The helper runs the parser (``parse_advisor_response``)
+        # and the configured ADVISOR plugins; the orchestrator owns
+        # the ChatResponse for usage accumulation and event emission.
+        kwargs = _sampling_kwargs(ctx.request)
+        messages = build_advisor_messages(
             history=history,
             answer=answer,
+            system_prompt=_advisor_system_prompt(ctx),
+        )
+        response, fallbacks_used = await call_with_fallbacks(
+            self.adapter,
+            models=advisor_chain,
+            retry=ctx.route.retry,
+            messages=messages,
+            **kwargs,
         )
         _accumulate(ctx.usage, response)
         text = _text_of(response)
@@ -493,20 +552,88 @@ class Orchestrator:
             text=text,
         )
 
-        if _is_advisor_approval(text):
+        # Stage 2: parse the verdict and dispatch ADVISOR plugins. The
+        # helper's plugin context is a plain dict (the plugin manager
+        # expects a dict, not the typed PipelineContext), so the
+        # orchestrator seeds the dict with the keys the plugins need.
+        plugin_ctx = self._make_advisor_plugin_ctx(ctx, response)
+        # Pre-seed the parsed verdict so plugins can read it; the helper
+        # re-parses the text to derive these values, so this is a no-op
+        # when the helper's parser agrees (which it always does for the
+        # well-defined ADVISOR_* markers).
+        decision, revised_text = parse_advisor_response(text)
+        plugin_ctx["advisor_decision"] = decision
+        plugin_ctx["advisor_text"] = text
+        plugin_ctx["advisor_revised_text"] = revised_text
+        plugin_ctx["advisor_model"] = response.model or advisor_cfg.model
+        if self.plugin_manager is not None:
+            from moaxy.plugins.types import PluginType
+
+            await self.plugin_manager.run(
+                plugin_ctx, plugin_types=[PluginType.ADVISOR]
+            )
+
+        if decision == "approve":
             ctx.append_event(
                 "advisor_approve",
                 model=response.model or advisor_cfg.model,
             )
             return answer, fallbacks_used
 
-        revised = _advisor_revised_text(text) if _has_advice_marker(text) else text.strip()
+        # Stage 3: advisor REVISE. The orchestrator issues a primary-
+        # model call with the advisor's feedback to produce the final
+        # revised answer. This is the canonical "incorporate the
+        # advisor's feedback" path; the primary model is the one whose
+        # name ends up in the final response body.
         ctx.append_event(
             "advisor_revised",
             model=response.model or advisor_cfg.model,
-            text=revised,
+            text=revised_text or "",
         )
-        return revised, fallbacks_used
+        revision_response, rev_fallbacks_used = await self._primary_advisor_revision(
+            ctx,
+            model_chain=primary_chain,
+            history=history,
+            answer=answer,
+            advisor_feedback=revised_text or "",
+        )
+        _accumulate(ctx.usage, revision_response)
+        ctx.append_event(
+            "advisor_revision",
+            model=revision_response.model or primary_chain[0],
+            text=_text_of(revision_response),
+        )
+        fallbacks_used.extend(rev_fallbacks_used)
+        return _text_of(revision_response), fallbacks_used
+
+    def _make_advisor_plugin_ctx(
+        self,
+        ctx: PipelineContext,
+        response: ChatResponse,
+    ) -> dict[str, Any]:
+        """Build the dict context :func:`advisor_turn` reads for plugin dispatch.
+
+        The orchestrator stores the ``PipelineContext`` on a typed
+        object; the plugin manager expects a plain dict. This helper
+        surfaces the keys the advisor plugins need (adapter, plugin
+        manager, request id, route name, request body) into a fresh
+        dict so plugins can read them without depending on the typed
+        context. The returned dict also seeds ``response`` and
+        ``model`` so plugins can read the parsed ChatResponse.
+        """
+        route_name = ""
+        if ctx.route is not None and ctx.route.route is not None:
+            route_name = ctx.route.route.name
+        plugin_ctx: dict[str, Any] = {
+            "adapter": self.adapter,
+            "plugin_manager": self.plugin_manager,
+            "request_id": ctx.request_id,
+            "route": route_name,
+            "request": ctx.request,
+            "response": response,
+            "model": response.model,
+        }
+        return plugin_ctx
 
     async def run(self, ctx: PipelineContext) -> PipelineContext:
         """Run the full initial → reflection → advisor pipeline.
@@ -607,6 +734,7 @@ class Orchestrator:
             advisor_answer, advisor_fallbacks = await self._run_advisor(
                 ctx,
                 advisor_chain=advisor_chain,
+                primary_chain=model_chain,
                 history=history,
                 answer=current_answer,
             )

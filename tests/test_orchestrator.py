@@ -560,14 +560,19 @@ class TestAdvisorStage:
 
     @pytest.mark.asyncio
     async def test_advisor_revise_replaces_response(self):
-        """VAL-PIPE-032: ADVISOR_REVISE: → response content = revised text."""
-        revised_text = "this is the advisor's revised answer"
+        """VAL-PIPE-032: ADVISOR_REVISE: → primary model issues a final revision."""
+        advisor_text = "this is the advisor's revised answer"
+        final_answer = "this is the primary model's final revised answer"
         adapter = ScriptedAdapter(
             [
                 _response("initial"),
                 _response("c\nREFLECT_CONFIDENCE: 0.5"),
                 _response("revised"),
-                _response(f"ADVISOR_REVISE: {revised_text}", prompt_tokens=4, completion_tokens=10),
+                _response(f"ADVISOR_REVISE: {advisor_text}", prompt_tokens=4, completion_tokens=10),
+                # The orchestrator issues a primary revision call with
+                # the advisor's feedback baked in; the response of that
+                # call becomes the final body content.
+                _response(final_answer, prompt_tokens=4, completion_tokens=10),
             ]
         )
         route = _build_route(
@@ -585,9 +590,11 @@ class TestAdvisorStage:
             "reflect_revised",
             "advisor",
             "advisor_revised",
+            "advisor_revision",
         ]
         assert ctx.upstream_response is not None
-        assert ctx.upstream_response.message.content == revised_text
+        # The final response content is the post-primary-revision text.
+        assert ctx.upstream_response.message.content == final_answer
 
     @pytest.mark.asyncio
     async def test_advisor_turns_0_skips_advisor(self):
@@ -745,13 +752,15 @@ class TestUsageAccumulation:
 
     @pytest.mark.asyncio
     async def test_usage_includes_advisor_revise_call(self):
-        """VAL-PIPE-025: advisor revise call usage is summed in."""
+        """VAL-PIPE-025: advisor revise call usage is summed in (advisor + primary revision)."""
         adapter = ScriptedAdapter(
             [
                 _response("initial", prompt_tokens=10, completion_tokens=5),
                 _response("c\nREFLECT_CONFIDENCE: 0.5", prompt_tokens=8, completion_tokens=3),
                 _response("r", prompt_tokens=8, completion_tokens=3),
                 _response("ADVISOR_REVISE: final", prompt_tokens=4, completion_tokens=2),
+                # Primary revision call after advisor REVISE.
+                _response("final answer", prompt_tokens=4, completion_tokens=2),
             ]
         )
         route = _build_route(
@@ -763,8 +772,9 @@ class TestUsageAccumulation:
         ctx = _build_context(route)
         await Orchestrator(adapter).run(ctx)
         snap = ctx.usage.snapshot()
-        assert snap.prompt_tokens == 10 + 8 + 8 + 4
-        assert snap.completion_tokens == 5 + 3 + 3 + 2
+        # 5 calls: initial, critique, revise, advisor, primary-revision.
+        assert snap.prompt_tokens == 10 + 8 + 8 + 4 + 4
+        assert snap.completion_tokens == 5 + 3 + 3 + 2 + 2
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -814,6 +824,8 @@ class TestResponseModelEchoesAlias:
                 _response("c\nREFLECT_CONFIDENCE: 0.5"),
                 _response("r"),
                 _response("ADVISOR_REVISE: final"),
+                # Primary revision after the advisor REVISE.
+                _response("primary-final"),
             ]
         )
         route = _build_route(
@@ -828,7 +840,8 @@ class TestResponseModelEchoesAlias:
         await Orchestrator(adapter).run(ctx)
         assert ctx.upstream_response is not None
         assert ctx.upstream_response.model == "coder-pro"
-        assert ctx.upstream_response.message.content == "final"
+        # The final response is the primary revision's text.
+        assert ctx.upstream_response.message.content == "primary-final"
 
 
 # ────────────────────────────────────────────────────────────────────
