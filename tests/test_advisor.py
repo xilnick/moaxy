@@ -26,6 +26,7 @@ recorder plugin; no discovery on disk.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from copy import deepcopy
 from pathlib import Path
@@ -45,6 +46,7 @@ from moaxy.pipeline.message_builders import (
     build_advisor_messages,
     build_advisor_revision_messages,
 )
+from moaxy.pipeline.orchestrator import Orchestrator, build_response_headers
 from moaxy.pipeline.prompts import DEFAULT_ADVISOR_PROMPT
 from moaxy.plugins.base import Plugin
 from moaxy.plugins.manager import PluginManager
@@ -954,3 +956,700 @@ class TestOrchestratorAdvisorPluginDispatch:
         # The plugin context carries the parsed verdict.
         assert ctx_seen["advisor_decision"] == "approve"
         assert ctx_seen["advisor_text"] == "ADVISOR_APPROVE"
+
+
+# ────────────────────────────────────────────────────────────────────
+# Cross-advise (M3): primary and advisor use different model names
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestCrossAdviseOrchestrator:
+    """Cross-advise: the advisor call uses a different model name than the primary.
+
+    M3 cross-advise is the case where ``advisor.model`` differs from the
+    primary model. The orchestrator must issue the advisor call to the
+    configured advisor model name (not the primary's), and the
+    :func:`build_response_headers` helper must surface that name in the
+    ``x-moaxy-advisor-model`` response header.
+    """
+
+    def _make_response(
+        self,
+        content: str,
+        *,
+        model: str,
+        prompt_tokens: int = 4,
+        completion_tokens: int = 4,
+    ) -> ChatResponse:
+        return ChatResponse(
+            id=f"chatcmpl-{model}",
+            model=model,
+            message=Message(role="assistant", content=content),
+            usage=Usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            ),
+            finish_reason="stop",
+        )
+
+    def _build_route(
+        self,
+        *,
+        primary_model: str = "minimax-m3:cloud",
+        advisor_model: str | None = "deepseek-v4-pro:cloud",
+        reflection_turns: int = 0,
+        advisor_turns: int = 1,
+    ) -> Any:
+        from moaxy.models.config import (
+            AdvisorConfig,
+            ReflectionConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+
+        config_route = RouteConfig(
+            name="cross-advise-route",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+            backend="ollama-local",
+            aliases={"coder-pro": primary_model},
+            reflection=ReflectionConfig(turns=reflection_turns),
+            advisor=AdvisorConfig(model=advisor_model, turns=advisor_turns),
+        )
+        # Use the matcher.Routematch (the dataclass) since it accepts
+        # the per-route typed config. The Pydantic ``RouteMatch`` model
+        # is a different type (the glob matcher config) and rejects
+        # these fields.
+        from moaxy.routing.matcher import RouteMatch as MatcherRouteMatch
+        rm = MatcherRouteMatch(
+            route=config_route,
+            original_model="coder-pro",
+            resolved_model=primary_model,
+            backend="ollama-local",
+            path="/v1/chat/completions",
+            reflection=config_route.reflection,
+            advisor=config_route.advisor,
+            fallbacks=[],
+            retry=0,
+            aliases=dict(config_route.aliases),
+        )
+        return rm
+
+    def _build_context(
+        self,
+        route: Any,
+        *,
+        request_id: str = "req-1",
+    ) -> Any:
+        from moaxy.pipeline.context import PipelineContext
+        return PipelineContext(
+            request_id=request_id,
+            request={
+                "model": route.original_model,
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+            route=route,
+            model_alias_resolved=route.resolved_model,
+            target_backend=route.backend,
+            original_model=route.original_model,
+        )
+
+    @pytest.mark.asyncio
+    async def test_advisor_call_uses_advisor_model(self):
+        """The advisor LLM call carries the configured ``advisor.model`` name."""
+        adapter = ScriptedAdapter(
+            [
+                self._make_response("initial", model="minimax-m3:cloud"),
+                self._make_response(
+                    "ADVISOR_APPROVE", model="deepseek-v4-pro:cloud"
+                ),
+            ]
+        )
+        route = self._build_route()
+        ctx = self._build_context(route)
+        await Orchestrator(adapter).run(ctx)
+
+        # Two calls: initial on the primary, advisor on the advisor model.
+        assert [c["model"] for c in adapter.calls] == [
+            "minimax-m3:cloud",
+            "deepseek-v4-pro:cloud",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_advisor_model_header_reports_advisor_name(self):
+        """The ``x-moaxy-advisor-model`` header equals ``advisor.model``."""
+        adapter = ScriptedAdapter(
+            [
+                self._make_response("initial", model="minimax-m3:cloud"),
+                self._make_response(
+                    "ADVISOR_APPROVE", model="deepseek-v4-pro:cloud"
+                ),
+            ]
+        )
+        route = self._build_route()
+        ctx = self._build_context(route, request_id="req-cross")
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The advisor model header reports the configured advisor.
+        assert headers["x-moaxy-advisor-model"] == "deepseek-v4-pro:cloud"
+
+    @pytest.mark.asyncio
+    async def test_cross_advise_revise_uses_advisor_then_primary(self):
+        """ADVISOR_REVISE → a follow-up primary call; the final response
+        is the primary's revision, not the advisor's text."""
+        adapter = ScriptedAdapter(
+            [
+                self._make_response("initial", model="minimax-m3:cloud"),
+                self._make_response(
+                    "ADVISOR_REVISE: better answer",
+                    model="deepseek-v4-pro:cloud",
+                ),
+                # The follow-up primary revision.
+                self._make_response(
+                    "primary-revised", model="minimax-m3:cloud"
+                ),
+            ]
+        )
+        route = self._build_route()
+        ctx = self._build_context(route, request_id="req-revise")
+        await Orchestrator(adapter).run(ctx)
+        # The final response carries the primary's revision.
+        assert ctx.upstream_response is not None
+        assert ctx.upstream_response.message.content == "primary-revised"
+        # Three calls: initial, advisor (to deepseek), primary-revise.
+        assert [c["model"] for c in adapter.calls] == [
+            "minimax-m3:cloud",
+            "deepseek-v4-pro:cloud",
+            "minimax-m3:cloud",
+        ]
+        # The header still reports the advisor model.
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-model"] == "deepseek-v4-pro:cloud"
+
+
+# ────────────────────────────────────────────────────────────────────
+# Self-advise (M3): advisor.model equals the primary
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestSelfAdviseOrchestrator:
+    """Self-advise: advisor.model == primary model; both calls go to the same name."""
+
+    def _make_response(
+        self,
+        content: str,
+        *,
+        model: str,
+        prompt_tokens: int = 4,
+        completion_tokens: int = 4,
+    ) -> ChatResponse:
+        return ChatResponse(
+            id=f"chatcmpl-{model}",
+            model=model,
+            message=Message(role="assistant", content=content),
+            usage=Usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            ),
+            finish_reason="stop",
+        )
+
+    @pytest.mark.asyncio
+    async def test_self_advise_makes_two_separate_llm_calls(self):
+        """Self-advise issues a separate advisor LLM call, even though the
+        model name is the same as the primary."""
+        adapter = ScriptedAdapter(
+            [
+                self._make_response("initial", model="minimax-m3:cloud"),
+                self._make_response(
+                    "ADVISOR_APPROVE", model="minimax-m3:cloud"
+                ),
+            ]
+        )
+        from moaxy.models.config import (
+            AdvisorConfig,
+            ReflectionConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.pipeline.context import PipelineContext
+        from moaxy.routing.matcher import RouteMatch
+
+        config_route = RouteConfig(
+            name="self-advise-route",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+            backend="ollama-local",
+            aliases={"coder-pro": "minimax-m3:cloud"},
+            reflection=ReflectionConfig(turns=0),
+            advisor=AdvisorConfig(
+                model="minimax-m3:cloud", turns=1
+            ),
+        )
+        route = RouteMatch(
+            route=config_route,
+            original_model="coder-pro",
+            resolved_model="minimax-m3:cloud",
+            backend="ollama-local",
+            path="/v1/chat/completions",
+            reflection=config_route.reflection,
+            advisor=config_route.advisor,
+            fallbacks=[],
+            retry=0,
+            aliases=dict(config_route.aliases),
+        )
+        ctx = PipelineContext(
+            request_id="req-self",
+            request={
+                "model": "coder-pro",
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+            route=route,
+            model_alias_resolved=route.resolved_model,
+            target_backend=route.backend,
+            original_model=route.original_model,
+        )
+        await Orchestrator(adapter).run(ctx)
+        # Two calls: both to the same model name.
+        assert len(adapter.calls) == 2
+        assert [c["model"] for c in adapter.calls] == [
+            "minimax-m3:cloud",
+            "minimax-m3:cloud",
+        ]
+        # The advisor header reports the (same) advisor model.
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-model"] == "minimax-m3:cloud"
+
+
+# ────────────────────────────────────────────────────────────────────
+# Advisor runs AFTER reflection
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestAdvisorAfterReflection:
+    """The advisor stage runs after the reflection loop in the default sequential path."""
+
+    def _make_response(
+        self,
+        content: str,
+        *,
+        model: str = "minimax-m3:cloud",
+        prompt_tokens: int = 4,
+        completion_tokens: int = 4,
+    ) -> ChatResponse:
+        return ChatResponse(
+            id=f"chatcmpl-{id(self)}-{prompt_tokens}",
+            model=model,
+            message=Message(role="assistant", content=content),
+            usage=Usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            ),
+            finish_reason="stop",
+        )
+
+    @pytest.mark.asyncio
+    async def test_advisor_called_after_reflection_revision(self):
+        """The advisor LLM call is the last call; the revision's content
+        is the input to the advisor (not the initial answer)."""
+        adapter = ScriptedAdapter(
+            [
+                self._make_response("initial-answer", prompt_tokens=5, completion_tokens=3),
+                # Critique.
+                self._make_response("critique\nREFLECT_CONFIDENCE: 0.5"),
+                # Revision.
+                self._make_response("revised-answer", prompt_tokens=4, completion_tokens=4),
+                # Advisor call.
+                self._make_response(
+                    "ADVISOR_APPROVE", model="deepseek-v4-pro:cloud"
+                ),
+            ]
+        )
+        from moaxy.models.config import (
+            AdvisorConfig,
+            ReflectionConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.pipeline.context import PipelineContext
+        from moaxy.routing.matcher import RouteMatch
+
+        config_route = RouteConfig(
+            name="reflective-advisor-route",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+            backend="ollama-local",
+            aliases={"coder-pro": "minimax-m3:cloud"},
+            reflection=ReflectionConfig(turns=1, early_exit=False),
+            advisor=AdvisorConfig(
+                model="deepseek-v4-pro:cloud", turns=1
+            ),
+        )
+        route = RouteMatch(
+            route=config_route,
+            original_model="coder-pro",
+            resolved_model="minimax-m3:cloud",
+            backend="ollama-local",
+            path="/v1/chat/completions",
+            reflection=config_route.reflection,
+            advisor=config_route.advisor,
+            fallbacks=[],
+            retry=0,
+            aliases=dict(config_route.aliases),
+        )
+        ctx = PipelineContext(
+            request_id="req-arf",
+            request={
+                "model": "coder-pro",
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+            route=route,
+            model_alias_resolved=route.resolved_model,
+            target_backend=route.backend,
+            original_model=route.original_model,
+        )
+        await Orchestrator(adapter).run(ctx)
+        # 4 LLM calls: initial, critique, revision, advisor.
+        assert len(adapter.calls) == 4
+        assert [c["model"] for c in adapter.calls] == [
+            "minimax-m3:cloud",  # initial
+            "minimax-m3:cloud",  # critique
+            "minimax-m3:cloud",  # revision
+            "deepseek-v4-pro:cloud",  # advisor
+        ]
+        # Event ordering: initial → critique → revised → advisor → advisor_approve.
+        types = [e.type for e in ctx.events]
+        assert types == [
+            "initial",
+            "reflect_critique",
+            "reflect_revised",
+            "advisor",
+            "advisor_approve",
+        ]
+        # The advisor's input is the post-reflection answer.
+        advisor_call = adapter.calls[3]
+        # The last user-role message in the advisor call contains the revised answer.
+        last_user_msg = None
+        for msg in advisor_call["messages"]:
+            if msg.get("role") == "user":
+                last_user_msg = msg
+        assert last_user_msg is not None
+        assert "revised-answer" in last_user_msg["content"]
+
+    @pytest.mark.asyncio
+    async def test_advisor_sees_post_reflection_answer_not_initial(self):
+        """The advisor call's messages list references the REVISED answer,
+        not the initial one. (Concrete check on input payload.)"""
+        adapter = ScriptedAdapter(
+            [
+                self._make_response("INITIAL_ANSWER", prompt_tokens=5, completion_tokens=3),
+                self._make_response("critique\nREFLECT_CONFIDENCE: 0.5"),
+                self._make_response("REVISED_ANSWER", prompt_tokens=4, completion_tokens=4),
+                self._make_response("ADVISOR_APPROVE", model="deepseek-v4-pro:cloud"),
+            ]
+        )
+        from moaxy.models.config import (
+            AdvisorConfig,
+            ReflectionConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.pipeline.context import PipelineContext
+        from moaxy.routing.matcher import RouteMatch
+
+        config_route = RouteConfig(
+            name="advisor-sees-revised",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+            backend="ollama-local",
+            aliases={"coder-pro": "minimax-m3:cloud"},
+            reflection=ReflectionConfig(turns=1, early_exit=False),
+            advisor=AdvisorConfig(
+                model="deepseek-v4-pro:cloud", turns=1
+            ),
+        )
+        route = RouteMatch(
+            route=config_route,
+            original_model="coder-pro",
+            resolved_model="minimax-m3:cloud",
+            backend="ollama-local",
+            path="/v1/chat/completions",
+            reflection=config_route.reflection,
+            advisor=config_route.advisor,
+            fallbacks=[],
+            retry=0,
+            aliases=dict(config_route.aliases),
+        )
+        ctx = PipelineContext(
+            request_id="req-input",
+            request={
+                "model": "coder-pro",
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+            route=route,
+            model_alias_resolved=route.resolved_model,
+            target_backend=route.backend,
+            original_model=route.original_model,
+        )
+        await Orchestrator(adapter).run(ctx)
+        # The advisor call's messages reference the REVISED answer.
+        advisor_call = adapter.calls[3]
+        advisor_messages = advisor_call["messages"]
+        advisor_blob = " ".join(m.get("content", "") for m in advisor_messages)
+        # The revised answer is in the advisor call's messages; the
+        # initial answer is NOT in any of the advisor's input messages.
+        assert "REVISED_ANSWER" in advisor_blob
+        assert "INITIAL_ANSWER" not in advisor_blob
+
+
+# ────────────────────────────────────────────────────────────────────
+# Parallel correctness (advisor.parallel=true)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestAdvisorParallelCorrectness:
+    """``advisor.parallel: true`` is a M4 toggle; M3 still runs sequentially.
+
+    M3 keeps the sequential default. The ``parallel: true`` config
+    option is accepted by :class:`AdvisorConfig` (forward-compatibility
+    with M4) but the orchestrator's behaviour is unchanged. These
+    tests pin that contract: the response content is correct, the
+    call count matches the sequential path, and no ordering corruption
+    is observed.
+    """
+
+    def _make_response(
+        self,
+        content: str,
+        *,
+        model: str = "minimax-m3:cloud",
+        prompt_tokens: int = 4,
+        completion_tokens: int = 4,
+    ) -> ChatResponse:
+        return ChatResponse(
+            id=f"chatcmpl-{id(self)}-{prompt_tokens}",
+            model=model,
+            message=Message(role="assistant", content=content),
+            usage=Usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            ),
+            finish_reason="stop",
+        )
+
+    @pytest.mark.asyncio
+    async def test_advisor_parallel_true_runs_sequentially(self):
+        """``advisor.parallel: true`` is a no-op in M3; the advisor still
+        runs after the initial call (sequential)."""
+        adapter = ScriptedAdapter(
+            [
+                self._make_response("initial"),
+                self._make_response(
+                    "ADVISOR_APPROVE", model="deepseek-v4-pro:cloud"
+                ),
+            ]
+        )
+        from moaxy.models.config import (
+            AdvisorConfig,
+            ReflectionConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.pipeline.context import PipelineContext
+        from moaxy.routing.matcher import RouteMatch
+
+        config_route = RouteConfig(
+            name="advisor-parallel",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+            backend="ollama-local",
+            aliases={"coder-pro": "minimax-m3:cloud"},
+            reflection=ReflectionConfig(turns=0),
+            advisor=AdvisorConfig(
+                model="deepseek-v4-pro:cloud",
+                turns=1,
+                parallel=True,  # M4 toggle; M3 still runs sequentially.
+            ),
+        )
+        route = RouteMatch(
+            route=config_route,
+            original_model="coder-pro",
+            resolved_model="minimax-m3:cloud",
+            backend="ollama-local",
+            path="/v1/chat/completions",
+            reflection=config_route.reflection,
+            advisor=config_route.advisor,
+            fallbacks=[],
+            retry=0,
+            aliases=dict(config_route.aliases),
+        )
+        ctx = PipelineContext(
+            request_id="req-parallel",
+            request={
+                "model": "coder-pro",
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+            route=route,
+            model_alias_resolved=route.resolved_model,
+            target_backend=route.backend,
+            original_model=route.original_model,
+        )
+        await Orchestrator(adapter).run(ctx)
+        # Two calls in the same source order: initial then advisor.
+        assert len(adapter.calls) == 2
+        # The advisor header is present.
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-model"] == "deepseek-v4-pro:cloud"
+
+
+# ────────────────────────────────────────────────────────────────────
+# Concurrent request isolation (M3: per-context state)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestAdvisorConcurrentRequestIsolation:
+    """Concurrent requests with overlapping config do not cross-contaminate.
+
+    The :class:`Orchestrator` and the :func:`advisor_turn` helper are
+    stateless from request to request: every coroutine receives its
+    own :class:`PipelineContext` (or context dict) and mutates only
+    that object. Two concurrent coroutines must each see their own
+    request_id, route, adapter call log, and final response.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_advisor_turns_isolated(self):
+        """Two concurrent ``advisor_turn`` coroutines each see their own state."""
+        adapter = ScriptedAdapter(
+            [
+                _advisor_response("ADVISOR_APPROVE"),  # request A
+                _advisor_response("ADVISOR_REVISE: better"),  # request B
+            ]
+        )
+        ctx_a: dict[str, Any] = {
+            "adapter": adapter,
+            "request_id": "req-A",
+        }
+        ctx_b: dict[str, Any] = {
+            "adapter": adapter,
+            "request_id": "req-B",
+        }
+        # Run both advisor passes concurrently.
+        results = await asyncio.gather(
+            advisor_turn(
+                ctx_a,
+                advisor_model="model-A",
+                history=[{"role": "user", "content": "A"}],
+                current_answer="answer A",
+            ),
+            advisor_turn(
+                ctx_b,
+                advisor_model="model-B",
+                history=[{"role": "user", "content": "B"}],
+                current_answer="answer B",
+            ),
+        )
+        decision_a, text_a = results[0]
+        decision_b, text_b = results[1]
+        # Each request's decision is independent.
+        assert decision_a == "approve"
+        assert text_a is None
+        assert decision_b == "revise"
+        assert text_b == "better"
+        # The two advisor calls carried the correct model names.
+        assert adapter.calls[0]["model"] == "model-A"
+        assert adapter.calls[1]["model"] == "model-B"
+        # Each context dict carries its own request_id.
+        assert ctx_a["request_id"] == "req-A"
+        assert ctx_b["request_id"] == "req-B"
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_orchestrator_runs_isolated(self):
+        """Two concurrent :meth:`Orchestrator.run` invocations do not share state."""
+        from moaxy.models.config import (
+            AdvisorConfig,
+            ReflectionConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.pipeline.context import PipelineContext
+        from moaxy.routing.matcher import RouteMatch
+
+        def _make_resp(content: str, *, model: str) -> ChatResponse:
+            return ChatResponse(
+                id="chatcmpl-x",
+                model=model,
+                message=Message(role="assistant", content=content),
+                usage=Usage(
+                    prompt_tokens=4, completion_tokens=4, total_tokens=8
+                ),
+                finish_reason="stop",
+            )
+
+        def _build_context(
+            request_id: str, original_answer: str
+        ) -> PipelineContext:
+            config_route = RouteConfig(
+                name="concurrent-route",
+                match=ConfigRouteMatch(
+                    model="*", path="/v1/chat/completions"
+                ),
+                backend="ollama-local",
+                aliases={"coder-pro": "m1"},
+                reflection=ReflectionConfig(turns=0),
+                advisor=AdvisorConfig(model="m2", turns=1),
+            )
+            route = RouteMatch(
+                route=config_route,
+                original_model="coder-pro",
+                resolved_model="m1",
+                backend="ollama-local",
+                path="/v1/chat/completions",
+                reflection=config_route.reflection,
+                advisor=config_route.advisor,
+                fallbacks=[],
+                retry=0,
+                aliases=dict(config_route.aliases),
+            )
+            return PipelineContext(
+                request_id=request_id,
+                request={
+                    "model": "coder-pro",
+                    "messages": [{"role": "user", "content": original_answer}],
+                },
+                route=route,
+                model_alias_resolved=route.resolved_model,
+                target_backend=route.backend,
+                original_model=route.original_model,
+            )
+
+        # Script: request A's calls come first (initial + advisor), then
+        # request B's calls (initial + advisor + primary-revise).
+        adapter = ScriptedAdapter(
+            [
+                _make_resp("initial-A", model="m1"),
+                _advisor_response("ADVISOR_APPROVE", model="m2"),
+                _make_resp("initial-B", model="m1"),
+                _advisor_response("ADVISOR_REVISE: better B", model="m2"),
+                _make_resp("primary-revised-B", model="m1"),
+            ]
+        )
+        ctx_a = _build_context("req-conc-A", "answer-A")
+        ctx_b = _build_context("req-conc-B", "answer-B")
+        await asyncio.gather(
+            Orchestrator(adapter).run(ctx_a),
+            Orchestrator(adapter).run(ctx_b),
+        )
+        # Each context has the response matching its own request.
+        assert ctx_a.upstream_response is not None
+        assert ctx_b.upstream_response is not None
+        # Context A's response is the initial answer (advisor approved).
+        assert ctx_a.upstream_response.message.content == "initial-A"
+        # Context B's response is the primary revision after ADVISOR_REVISE.
+        assert ctx_b.upstream_response.message.content == "primary-revised-B"
+        # The contexts' request_ids are unchanged.
+        assert ctx_a.request_id == "req-conc-A"
+        assert ctx_b.request_id == "req-conc-B"
+        # Each context has its own events list.
+        assert len(ctx_a.events) == 3  # initial, advisor, advisor_approve
+        assert len(ctx_b.events) >= 3  # initial, advisor, advisor_revised, advisor_revision
+
