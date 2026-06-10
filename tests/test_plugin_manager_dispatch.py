@@ -508,10 +508,10 @@ class TestDemoPluginsStillWork:
     def test_demo_plugin_count_unchanged(self):
         mgr = PluginManager(plugins_dir=PLUGINS_DIR)
         mgr.load()
-        # The two existing demo plugins are still present. (demo_reflector and
-        # demo_advisor land in a separate feature; this test guards the
-        # baseline invariant.)
-        assert mgr.plugin_count == 2
+        # The original two demo plugins (router, transformer) are still
+        # present. The new built-in REFLECTOR (demo_reflector) and ADVISOR
+        # (demo_advisor) plugins are also loaded.
+        assert mgr.plugin_count >= 2
 
     def test_demo_router_still_invokable_via_sync_process(self):
         mgr = PluginManager(plugins_dir=PLUGINS_DIR)

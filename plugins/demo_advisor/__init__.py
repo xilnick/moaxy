@@ -1,0 +1,1 @@
+# Demo advisor plugin package

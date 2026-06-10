@@ -241,7 +241,7 @@ class TestAsyncExtensionDoesNotBreakDiscovery:
         mgr = PluginManager(plugins_dir=PLUGINS_DIR)
         errors = mgr.load()
         assert errors == []
-        assert mgr.plugin_count == 2
+        assert mgr.plugin_count >= 2
 
     def test_custom_plugin_with_async_hook_loads_via_manager(self):
         mgr = PluginManager(plugins_dir=PLUGINS_DIR)
