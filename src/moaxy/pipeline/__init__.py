@@ -9,7 +9,11 @@ the pipeline composes them per request.
 
 from moaxy.pipeline.advisor import advisor_turn, parse_advisor_response
 from moaxy.pipeline.context import PipelineContext, PipelineEvent
-from moaxy.pipeline.fallback import UpstreamExhaustedError, call_with_fallbacks
+from moaxy.pipeline.fallback import (
+    UpstreamExhaustedError,
+    call_with_fallbacks,
+    call_with_fallbacks_stream,
+)
 from moaxy.pipeline.message_builders import (
     build_advisor_messages,
     build_advisor_revision_messages,
@@ -37,6 +41,7 @@ __all__ = [
     "build_response_headers",
     "build_revision_messages",
     "call_with_fallbacks",
+    "call_with_fallbacks_stream",
     "parse_advisor_response",
     "parse_confidence",
     "reflect_turn",

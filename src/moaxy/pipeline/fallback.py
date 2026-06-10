@@ -47,11 +47,26 @@ itself is never in the list, even when it succeeded only after one or
 more retries. The list is ordered by invocation: ``fallbacks_used[0]``
 is the first fallback the walker tried, and so on. A response served
 by the primary on the first attempt yields ``fallbacks_used = []``.
+
+Streaming walker
+----------------
+
+:func:`call_with_fallbacks_stream` is the streaming counterpart of
+:func:`call_with_fallbacks`. It is an async generator that yields
+text deltas from the first model in the chain whose
+``adapter.stream()`` succeeds. The walker tries the primary first
+and walks the fallback list on transient errors (same retry and
+fallback semantics as the buffered walker). Permanent (4xx) errors
+bubble up immediately without consulting the fallback list. When
+the chain is exhausted, the generator raises
+:class:`UpstreamExhaustedError` so the caller can surface a
+structured error on the streaming response.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 
 from moaxy.adapters.base import (
@@ -242,7 +257,121 @@ async def call_with_fallbacks(
     )
 
 
+async def call_with_fallbacks_stream(
+    adapter: Adapter,
+    models: list[str],
+    retry: int,
+    **kwargs: Any,
+) -> AsyncIterator[str]:
+    """Walk ``models`` in order, yielding text deltas from the first success.
+
+    Streaming counterpart of :func:`call_with_fallbacks`. The walker
+    is an async generator that yields text deltas from the first
+    model in the chain whose ``adapter.stream()`` succeeds. The
+    walker tries the primary first; on a transient error (5xx,
+    timeout, connection refused) it walks the fallback list, retrying
+    each model up to ``retry`` times before moving on. Permanent
+    (4xx) errors bubble up immediately without consulting the
+    fallback list (same semantics as the buffered walker).
+
+    Args:
+        adapter: The :class:`moaxy.adapters.base.Adapter` instance to
+            dispatch every streaming call through. The walker calls
+            ``adapter.stream(model=current_model, **kwargs)`` per
+            attempt.
+        models: Ordered list of model identifiers. The first element
+            is the primary model; the remaining elements are
+            fallbacks. The walker tries them in order, advancing to
+            the next entry only when the current one has exhausted
+            its retry budget. An empty ``models`` list raises
+            :class:`UpstreamExhaustedError` before yielding anything.
+        retry: Per-model retry budget. The walker makes up to
+            ``retry + 1`` attempts on each model (one initial call
+            plus ``retry`` retries on transient failures). A
+            negative value is treated as zero. Permanent (4xx)
+            failures bypass the budget.
+        **kwargs: Keyword arguments forwarded verbatim to
+            ``adapter.stream``. Must NOT contain ``model`` (the
+            walker injects the current model name itself); any
+            other OpenAI body field is allowed (``messages``,
+            ``temperature``, ``top_p``, ``max_tokens``, etc.).
+
+    Yields:
+        Text deltas (str) from the successful model. Empty strings
+        are passed through unchanged; the caller can filter them.
+
+    Raises:
+        UpstreamError: A permanent (4xx) failure on any model. The
+            exception propagates out of the generator without
+            consulting the fallback list because the request itself
+            is invalid.
+        UpstreamExhaustedError: Every model in the chain has
+            exhausted its retry budget without success. The
+            exception's message contains the substring
+            ``"all backends failed"``.
+    """
+    if not models:
+        raise UpstreamExhaustedError(
+            "all backends failed: empty model list",
+            models=[],
+            last_error=None,
+        )
+
+    if "model" in kwargs:
+        raise TypeError(
+            "call_with_fallbacks_stream() does not accept a 'model' kwarg; "
+            "the walker manages the model name from the `models` list. "
+            "Remove `model=` from the call site."
+        )
+
+    attempts_per_model = max(int(retry), 0) + 1
+    last_error: BaseException | None = None
+
+    for _index, model in enumerate(models):
+        for attempt in range(attempts_per_model):
+            try:
+                async for delta in adapter.stream(model=model, **kwargs):
+                    yield delta
+                # The inner async generator completed without
+                # raising: the model produced a complete stream and
+                # the call is a success. Bail out of the retry loop
+                # and the fallback walker.
+                return
+            except UpstreamError as exc:
+                last_error = exc
+                if not _is_transient(exc):
+                    logger.info(
+                        "fallback walker (stream): permanent error on model=%s "
+                        "(status=%s); re-raising without retrying",
+                        model,
+                        exc.status_code,
+                    )
+                    raise
+                logger.warning(
+                    "fallback walker (stream): transient error on model=%s "
+                    "(attempt %d/%d): %s",
+                    model,
+                    attempt + 1,
+                    attempts_per_model,
+                    exc,
+                )
+                if attempt + 1 < attempts_per_model:
+                    continue
+                # Out of retry budget on this model; the for-loop
+                # advances to the next model in the chain.
+                break
+
+    last_error_str = str(last_error) if last_error is not None else "no attempts"
+    raise UpstreamExhaustedError(
+        f"all backends failed; no model in the fallback chain succeeded "
+        f"(last error: {last_error_str})",
+        models=models,
+        last_error=last_error,
+    )
+
+
 __all__ = [
     "UpstreamExhaustedError",
     "call_with_fallbacks",
+    "call_with_fallbacks_stream",
 ]

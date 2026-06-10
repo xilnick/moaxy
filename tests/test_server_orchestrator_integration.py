@@ -46,12 +46,18 @@ from moaxy.server.middleware import REQUEST_ID_HEADER
 
 
 class ScriptedAdapter(Adapter):
-    """An :class:`Adapter` whose ``chat`` is driven by a script.
+    """An :class:`Adapter` whose ``chat`` and ``stream`` are driven by a script.
 
     Each entry in the script is either a :class:`ChatResponse` (success)
     or a :class:`BaseException` (raised). Calls are recorded in
     :attr:`calls` so tests can assert on the ``model`` and ``messages``
     the orchestrator forwarded.
+
+    The script may also contain a list of strings (or any iterable) at
+    the position where a streaming response is expected; the
+    :meth:`stream` coroutine yields each string in order. This lets
+    tests program a per-call streaming response without giving up the
+    same ``script``-driven call-recording the buffered path uses.
     """
 
     name = "scripted"
@@ -78,22 +84,40 @@ class ScriptedAdapter(Adapter):
         self._index += 1
         if isinstance(entry, BaseException):
             raise entry
-        if not isinstance(entry, ChatResponse):
-            raise AssertionError(
-                f"ScriptedAdapter: script entry must be ChatResponse or "
-                f"Exception, got {type(entry).__name__}"
-            )
-        return entry
+        if isinstance(entry, ChatResponse):
+            return entry
+        raise AssertionError(
+            f"ScriptedAdapter: script entry must be ChatResponse, Exception, "
+            f"or list of stream deltas; got {type(entry).__name__}"
+        )
 
-    async def stream(  # pragma: no cover - streaming is M4
+    async def stream(  # noqa: D401
         self,
         *,
         model: str,
         messages: list[dict[str, Any]],
         **kwargs: Any,
     ):
-        if False:
-            yield ""
+        self.calls.append({"model": model, "messages": messages, **kwargs})
+        if self._index >= len(self._script):
+            raise AssertionError(
+                f"ScriptedAdapter: no more scripted responses "
+                f"(call #{self._index + 1} for model={model})"
+            )
+        entry = self._script[self._index]
+        self._index += 1
+        if isinstance(entry, BaseException):
+            raise entry
+        if isinstance(entry, list):
+            for delta in entry:
+                if isinstance(delta, BaseException):
+                    raise delta
+                yield str(delta)
+            return
+        raise AssertionError(
+            f"ScriptedAdapter: stream script entry must be list of deltas "
+            f"or Exception; got {type(entry).__name__}"
+        )
 
     async def close(self) -> None:  # pragma: no cover - nothing to close
         return None
@@ -563,16 +587,55 @@ class TestFallbackIntegration:
 
 
 # ────────────────────────────────────────────────────────────────────
-# Stream flag is ignored at M1-M3 boundary
+# M4 streaming — server-sent events for ``stream: true`` requests.
 # ────────────────────────────────────────────────────────────────────
 
 
-class TestStreamFlagIgnored:
-    """``stream: true`` requests are buffered to a JSON response at M1-M3."""
+def _parse_sse_events(body: str) -> list[tuple[str | None, str]]:
+    """Parse an SSE response body into ``(event_name, data_payload)`` pairs.
+
+    The response body is a series of events separated by a blank line
+    (``\\n\\n``). Each event may have one or more ``field: value``
+    lines; we extract the ``event:`` field (default ``"message"`` when
+    absent) and concatenate the ``data:`` lines per the SSE spec.
+
+    Returns:
+        A list of ``(event_name, data)`` tuples in order. The
+        terminator ``[DONE]`` is preserved as a ``data:`` payload so
+        tests can assert on its presence.
+    """
+    events: list[tuple[str | None, str]] = []
+    current_event: str | None = None
+    current_data: list[str] = []
+    for line in body.split("\n"):
+        if line == "":
+            if current_data or current_event is not None:
+                events.append((current_event, "\n".join(current_data)))
+            current_event = None
+            current_data = []
+            continue
+        if line.startswith(":"):
+            # Comment / keep-alive line; ignore.
+            continue
+        if ":" in line:
+            field, _, value = line.partition(":")
+            if value.startswith(" "):
+                value = value[1:]
+            if field == "event":
+                current_event = value
+            elif field == "data":
+                current_data.append(value)
+    if current_data or current_event is not None:
+        events.append((current_event, "\n".join(current_data)))
+    return events
+
+
+class TestStreamingEndpoint:
+    """``stream: true`` requests receive an SSE ``text/event-stream``."""
 
     @pytest.mark.asyncio
-    async def test_stream_true_returns_non_streaming_json(self):
-        adapter = ScriptedAdapter([_response("ok")])
+    async def test_stream_true_returns_text_event_stream(self):
+        adapter = ScriptedAdapter([["hello ", "world"]])
         route = _build_route_config(reflection_turns=0)
         app = _build_app(adapter, route)
         async with AsyncClient(
@@ -584,6 +647,222 @@ class TestStreamFlagIgnored:
                     "model": "minimax-m3:cloud",
                     "messages": [{"role": "user", "content": "ping"}],
                     "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_initial_chunks_then_done(self):
+        adapter = ScriptedAdapter([["Hel", "lo"]])
+        route = _build_route_config(reflection_turns=0)
+        app = _build_app(adapter, route)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "minimax-m3:cloud",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+        assert response.status_code == 200
+        events = _parse_sse_events(response.text)
+        # The first event is a default-named event (no ``event:`` field)
+        # carrying the role+first-content chunk; the second is the
+        # second content chunk; the third is the empty-delta final
+        # chunk (still a default-named event); the last is ``[DONE]``.
+        assert events[-1] == (None, "[DONE]")
+        # At least one ``data:`` event has ``choices[0].delta.content``
+        # set; the first such event also carries ``delta.role``.
+        data_events = [e for e in events[:-1] if e[0] is None]
+        assert len(data_events) >= 2
+        first = json.loads(data_events[0][1])
+        assert first["object"] == "chat.completion.chunk"
+        assert first["choices"][0]["delta"].get("role") == "assistant"
+        assert first["choices"][0]["delta"]["content"] == "Hel"
+        second = json.loads(data_events[1][1])
+        assert second["choices"][0]["delta"].get("content") == "lo"
+
+    @pytest.mark.asyncio
+    async def test_stream_reflective_emits_revision_event(self):
+        """A reflective route streams initial then emits ``event: revision``."""
+        adapter = ScriptedAdapter(
+            [
+                # Initial streaming call.
+                ["Hello, ", "world!"],
+                # Reflection critique (non-streaming chat).
+                _response("c\nREFLECT_CONFIDENCE: 0.5"),
+                # Reflection revision (non-streaming chat).
+                _response("revised answer", model="minimax-m3:cloud"),
+            ]
+        )
+        route = _build_route_config(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+        )
+        app = _build_app(adapter, route)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "minimax-m3:cloud",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = _parse_sse_events(response.text)
+        # Last event is ``[DONE]``.
+        assert events[-1] == (None, "[DONE]")
+        # Find a revision event.
+        revision_events = [e for e in events if e[0] == "revision"]
+        assert len(revision_events) == 1
+        rev_payload = json.loads(revision_events[0][1])
+        assert rev_payload["text"] == "revised answer"
+        assert rev_payload["turn"] == 0
+
+    @pytest.mark.asyncio
+    async def test_stream_chunks_have_delta_content_field(self):
+        adapter = ScriptedAdapter([["alpha", "beta", "gamma"]])
+        route = _build_route_config(reflection_turns=0)
+        app = _build_app(adapter, route)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "minimax-m3:cloud",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+        events = _parse_sse_events(response.text)
+        # All non-terminator data events have a ``choices[].delta`` dict
+        # with a ``content`` key (possibly empty string for the final
+        # empty-delta chunk that carries the finish_reason).
+        data_events = [e for e in events[:-1] if e[0] is None]
+        for _event_name, payload in data_events:
+            decoded = json.loads(payload)
+            assert decoded["object"] == "chat.completion.chunk"
+            assert "choices" in decoded
+            assert len(decoded["choices"]) == 1
+            assert "delta" in decoded["choices"][0]
+            assert "content" in decoded["choices"][0]["delta"]
+
+    @pytest.mark.asyncio
+    async def test_stream_includes_x_moaxy_request_id_header(self):
+        adapter = ScriptedAdapter([["ok"]])
+        route = _build_route_config(reflection_turns=0)
+        app = _build_app(adapter, route)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "minimax-m3:cloud",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+        assert response.status_code == 200
+        assert REQUEST_ID_HEADER in response.headers
+        assert response.headers[REQUEST_ID_HEADER]
+
+    @pytest.mark.asyncio
+    async def test_stream_includes_x_moaxy_alias_resolved_header(self):
+        adapter = ScriptedAdapter([["ok"]])
+        route = _build_route_config(
+            aliases={"coder-pro": "minimax-m3:cloud"},
+        )
+        app = _build_app(adapter, route)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "coder-pro",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+        assert response.status_code == 200
+        assert response.headers["x-moaxy-alias-resolved"] == "minimax-m3:cloud"
+
+    @pytest.mark.asyncio
+    async def test_stream_includes_x_moaxy_reflect_turns_header(self):
+        adapter = ScriptedAdapter([["ok"]])
+        route = _build_route_config(reflection_turns=0)
+        app = _build_app(adapter, route)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "minimax-m3:cloud",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+        assert response.status_code == 200
+        assert response.headers["x-moaxy-reflect-turns"] == "0"
+
+    @pytest.mark.asyncio
+    async def test_stream_non_reflective_emits_no_revision_events(self):
+        """A non-reflective route emits no ``event: revision``."""
+        adapter = ScriptedAdapter([["alpha", "beta"]])
+        route = _build_route_config(reflection_turns=0)
+        app = _build_app(adapter, route)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "minimax-m3:cloud",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+        events = _parse_sse_events(response.text)
+        revision_events = [e for e in events if e[0] == "revision"]
+        assert revision_events == []
+        # The stream still ends with ``[DONE]``.
+        assert events[-1] == (None, "[DONE]")
+
+    @pytest.mark.asyncio
+    async def test_stream_false_keeps_non_streaming_path(self):
+        """``stream: false`` (or absent) still returns a JSON response."""
+        adapter = ScriptedAdapter([_response("ok")])
+        route = _build_route_config(reflection_turns=0)
+        app = _build_app(adapter, route)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "minimax-m3:cloud",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": False,
                 },
                 headers={"Content-Type": "application/json"},
             )

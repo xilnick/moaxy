@@ -67,17 +67,21 @@ reference implementation.
 from __future__ import annotations
 
 import logging
+import time
+from collections.abc import AsyncIterator
 from typing import Any
 
 from moaxy.adapters.base import (
     Adapter,
     ChatResponse,
     Message,
+    UpstreamError,
+    Usage,
     UsageAccumulator,
 )
 from moaxy.pipeline.advisor import parse_advisor_response
 from moaxy.pipeline.context import PipelineContext
-from moaxy.pipeline.fallback import call_with_fallbacks
+from moaxy.pipeline.fallback import UpstreamExhaustedError, call_with_fallbacks
 from moaxy.pipeline.message_builders import (
     build_advisor_messages,
     build_advisor_revision_messages,
@@ -783,6 +787,330 @@ class Orchestrator:
         # the ``x-moaxy-fallbacks-used`` header.
         ctx.__dict__["fallbacks_used"] = fallbacks_used
         return ctx
+
+    async def stream_run(self, ctx: PipelineContext) -> AsyncIterator[bytes]:
+        """Run the pipeline and yield SSE-encoded response bytes.
+
+        This is the M4 streaming entry point. The server calls this
+        coroutine when the request body has ``stream: true``; the
+        coroutine yields SSE-encoded bytes that uvicorn's
+        :class:`StreamingResponse` serialises to the client.
+
+        Streaming strategy
+        -------------------
+
+        * The initial answer is streamed incrementally using
+          :meth:`Adapter.stream` on the underlying adapter. The
+          first yielded delta carries ``role: "assistant"`` in
+          ``delta``; subsequent deltas carry the content pieces
+          verbatim. The initial answer is complete as soon as the
+          adapter finishes yielding; the streamed deltas are not
+          buffered, so initial time-to-first-token is independent
+          of the (potentially large) reflection/advisor latency.
+        * After the initial answer completes, the orchestrator
+          runs the optional reflection loop and the optional
+          advisor pass. These stages do NOT stream (the
+          OpenAI-compatible ``stream: true`` protocol does not
+          define streaming for revise-style turns; the architecture
+          pins revisions as single events). For each revised
+          answer, the orchestrator emits one ``event: revision``
+          SSE event whose ``data:`` field carries the full revised
+          text.
+        * The stream ends with ``data: [DONE]\\n\\n`` regardless of
+          whether reflection or advisor ran.
+
+        Usage accumulation and event emission
+        -------------------------------------
+
+        The streaming path maintains the same :class:`PipelineContext`
+        semantics as the buffered path: every LLM call is recorded
+        in ``ctx.events``, usage is summed into ``ctx.usage``, and
+        the same runtime attributes (``fallbacks_used``,
+        ``last_confidence``) are set on the context. The response
+        headers (e.g. ``x-moaxy-reflect-turns``) are derived by the
+        same :func:`build_response_headers` helper; the SSE stream
+        itself does not carry ``x-moaxy-*`` headers per event
+        (those go on the HTTP response envelope).
+
+        Args:
+            ctx: The :class:`PipelineContext` describing the
+                request. Must have a non-``None`` ``route``, a
+                ``request_id``, and a ``model_alias_resolved`` (or
+                a route that exposes one). The context is mutated
+                in place exactly as in :meth:`run`.
+
+        Yields:
+            Raw bytes for each SSE event. The order of events is:
+            1. ``data: {chunk-with-delta-role}\\n\\n`` (the leading
+               role-assignment chunk for the initial answer).
+            2. ``data: {chunk-with-delta-content}\\n\\n`` per
+               adapter delta, then ``data: {chunk-with-delta-empty,
+               finish-reason=stop}\\n\\n`` for the final initial
+               chunk.
+            3. ``event: revision\\ndata: {revised-text}\\n\\n`` per
+               reflection revision (one per executed turn).
+            4. ``event: revision\\ndata: {advisor-revised-text}\\n\\n``
+               for the optional advisor revision.
+            5. ``data: [DONE]\\n\\n`` as the final terminator.
+
+        Raises:
+            UpstreamError: A permanent (4xx) failure from the
+                adapter during any step. The exception propagates
+                out of the async generator; uvicorn closes the
+                streaming response and the server's error handler
+                is NOT triggered (the response status is already
+                sent on the first chunk in HTTP/1.1). Callers that
+                want a clean error envelope for streaming requests
+                should drain the generator inside a try/except and
+                send a final error SSE event before terminating.
+            UpstreamExhaustedError: Every model in the chain has
+                exhausted its retry budget. The coroutine surfaces
+                the exception; the streaming response ends with
+                whatever was yielded so far.
+        """
+        # Local import to avoid pulling streaming helpers at module
+        # import time (and to keep the orchestrator decoupled from
+        # the SSE encoding details for testing).
+        from moaxy.server.streaming import (
+            build_chat_completion_chunk,
+            build_revision_payload,
+            format_sse_data,
+            format_sse_done,
+            format_sse_event,
+        )
+
+        if ctx.route is None:
+            raise RuntimeError("PipelineContext.route must be set before stream_run()")
+        if self.adapter is None:
+            raise RuntimeError("Orchestrator.adapter must be set")
+
+        # Stage 0: alias resolution bookkeeping (mirrors ``run()``).
+        if not ctx.model_alias_resolved:
+            ctx.model_alias_resolved = ctx.route.resolved_model
+        if ctx.target_backend is None:
+            ctx.target_backend = ctx.route.backend
+
+        original_model = ctx.original_model or ctx.request.get("model", "")
+        ctx.original_model = original_model
+
+        model_chain = _resolved_model_chain(ctx)
+        history: list[dict[str, Any]] = list(ctx.request.get("messages", []))
+        chunk_id = "chatcmpl-stream"
+        created = int(time.time())
+
+        # Stage 1: stream the initial answer incrementally. The
+        # adapter's ``stream()`` is an async generator yielding text
+        # deltas; we wrap each delta as a chat.completion.chunk SSE
+        # event. The first chunk carries the role assignment; the
+        # last chunk carries the empty-delta finish_reason. We
+        # accumulate the full initial text on the context so the
+        # reflection loop and the response builder can read it
+        # after the stream completes.
+        kwargs = _sampling_kwargs(ctx.request)
+        messages: list[dict[str, Any]] = ctx.request.get("messages", [])
+        first_chunk_emitted = False
+        current_answer_parts: list[str] = []
+        initial_model_name = model_chain[0]
+        initial_finish_reason = "stop"
+        initial_usage = None
+        try:
+            async for delta in self._stream_initial(
+                model_chain=model_chain,
+                retry=ctx.route.retry,
+                messages=messages,
+                kwargs=kwargs,
+            ):
+                if not first_chunk_emitted:
+                    # First chunk: open with the role assignment so
+                    # OpenAI-style clients see ``assistant`` from
+                    # the very first delta.
+                    first_chunk_emitted = True
+                    chunk = build_chat_completion_chunk(
+                        model=original_model,
+                        delta={"role": "assistant", "content": delta},
+                        finish_reason=None,
+                        chunk_id=chunk_id,
+                        created=created,
+                    )
+                else:
+                    chunk = build_chat_completion_chunk(
+                        model=original_model,
+                        delta={"content": delta},
+                        finish_reason=None,
+                        chunk_id=chunk_id,
+                        created=created,
+                    )
+                yield format_sse_data(chunk)
+                if delta:
+                    current_answer_parts.append(delta)
+        except (UpstreamError, UpstreamExhaustedError):
+            # Bubble adapter-level failures out of the generator so
+            # the server can surface them on the response. The
+            # streaming response in HTTP/1.1 cannot change its
+            # status code after the first byte, so the server
+            # should pre-validate the request (route, content-type,
+            # body) before entering the streaming path. Adapter
+            # failures are the canonical "we promised success and
+            # can't deliver" case; the client sees the connection
+            # close and the server logs the underlying error.
+            raise
+
+        current_answer = "".join(current_answer_parts)
+        ctx.append_event(
+            "initial",
+            model=initial_model_name,
+            text=current_answer,
+        )
+
+        # Final chunk for the initial answer: empty delta, finish_reason set.
+        final_initial_chunk = build_chat_completion_chunk(
+            model=original_model,
+            delta={},
+            finish_reason=initial_finish_reason,
+            chunk_id=chunk_id,
+            created=created,
+        )
+        yield format_sse_data(final_initial_chunk)
+
+        # Reflect the initial answer in ``ctx.upstream_response`` so
+        # the response builder (for the trailing x-moaxy-* headers
+        # and the accumulated usage) sees a complete ChatResponse.
+        # We do not have a true usage from the streaming path (the
+        # adapter's ``stream()`` does not currently surface usage);
+        # we synthesise a zero-usage ChatResponse so the dataclass
+        # is well-formed. The reflection / advisor stages below
+        # overwrite it as those calls return real usage data.
+        ctx.upstream_response = ChatResponse(
+            id=chunk_id,
+            model=initial_model_name,
+            message=Message(role="assistant", content=current_answer),
+            usage=initial_usage if initial_usage is not None else Usage(),
+            finish_reason=initial_finish_reason,
+        )
+
+        fallbacks_used: list[str] = list(ctx.__dict__.get("fallbacks_used", []))
+
+        # Stage 2: reflection loop (0..3 turns, sequential by default).
+        # Reflection runs as non-streaming LLM calls (the architecture
+        # only streams the initial answer). For each executed turn
+        # the orchestrator emits one ``event: revision`` SSE event
+        # carrying the revised text. The logic mirrors the buffered
+        # ``_run_reflection`` helper so event ordering, early exit,
+        # and confidence tracking stay consistent.
+        if ctx.route.reflection.turns > 0:
+            reflect_answer, reflect_fallbacks, _turns_executed = await self._run_reflection(
+                ctx,
+                model_chain=model_chain,
+                history=history,
+                current_answer=current_answer,
+            )
+            current_answer = reflect_answer
+            fallbacks_used.extend(reflect_fallbacks)
+            # Emit one ``event: revision`` per ``reflect_revised`` event
+            # emitted by ``_run_reflection``. We walk the event list
+            # (newest events at the end) so revisions stream in
+            # turn-order, matching the contract.
+            for event in ctx.events:
+                if event.type == "reflect_revised" and event.text is not None:
+                    payload = build_revision_payload(
+                        model=event.model or model_chain[0],
+                        text=event.text,
+                        turn=event.turn,
+                        chunk_id=chunk_id,
+                        created=created,
+                    )
+                    yield format_sse_event("revision", payload)
+
+        # Stage 3: advisor pass (0..1 turn, sequential after reflection).
+        # Like reflection, the advisor runs as a non-streaming LLM
+        # call. The revised answer (if any) is emitted as a final
+        # ``event: revision`` SSE event.
+        if ctx.route.advisor.turns >= 1 and ctx.route.advisor.model:
+            advisor_chain = _advisor_model_chain(ctx)
+            advisor_answer, advisor_fallbacks = await self._run_advisor(
+                ctx,
+                advisor_chain=advisor_chain,
+                primary_chain=model_chain,
+                history=history,
+                answer=current_answer,
+            )
+            current_answer = advisor_answer
+            fallbacks_used.extend(advisor_fallbacks)
+            # Look for the ``advisor_revised`` event we just emitted
+            # and forward its text as a revision SSE event. Approve
+            # paths do NOT emit a revision (the original answer is
+            # kept); the contract only mandates ``event: revision``
+            # for the revised cases.
+            for event in ctx.events:
+                if event.type == "advisor_revised" and event.text:
+                    payload = build_revision_payload(
+                        model=event.model or advisor_chain[0],
+                        text=event.text,
+                        chunk_id=chunk_id,
+                        created=created,
+                    )
+                    yield format_sse_event("revision", payload)
+                    break
+
+        # Update the final response on the context so the response
+        # builder (and any post-run observer) sees the final
+        # content and the accumulated usage.
+        if ctx.upstream_response is not None:
+            ctx.upstream_response = ChatResponse(
+                id=ctx.upstream_response.id,
+                model=original_model,
+                message=Message(
+                    role=ctx.upstream_response.message.role,
+                    content=current_answer,
+                ),
+                usage=ctx.usage.snapshot(),
+                finish_reason=ctx.upstream_response.finish_reason or "stop",
+            )
+
+        ctx.__dict__["fallbacks_used"] = fallbacks_used
+        ctx.__dict__["streamed"] = True
+
+        # Stage 4: end of stream marker.
+        yield format_sse_done()
+
+    async def _stream_initial(
+        self,
+        *,
+        model_chain: list[str],
+        retry: int,
+        messages: list[dict[str, Any]],
+        kwargs: dict[str, Any],
+    ) -> AsyncIterator[str]:
+        """Yield the initial-answer text deltas via the fallback walker.
+
+        Wraps :func:`moaxy.pipeline.fallback.call_with_fallbacks_stream`
+        so the per-step retry budget and per-route fallback list apply
+        uniformly to the streaming initial call. The walker returns an
+        async generator (not a value) when the chosen model supports
+        streaming; the caller iterates it transparently.
+
+        Args:
+            model_chain: The full model chain (primary + fallbacks)
+                in invocation order.
+            retry: The per-model retry budget.
+            messages: The chat-completion messages list.
+            kwargs: Sampling parameters forwarded from the request.
+
+        Yields:
+            Text deltas (str) from the upstream. Empty strings are
+            filtered by the orchestrator (they do not contribute
+            content to the response).
+        """
+        from moaxy.pipeline.fallback import call_with_fallbacks_stream
+
+        async for delta in call_with_fallbacks_stream(
+            self.adapter,
+            models=model_chain,
+            retry=retry,
+            messages=messages,
+            **kwargs,
+        ):
+            yield delta
 
 
 def build_response_headers(ctx: PipelineContext, *, request_id: str) -> dict[str, str]:

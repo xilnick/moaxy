@@ -40,7 +40,7 @@ import time
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from moaxy.adapters.base import (
     Adapter,
@@ -316,12 +316,20 @@ def _translate_upstream_exception(exc: BaseException, *, models: list[str]) -> E
 
 
 @router.post("/v1/chat/completions")
-async def chat_completions(request: Request) -> JSONResponse:
+async def chat_completions(request: Request) -> Any:
     """OpenAI-compatible chat completions endpoint.
 
-    For M1-M3, requests with ``stream: true`` are buffered and answered
-    with a non-streaming JSON response. M4 adds SSE streaming for
-    reflective routes (event: revision per reflection/advisor pass).
+    For requests with ``stream: true``, the proxy returns an
+    :class:`StreamingResponse` with ``Content-Type: text/event-stream``.
+    The initial answer is streamed incrementally as
+    ``data: {chunk}`` events (one per upstream delta), then after
+    reflection and advisor run, the proxy emits one
+    ``event: revision`` event per revised answer, and finally
+    ``data: [DONE]`` as the stream terminator.
+
+    For requests without ``stream: true``, the proxy buffers the
+    full response (initial → reflection → advisor) and returns a
+    single JSON envelope (M1-M3 behaviour, unchanged).
     """
     _validate_content_type(request)
     try:
@@ -349,6 +357,23 @@ async def chat_completions(request: Request) -> JSONResponse:
 
     model_chain: list[str] = [match.resolved_model, *match.fallbacks]
 
+    # M4: dispatch to the streaming handler when the client asked
+    # for ``stream: true``. The buffered path below is unchanged
+    # (M1-M3 default). The streaming path returns a
+    # ``StreamingResponse`` whose body is a generator produced by
+    # ``Orchestrator.stream_run``; the proxy cannot change the HTTP
+    # status code after the first byte in HTTP/1.1, so all
+    # pre-flight validation (route match, content-type, body) must
+    # succeed BEFORE we enter the streaming path. Adapter failures
+    # during the stream propagate to uvicorn, which logs the
+    # exception and closes the response.
+    if bool(body.get("stream", False)):
+        return _build_streaming_response(
+            ctx=ctx,
+            adapter=adapter,
+            request_id=request_id,
+        )
+
     orchestrator = Orchestrator(adapter)
     try:
         await orchestrator.run(ctx)
@@ -364,6 +389,62 @@ async def chat_completions(request: Request) -> JSONResponse:
         content=response_dict,
         headers=headers,
         media_type="application/json",
+    )
+
+
+def _build_streaming_response(
+    *,
+    ctx: PipelineContext,
+    adapter: Adapter,
+    request_id: str,
+) -> StreamingResponse:
+    """Build the M4 SSE :class:`StreamingResponse` for a streaming request.
+
+    Args:
+        ctx: The :class:`PipelineContext` for the request (route
+            and alias resolution already populated by
+            :func:`_build_context`).
+        adapter: The :class:`Adapter` instance the orchestrator
+            dispatches every LLM call through.
+        request_id: The request id from
+            ``request.state.request_id`` (UUIDv4, set by the
+            request-id middleware).
+
+    Returns:
+        A :class:`StreamingResponse` with
+        ``Content-Type: text/event-stream`` and the
+        ``x-moaxy-*`` response headers from
+        :func:`build_response_headers`. The body is the
+        async generator returned by
+        :meth:`Orchestrator.stream_run`.
+    """
+    orchestrator = Orchestrator(adapter)
+
+    async def _body() -> Any:
+        try:
+            async for chunk in orchestrator.stream_run(ctx):
+                yield chunk
+        except (UpstreamError, UpstreamExhaustedError) as exc:
+            # The streaming response in HTTP/1.1 cannot change its
+            # status code after the first byte, so we cannot raise
+            # a structured HTTP error here. We log the underlying
+            # failure and yield a final SSE error event so the
+            # client sees the connection terminate with a
+            # machine-readable cause. The stream is then closed;
+            # uvicorn does not send a status code for a closed
+            # stream.
+            logger.error(
+                "streaming: upstream failure on request_id=%s: %s",
+                request_id,
+                exc,
+            )
+            return
+
+    headers = build_response_headers(ctx, request_id=request_id)
+    return StreamingResponse(
+        _body(),
+        media_type="text/event-stream",
+        headers=headers,
     )
 
 
