@@ -31,6 +31,10 @@ from moaxy.adapters.registry import AdapterRegistry, build_registry
 from moaxy.config.loader import load_config
 from moaxy.models.config import MoaxyConfig
 from moaxy.routing.matcher import RouteMatcher
+from moaxy.server.auth_gate import (
+    AuthGateMiddleware,
+    build_principal_index,
+)
 from moaxy.server.errors import (
     MethodNotAllowedError,
     register_error_handlers,
@@ -121,7 +125,7 @@ def create_app(
         else config.plugins.plugins_dir
     )
 
-    _install_middleware(app)
+    _install_middleware(app, config)
     _install_routes(app)
     _install_method_not_allowed_handlers(app)
     register_error_handlers(app)
@@ -129,8 +133,8 @@ def create_app(
     return app
 
 
-def _install_middleware(app: FastAPI) -> None:
-    """Mount the three server-level middlewares in the correct order.
+def _install_middleware(app: FastAPI, config: MoaxyConfig) -> None:
+    """Mount the server-level middlewares in the correct order.
 
     Starlette's ``add_middleware`` installs middlewares in REVERSE order
     of the calls, so the first call below is the OUTERMOST middleware
@@ -142,17 +146,43 @@ def _install_middleware(app: FastAPI) -> None:
 
     * StructuredLoggingMiddleware (outermost)
     * TimingMiddleware
-    * RequestIdMiddleware (innermost)
+    * RequestIdMiddleware
+    * AuthGateMiddleware (innermost of the user-installed middlewares)
 
     On the request path, this means: id is attached, then start_time,
-    then the route handler runs. On the response path, the route
-    handler returns, the timing middleware adds ``x-moaxy-time-ms``,
-    the request id middleware adds ``x-moaxy-request-id``, and finally
+    then the auth gate validates the API key (when ``auth.enabled``
+    is true), then the route handler runs. On the response path, the
+    route handler returns, the auth gate (if it ran) returns
+    normally, the timing middleware adds ``x-moaxy-time-ms``, the
+    request id middleware adds ``x-moaxy-request-id``, and finally
     the logging middleware emits a log line.
+
+    The :class:`AuthGateMiddleware` is only installed when
+    ``config.auth is not None and config.auth.enabled``; otherwise
+    the no-op overhead is avoided and the data plane runs as before.
     """
     app.add_middleware(StructuredLoggingMiddleware)
     app.add_middleware(TimingMiddleware)
     app.add_middleware(RequestIdMiddleware)
+    if config.auth is not None and config.auth.enabled:
+        header_names = tuple(config.auth.header_names) or (
+            "X-API-Key",
+            "Authorization",
+        )
+        exempt_paths = tuple(config.auth.exempt_paths) or ("/health",)
+        principal_index = build_principal_index(config.auth.api_keys)
+        # Install as a USER MIDDLEWARE (not a route middleware) so
+        # it wraps the BaseHTTPMiddleware chain. When the auth
+        # gate short-circuits with a 401, the BaseHTTPMiddleware
+        # middlewares (request id, timing, logging) never run,
+        # but the gate itself attaches the request id header
+        # directly. See auth_gate.py for the rationale.
+        app.add_middleware(
+            AuthGateMiddleware,
+            principal_index=principal_index,
+            header_names=header_names,
+            exempt_paths=exempt_paths,
+        )
 
 
 def _install_routes(app: FastAPI) -> None:

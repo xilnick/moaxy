@@ -67,6 +67,33 @@ class NotFoundError(MoaxyError):
     error_type = "not_found"
 
 
+class UnauthorizedError(MoaxyError):
+    """Raised when the request is unauthenticated (no principal on state).
+
+    Maps to HTTP 401. The auth gate already returns 401 for missing
+    or invalid API keys; this class is the in-band signal for code
+    paths that bypass the gate (admin role checks, etc.) but still
+    need a 401 to the client.
+    """
+
+    status_code = 401
+    error_type = "unauthorized"
+
+
+class ForbiddenError(MoaxyError):
+    """Raised when the request is authenticated but not authorised.
+
+    Maps to HTTP 403. The admin endpoints raise this when a valid
+    principal is missing the ``admin`` role; the client gets a
+    distinct 403 instead of a 401 so it can tell "your key is
+    recognised but you cannot do this" apart from "your key is
+    not recognised".
+    """
+
+    status_code = 403
+    error_type = "forbidden"
+
+
 class NoRouteMatchError(MoaxyError):
     """Raised when no route in the table matches the incoming request.
 
@@ -379,11 +406,13 @@ def register_error_handlers(app: FastAPI) -> None:
 
 __all__ = [
     "BadRequestError",
+    "ForbiddenError",
     "MethodNotAllowedError",
     "MoaxyError",
     "NoRouteMatchError",
     "NotFoundError",
     "ServiceUnavailableError",
+    "UnauthorizedError",
     "UnsupportedMediaTypeError",
     "UpstreamError",
     "UpstreamTimeoutError",

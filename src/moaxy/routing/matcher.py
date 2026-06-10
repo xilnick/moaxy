@@ -194,6 +194,45 @@ class RouteMatcher:
         """Return the snapshot of routes this matcher was built with."""
         return list(self._routes)
 
+    def add_route(self, route: RouteConfig) -> None:
+        """Append a new :class:`RouteConfig` to the in-memory route list.
+
+        The route is appended to the end of the list, so it is consulted
+        AFTER every pre-existing route. The matcher is otherwise
+        immutable: there is no "insert at position" or "replace by
+        name" operation, only append and remove. The first-match-wins
+        rule from :meth:`match` means a new route never preempts an
+        existing one — to "redefine" a route, the caller must
+        :meth:`remove_route` first.
+
+        Validation: the new route's name must be unique. A duplicate
+        name raises :class:`ValueError` because the data model already
+        requires uniqueness at the config level (the same constraint
+        is enforced here for runtime CRUD). The caller is expected to
+        catch the exception and translate it into the appropriate
+        HTTP error envelope.
+        """
+        if any(existing.name == route.name for existing in self._routes):
+            raise ValueError(
+                f"route {route.name!r} already exists; use a different name "
+                "or remove the existing route first"
+            )
+        self._routes.append(route)
+
+    def remove_route(self, name: str) -> bool:
+        """Remove a route by name.
+
+        Returns ``True`` when a route with the given name was found
+        and removed; ``False`` when no such route exists. The matcher
+        performs a linear scan; routes are small (typically < 100
+        entries), so the cost is negligible.
+        """
+        for index, existing in enumerate(self._routes):
+            if existing.name == name:
+                del self._routes[index]
+                return True
+        return False
+
     def match(self, request: Mapping[str, Any]) -> RouteMatch | None:
         """Return the first matching :class:`RouteMatch`, or ``None``.
 
