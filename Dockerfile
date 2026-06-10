@@ -21,9 +21,9 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 RUN mkdir -p /app/config && chown -R moaxy:moaxy /app
 
 USER moaxy
-EXPOSE 8000
+EXPOSE 8765
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -sf http://localhost:8000/health || exit 1
+    CMD curl -sf http://localhost:8765/health || exit 1
 
-CMD ["python", "-c", "import moaxy; print(f'moaxy v{moaxy.__version__} ready')"]
+CMD ["uvicorn", "moaxy.server.app:create_app", "--factory", "--host", "127.0.0.1", "--port", "8765"]

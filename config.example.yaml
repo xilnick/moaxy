@@ -5,22 +5,25 @@
 #
 # Quick start:
 #   1. cp config.example.yaml config.yaml
-#   2. export MOAXY_ADMIN_API_KEY="your-secret-key"
-#   3. uvicorn moaxy.server.app:create_app --factory --host 0.0.0.0 --port 8000
+#   2. (optional) export OPENAI_API_KEY="..." for non-Ollama backends
+#   3. uvicorn moaxy.server.app:create_app --factory --host 127.0.0.1 --port 8765
 #
 # All values support ${ENV_VAR} substitution (e.g. "${OPENAI_API_KEY}").
 
 # ── Server ─────────────────────────────────────────────────
-# Address and port the proxy binds to.
-listen: "0.0.0.0"
-port: 8000
-log_level: "info"
+# Address and port the proxy binds to. The M1 server-level config
+# mandates a loopback listen address (127.0.0.1 or ::1) for security.
+server:
+  listen: "127.0.0.1"
+  port: 8765
+  log_level: "info"
+  plugins_dir: "plugins"
+  request_timeout_s: 60.0
 
 # ── Plugins ─────────────────────────────────────────────────
 # Plugin discovery scans the plugins/ directory for Plugin subclasses.
 # Each plugin must have a plugin.py file with a Plugin subclass.
 # Plugins are loaded in alphabetical order.
-plugins_dir: "plugins"
 
 # Optional per-plugin config (keyed by plugin class name).
 # plugin_config:
@@ -41,15 +44,51 @@ backends:
   #   timeout: 30.0
 
 # ── Routes ──────────────────────────────────────────────────
+# First-match-wins. ``model`` and ``path`` use fnmatch globs.
+# ``aliases`` is a per-route alias table: clients send the alias,
+# the proxy rewrites to the real model name on the way to the backend,
+# and the response ``body.model`` echoes the original alias.
+# ``fallbacks`` and ``retry`` are the per-route fallback chain.
 routes:
-  - name: "catch-all"
+  - name: "reflective-coder"
+    match:
+      model: "coder-pro"
+      path: "/v1/chat/completions"
+    strategy: "single"
+    backend: "ollama-local"
+    aliases:
+      "coder-pro": "minimax-m3:cloud"
+    fallbacks:
+      - "minimax-m2.7:cloud"
+      - "deepseek-v4-pro:cloud"
+    retry: 1
+    reflection:
+      turns: 1
+      early_exit: true
+      threshold: 0.85
+      parallel: false
+    advisor:
+      model: "deepseek-v4-pro:cloud"
+      turns: 1
+      parallel: false
+
+  - name: "plain"
     match:
       model: "*"
-      path: "/*"
+      path: "/v1/chat/completions"
     strategy: "single"
     backend: "ollama-local"
 
+# ── Per-model defaults (used when a route doesn't override) ──
+# models:
+#   fallbacks:
+#     "minimax-m3:cloud": ["minimax-m2.7:cloud", "deepseek-v4-pro:cloud"]
+#   retry:
+#     "minimax-m3:cloud": 2
+
 # ── Auth ────────────────────────────────────────────────────
+# M1 has no auth gate. The block is preserved for forward-compatibility
+# with M4; the default value of ``enabled`` is ``false``.
 # auth:
 #   enabled: false
 #   exempt_paths:
@@ -57,9 +96,6 @@ routes:
 #   header_names:
 #     - "X-API-Key"
 #     - "Authorization"
-#   default_rate_limit:
-#     requests_per_second: 10
-#     burst: 20
 #   api_keys:
 #     - key_id: "admin"
 #       key_value: "${MOAXY_ADMIN_API_KEY}"
