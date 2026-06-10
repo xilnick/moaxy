@@ -37,17 +37,32 @@ from fastapi.responses import JSONResponse
 from moaxy.adapters.base import (
     Adapter,
     UpstreamError,
-    UpstreamTimeoutError,
-    UpstreamUnavailableError,
     UsageAccumulator,
+)
+from moaxy.adapters.base import (
+    UpstreamTimeoutError as AdapterUpstreamTimeoutError,
+)
+from moaxy.adapters.base import (
+    UpstreamUnavailableError as AdapterUpstreamUnavailableError,
 )
 from moaxy.routing.matcher import RouteMatch, RouteMatcher
 from moaxy.server.errors import (
     BadRequestError,
-    NotFoundError,
+    NoRouteMatchError,
     ServiceUnavailableError,
     UnsupportedMediaTypeError,
-    UpstreamUnavailableHTTPError,
+)
+from moaxy.server.errors import (
+    UpstreamError as UpstreamHTTPError,
+)
+from moaxy.server.errors import (
+    UpstreamTimeoutError as UpstreamTimeoutHTTPError,
+)
+from moaxy.server.errors import (
+    UpstreamUnavailableError as UpstreamUnavailableHTTPError,
+)
+from moaxy.server.errors import (
+    UpstreamUnavailableHTTPError as LegacyUpstreamUnavailableHTTPError,
 )
 
 logger = logging.getLogger(__name__)
@@ -137,7 +152,7 @@ async def _walk_fallbacks(
     for model in models:
         try:
             response = await _do_chat(adapter, model=model, body=body, messages=messages)
-        except UpstreamTimeoutError as exc:
+        except AdapterUpstreamTimeoutError as exc:
             logger.warning("upstream timeout on model=%s: %s", model, exc)
             last_error = exc
             last_status = None
@@ -145,7 +160,7 @@ async def _walk_fallbacks(
             if model != models[0]:
                 fallbacks_used.append(model)
             continue
-        except UpstreamUnavailableError as exc:
+        except AdapterUpstreamUnavailableError as exc:
             logger.warning("upstream unavailable on model=%s: %s", model, exc)
             last_error = exc
             last_status = None
@@ -165,7 +180,13 @@ async def _walk_fallbacks(
             fallbacks_used.append(model)
         return response, len(fallbacks_used), fallbacks_used, usage
 
-    if last_status is not None and last_status >= 400 and last_status < 500:
+    # Re-raise the most informative error. The ordering is:
+    # 1. A 4xx upstream means the client request is wrong → 400.
+    # 2. A timeout → 504.
+    # 3. An unavailable upstream → 503.
+    # 4. A 5xx upstream → 502 (carries the upstream's message).
+    # 5. Otherwise (e.g. all attempts unreachable) → 502 with summary.
+    if last_status is not None and 400 <= last_status < 500:
         raise BadRequestError(
             f"upstream rejected the request (HTTP {last_status}): {last_error}",
             details={
@@ -174,7 +195,24 @@ async def _walk_fallbacks(
                 "response_body": last_body,
             },
         )
-    raise UpstreamUnavailableHTTPError(
+    if isinstance(last_error, AdapterUpstreamTimeoutError):
+        raise UpstreamTimeoutHTTPError(
+            str(last_error) or "upstream timeout",
+            details={"models": models},
+        )
+    if isinstance(last_error, AdapterUpstreamUnavailableError):
+        raise UpstreamUnavailableHTTPError(
+            str(last_error) or "upstream unavailable",
+            details={"models": models},
+        )
+    if isinstance(last_error, UpstreamError):
+        raise UpstreamHTTPError(
+            str(last_error),
+            status_code=last_status,
+            body=last_body,
+            details={"models": models},
+        )
+    raise LegacyUpstreamUnavailableHTTPError(
         "all backends failed; no model in the fallback chain succeeded",
         details={
             "models": models,
@@ -240,9 +278,8 @@ async def chat_completions(request: Request) -> JSONResponse:
         {"model": body["model"], "path": "/v1/chat/completions"}
     )
     if match is None:
-        raise NotFoundError(
-            f"no route matches model {body['model']!r} on /v1/chat/completions",
-            details={"model": body["model"], "path": "/v1/chat/completions"},
+        raise NoRouteMatchError(
+            model=body["model"], path="/v1/chat/completions"
         )
 
     adapter = _get_adapter(request, match)

@@ -67,12 +67,113 @@ class NotFoundError(MoaxyError):
     error_type = "not_found"
 
 
+class NoRouteMatchError(MoaxyError):
+    """Raised when no route in the table matches the incoming request.
+
+    Maps to HTTP 404. The error message contains the literal substring
+    ``"no route matches"`` so callers can distinguish it from a generic
+    404 (e.g. an unknown path).
+    """
+
+    status_code = 404
+    error_type = "no_route_match"
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        model: str | None = None,
+        path: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        if message is None:
+            parts: list[str] = []
+            if model is not None:
+                parts.append(f"model {model!r}")
+            if path is not None:
+                parts.append(f"on {path}")
+            suffix = " " + " ".join(parts) if parts else ""
+            message = f"no route matches{suffix}"
+        payload: dict[str, Any] = dict(details) if details else {}
+        if model is not None:
+            payload.setdefault("model", model)
+        if path is not None:
+            payload.setdefault("path", path)
+        super().__init__(message, details=payload or None)
+
+
 class MethodNotAllowedError(MoaxyError):
     status_code = 405
     error_type = "method_not_allowed"
 
 
+class UpstreamError(MoaxyError):
+    """Raised when the upstream returns a 4xx/5xx or an unusable response.
+
+    Maps to HTTP 502. The original upstream message (or a fallback
+    summary) is preserved in :attr:`message` so the client gets a
+    useful, human-readable explanation. Stack traces, file paths, and
+    ``/site-packages/`` substrings are never included.
+    """
+
+    status_code = 502
+    error_type = "upstream_error"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        body: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        safe_message = _sanitize_message(message)
+        payload: dict[str, Any] = dict(details) if details else {}
+        if status_code is not None:
+            payload.setdefault("upstream_status", status_code)
+        if body is not None and "upstream_body" not in payload:
+            payload["upstream_body"] = body
+        super().__init__(safe_message, details=payload or None)
+        self.upstream_status_code = status_code
+        self.upstream_body = body
+
+
+class UpstreamTimeoutError(MoaxyError):
+    """Raised when the upstream times out (read, connect, or pool)."""
+
+    status_code = 504
+    error_type = "upstream_timeout"
+
+
+class UpstreamUnavailableError(MoaxyError):
+    """Raised when the upstream is unreachable (connection refused, DNS, etc.)."""
+
+    status_code = 503
+    error_type = "upstream_unavailable"
+
+
+class ValidationError(MoaxyError):
+    """Raised when the request body fails Pydantic validation.
+
+    Maps to HTTP 422 (or 400 when called explicitly with
+    ``status_code=400``). The :attr:`details` dict typically carries
+    the list of validation errors keyed under ``"errors"``.
+    """
+
+    status_code = 422
+    error_type = "validation_error"
+
+
 class UpstreamUnavailableHTTPError(MoaxyError):
+    """Legacy 502 error class kept for backward compatibility.
+
+    New code should use :class:`UpstreamError` (502) for upstream
+    failures with a surfaced message, or
+    :class:`UpstreamUnavailableError` (503) for connection-level
+    failures. The old name is still wired through the exception
+    handlers.
+    """
+
     status_code = 502
     error_type = "upstream_unavailable"
 
@@ -80,6 +181,54 @@ class UpstreamUnavailableHTTPError(MoaxyError):
 class ServiceUnavailableError(MoaxyError):
     status_code = 503
     error_type = "service_unavailable"
+
+
+# Patterns that must NEVER appear in a user-facing error message. Keeping
+# this in one place ensures the contract is enforced at every error
+# construction site, not just in the response layer.
+_STACK_TRACE_FRAGMENTS = (
+    "Traceback (most recent call last)",
+    "Traceback ",
+    "Traceback:",
+)
+
+
+def _sanitize_message(message: str) -> str:
+    """Return a copy of ``message`` safe to expose to clients.
+
+    Strips anything that looks like a Python stack trace, an absolute
+    filesystem path under ``/site-packages/`` or the project, or the
+    file/line markers FastAPI/Starlette emit alongside tracebacks.
+
+    The goal is the user-facing contract from the validation document:
+    response bodies must NEVER contain ``Traceback``, ``File "``,
+    ``line ``, ``/site-packages/``, or filesystem paths. The
+    :class:`MoaxyError` message is the only field rendered in the
+    envelope, so this is the single chokepoint for sanitisation.
+    """
+    if not message:
+        return message
+    text = str(message)
+    # Drop anything that smells like a Python traceback frame.
+    for fragment in _STACK_TRACE_FRAGMENTS:
+        text = text.replace(fragment, "")
+    # Drop "File \"..." / "line N" markers that may appear standalone.
+    while 'File "' in text:
+        start = text.find('File "')
+        end = text.find('"', start + len('File "'))
+        if end == -1:
+            text = text[:start]
+        else:
+            text = text[:start] + text[end + 1 :]
+    # Drop absolute paths under site-packages.
+    if "/site-packages/" in text:
+        head, _, rest = text.partition("/site-packages/")
+        text = head + rest.split("/", 1)[-1] if "/" in rest else head
+    # Drop project filesystem paths (defence in depth).
+    if "/Users/" in text and "/moaxy/" in text:
+        # Keep the tail past the last "/moaxy/" segment.
+        text = text.split("/moaxy/", 1)[-1]
+    return text.strip() or "upstream error"
 
 
 def _envelope(
@@ -232,9 +381,14 @@ __all__ = [
     "BadRequestError",
     "MethodNotAllowedError",
     "MoaxyError",
+    "NoRouteMatchError",
     "NotFoundError",
     "ServiceUnavailableError",
     "UnsupportedMediaTypeError",
+    "UpstreamError",
+    "UpstreamTimeoutError",
+    "UpstreamUnavailableError",
     "UpstreamUnavailableHTTPError",
+    "ValidationError",
     "register_error_handlers",
 ]
