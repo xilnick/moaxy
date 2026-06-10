@@ -2,27 +2,35 @@
 
 The handler is the data-plane surface of moaxy. It accepts an
 OpenAI-shaped ``chat.completion`` request body, matches the request
-against the route table, resolves aliases, and forwards the call to the
-configured backend adapter.
+against the route table, resolves aliases, and threads the request
+through the :class:`~moaxy.pipeline.orchestrator.Orchestrator` which
+performs the initial generation, the optional self-reflection loop
+(0..3 turns), and the optional advisor pass (0..1 turn).
 
-The full pipeline (reflection turns, advisor, usage accumulation, etc.)
-will be added in M2/M3. M1 implements:
+The orchestrator drives every LLM call through a single
+:class:`~moaxy.adapters.base.Adapter` selected by the matched route's
+``backend`` field. Per-step retry and fallback policy is handled inside
+the orchestrator via :func:`~moaxy.pipeline.fallback.call_with_fallbacks`,
+so this handler is responsible only for:
 
-* Request validation (presence of ``model`` and ``messages``).
-* Route matching via :class:`moaxy.routing.matcher.RouteMatcher`.
-* Alias resolution against the matched route.
-* Adapter dispatch through the route's ``backend``.
-* Per-call ``UsageAccumulator`` for usage aggregation across multiple
-  adapter calls (e.g. fallbacks).
-* 404 when no route matches.
-* 502 when all backends are exhausted.
-* 415 when the request body is missing the ``application/json`` content
-  type.
-* 400/422 for malformed JSON or missing required fields, with the
-  envelope produced by the error handlers.
-* Echoing the original ``model`` in the response body (alias or real).
-* Setting ``x-moaxy-*`` response headers (``x-moaxy-alias-resolved``,
-  ``x-moaxy-fallbacks-used``).
+* Request validation (presence of ``model`` and ``messages``, JSON body,
+  ``Content-Type: application/json``).
+* Route matching via :class:`~moaxy.routing.matcher.RouteMatcher`.
+* Building a :class:`~moaxy.pipeline.context.PipelineContext` for the
+  matched request and dispatching it through a fresh
+  :class:`~moaxy.pipeline.orchestrator.Orchestrator`.
+* Translating adapter-level exceptions
+  (:class:`~moaxy.adapters.base.UpstreamError` and its subclasses,
+  :class:`~moaxy.pipeline.fallback.UpstreamExhaustedError`) into the
+  moaxy HTTP error envelope.
+* Echoing the original ``model`` alias in the response body, building
+  the OpenAI-shaped chat.completion envelope, and stamping the
+  ``x-moaxy-*`` response headers via
+  :func:`~moaxy.pipeline.orchestrator.build_response_headers`.
+
+For M1-M3 the handler buffers the response (it does not stream
+``stream: true`` requests); M4 will add SSE streaming for reflective
+routes.
 """
 
 from __future__ import annotations
@@ -37,13 +45,18 @@ from fastapi.responses import JSONResponse
 from moaxy.adapters.base import (
     Adapter,
     UpstreamError,
-    UsageAccumulator,
 )
 from moaxy.adapters.base import (
     UpstreamTimeoutError as AdapterUpstreamTimeoutError,
 )
 from moaxy.adapters.base import (
     UpstreamUnavailableError as AdapterUpstreamUnavailableError,
+)
+from moaxy.pipeline.context import PipelineContext
+from moaxy.pipeline.fallback import UpstreamExhaustedError
+from moaxy.pipeline.orchestrator import (
+    Orchestrator,
+    build_response_headers,
 )
 from moaxy.routing.matcher import RouteMatch, RouteMatcher
 from moaxy.server.errors import (
@@ -70,16 +83,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _model_name_used(match: RouteMatch) -> str:
-    """The model name that the upstream adapter should call.
-
-    For M1 the matcher is responsible for alias resolution; we use the
-    resolved model as the model parameter sent to the adapter.
-    """
-    return match.resolved_model
-
-
 def _get_adapter(request: Request, match: RouteMatch) -> Adapter:
+    """Resolve the route's backend name to a concrete :class:`Adapter`.
+
+    Raises:
+        ServiceUnavailableError: The route has no ``backend`` set, or
+            the configured backend is not present in the registry.
+    """
     registry = request.app.state.adapters
     if match.backend is None:
         raise ServiceUnavailableError(
@@ -131,124 +141,67 @@ def _validate_body(body: dict[str, Any]) -> None:
         )
 
 
-async def _walk_fallbacks(
-    adapter: Adapter,
-    *,
-    models: list[str],
-    messages: list[dict[str, Any]],
+def _build_context(
     body: dict[str, Any],
-) -> tuple[dict[str, Any], int, list[str], UsageAccumulator]:
-    """Try the resolved model, then each entry of ``models``, returning the
-    final response dict, the number of fallback hops used, the list of
-    fallback model ids that were actually invoked, and the running
-    :class:`UsageAccumulator`.
+    match: RouteMatch,
+    *,
+    request_id: str,
+) -> PipelineContext:
+    """Build the :class:`PipelineContext` that drives the orchestrator.
+
+    The context captures the original request body verbatim (the
+    orchestrator reads ``request["messages"]`` and the sampling
+    parameters, and the contract forbids mutating the request — see
+    VAL-PIPE-039), the alias resolution result, and the matched
+    route. Streaming is dropped at M1-M3 boundary: clients that send
+    ``stream: true`` are still answered with a non-streaming JSON
+    response.
     """
-    usage = UsageAccumulator()
-    fallbacks_used: list[str] = []
-    last_error: Exception | None = None
-    last_status: int | None = None
-    last_body: str | None = None
-
-    for model in models:
-        try:
-            response = await _do_chat(adapter, model=model, body=body, messages=messages)
-        except AdapterUpstreamTimeoutError as exc:
-            logger.warning("upstream timeout on model=%s: %s", model, exc)
-            last_error = exc
-            last_status = None
-            last_body = None
-            if model != models[0]:
-                fallbacks_used.append(model)
-            continue
-        except AdapterUpstreamUnavailableError as exc:
-            logger.warning("upstream unavailable on model=%s: %s", model, exc)
-            last_error = exc
-            last_status = None
-            last_body = None
-            if model != models[0]:
-                fallbacks_used.append(model)
-            continue
-        except UpstreamError as exc:
-            logger.warning("upstream error on model=%s: %s", model, exc)
-            last_error = exc
-            last_status = exc.status_code
-            last_body = exc.body
-            if model != models[0]:
-                fallbacks_used.append(model)
-            continue
-        if model != models[0]:
-            fallbacks_used.append(model)
-        return response, len(fallbacks_used), fallbacks_used, usage
-
-    # Re-raise the most informative error. The ordering is:
-    # 1. A 4xx upstream means the client request is wrong → 400.
-    # 2. A timeout → 504.
-    # 3. An unavailable upstream → 503.
-    # 4. A 5xx upstream → 502 (carries the upstream's message).
-    # 5. Otherwise (e.g. all attempts unreachable) → 502 with summary.
-    if last_status is not None and 400 <= last_status < 500:
-        raise BadRequestError(
-            f"upstream rejected the request (HTTP {last_status}): {last_error}",
-            details={
-                "status": last_status,
-                "models": models,
-                "response_body": last_body,
-            },
-        )
-    if isinstance(last_error, AdapterUpstreamTimeoutError):
-        raise UpstreamTimeoutHTTPError(
-            str(last_error) or "upstream timeout",
-            details={"models": models},
-        )
-    if isinstance(last_error, AdapterUpstreamUnavailableError):
-        raise UpstreamUnavailableHTTPError(
-            str(last_error) or "upstream unavailable",
-            details={"models": models},
-        )
-    if isinstance(last_error, UpstreamError):
-        raise UpstreamHTTPError(
-            str(last_error),
-            status_code=last_status,
-            body=last_body,
-            details={"models": models},
-        )
-    raise LegacyUpstreamUnavailableHTTPError(
-        "all backends failed; no model in the fallback chain succeeded",
-        details={
-            "models": models,
-            "last_error": str(last_error) if last_error else None,
-        },
+    request_body: dict[str, Any] = dict(body)
+    # The orchestrator manages ``model``/``messages``/``stream``
+    # specially; do not double-include them in sampling kwargs.
+    request_body.pop("stream", None)
+    return PipelineContext(
+        request_id=request_id,
+        request=request_body,
+        route=match,
+        model_alias_resolved=match.resolved_model,
+        target_backend=match.backend,
+        original_model=match.original_model,
     )
 
 
-async def _do_chat(
-    adapter: Adapter,
-    *,
-    model: str,
-    body: dict[str, Any],
-    messages: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Invoke the adapter and return the OpenAI-shaped response dict.
+def _response_dict_from_context(ctx: PipelineContext) -> dict[str, Any]:
+    """Build the OpenAI-shaped ``chat.completion`` dict from the context.
 
-    Accepts the original request body so that the orchestrator can pass
-    extra sampling parameters (temperature, top_p, max_tokens, etc.) in
-    later milestones.
+    The :class:`moaxy.pipeline.orchestrator.Orchestrator` already stamps
+    the original alias into ``ctx.upstream_response.model`` and uses the
+    accumulated usage across every LLM call (see Stage 4 of
+    :meth:`Orchestrator.run`). This helper just serialises the final
+    :class:`~moaxy.adapters.base.ChatResponse` into the JSON envelope
+    the client expects.
     """
-    kwargs: dict[str, Any] = {
-        k: v
-        for k, v in body.items()
-        if k not in {"model", "messages", "stream"}
-    }
-    response = await adapter.chat(model=model, messages=messages, **kwargs)
+    response = ctx.upstream_response
+    if response is None:
+        # Should not happen — the orchestrator always sets
+        # ``upstream_response`` — but guard so a bug in the pipeline
+        # surfaces a clean 502 rather than an AttributeError.
+        raise LegacyUpstreamUnavailableHTTPError(
+            "upstream returned no response",
+            details={"request_id": ctx.request_id},
+        )
     return {
         "id": response.id,
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": response.model or model,
+        "model": response.model,
         "choices": [
             {
                 "index": 0,
-                "message": {"role": response.message.role, "content": response.message.content},
+                "message": {
+                    "role": response.message.role,
+                    "content": response.message.content,
+                },
                 "finish_reason": response.finish_reason or "stop",
             }
         ],
@@ -260,9 +213,116 @@ async def _do_chat(
     }
 
 
+def _translate_upstream_exception(exc: BaseException, *, models: list[str]) -> Exception:
+    """Translate an adapter/pipeline exception into a moaxy HTTP error.
+
+    The pipeline raises :class:`~moaxy.adapters.base.UpstreamError` and
+    its typed subclasses (:class:`UpstreamTimeoutError`,
+    :class:`UpstreamUnavailableError`) and
+    :class:`~moaxy.pipeline.fallback.UpstreamExhaustedError`. The HTTP
+    handler maps them to the corresponding moaxy error classes so the
+    registered exception handlers render the canonical JSON envelope.
+
+    The error type matches the underlying cause rather than the wrapper:
+
+    * :class:`UpstreamExhaustedError` whose ``last_error`` is a 5xx
+      :class:`UpstreamError` becomes ``upstream_error`` (502).
+    * :class:`UpstreamExhaustedError` whose ``last_error`` is a
+      :class:`UpstreamTimeoutError` becomes ``upstream_timeout`` (504).
+    * :class:`UpstreamExhaustedError` whose ``last_error`` is a
+      :class:`UpstreamUnavailableError` becomes ``upstream_unavailable``
+      (503).
+    * :class:`UpstreamExhaustedError` with no recoverable last_error
+      falls back to ``upstream_unavailable`` (502) so the client gets
+      a stable error code even when the failure mode is ambiguous.
+    """
+    if isinstance(exc, UpstreamExhaustedError):
+        underlying = exc.last_error
+        details_models = list(exc.models) if exc.models else list(models)
+        details_last_error = (
+            str(underlying) if underlying is not None else None
+        )
+        if isinstance(underlying, AdapterUpstreamTimeoutError):
+            return UpstreamTimeoutHTTPError(
+                str(underlying) or "upstream timeout",
+                details={"models": details_models, "last_error": details_last_error},
+            )
+        if isinstance(underlying, AdapterUpstreamUnavailableError):
+            return UpstreamUnavailableHTTPError(
+                str(underlying) or "upstream unavailable",
+                details={"models": details_models, "last_error": details_last_error},
+            )
+        if isinstance(underlying, UpstreamError):
+            status = underlying.status_code
+            if status is not None and 400 <= status < 500:
+                return BadRequestError(
+                    f"upstream rejected the request (HTTP {status}): {underlying}",
+                    details={
+                        "status": status,
+                        "models": details_models,
+                        "response_body": underlying.body,
+                        "last_error": details_last_error,
+                    },
+                )
+            return UpstreamHTTPError(
+                str(underlying) or "upstream error",
+                status_code=status,
+                body=underlying.body,
+                details={"models": details_models, "last_error": details_last_error},
+            )
+        # No recognisable last_error: degrade to 502 upstream_error
+        # because the user-facing message is a generic summary that
+        # still mentions the underlying cause.
+        return UpstreamHTTPError(
+            str(exc)
+            or "all backends failed; no model in the fallback chain succeeded",
+            status_code=502,
+            details={"models": details_models, "last_error": details_last_error},
+        )
+    if isinstance(exc, AdapterUpstreamTimeoutError):
+        return UpstreamTimeoutHTTPError(
+            str(exc) or "upstream timeout",
+            details={"models": models},
+        )
+    if isinstance(exc, AdapterUpstreamUnavailableError):
+        return UpstreamUnavailableHTTPError(
+            str(exc) or "upstream unavailable",
+            details={"models": models},
+        )
+    if isinstance(exc, UpstreamError):
+        status = exc.status_code
+        if status is not None and 400 <= status < 500:
+            return BadRequestError(
+                f"upstream rejected the request (HTTP {status}): {exc}",
+                details={
+                    "status": status,
+                    "models": models,
+                    "response_body": exc.body,
+                },
+            )
+        return UpstreamHTTPError(
+            str(exc),
+            status_code=status,
+            body=exc.body,
+            details={"models": models},
+        )
+    # Any other exception type is treated as a 502 with a generic
+    # message; the registered exception handler sanitises the message
+    # before it leaves the process.
+    return LegacyUpstreamUnavailableHTTPError(
+        str(exc) or "upstream error",
+        details={"models": models, "error_type": type(exc).__name__},
+    )
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> JSONResponse:
-    """OpenAI-compatible chat completions endpoint."""
+    """OpenAI-compatible chat completions endpoint.
+
+    For M1-M3, requests with ``stream: true`` are buffered and answered
+    with a non-streaming JSON response. M4 adds SSE streaming for
+    reflective routes (event: revision per reflection/advisor pass).
+    """
     _validate_content_type(request)
     try:
         body = await request.json()
@@ -283,19 +343,28 @@ async def chat_completions(request: Request) -> JSONResponse:
         )
 
     adapter = _get_adapter(request, match)
-    models: list[str] = [_model_name_used(match), *match.fallbacks]
-    messages: list[dict[str, Any]] = body["messages"]
 
-    response_dict, _hops, fallbacks_used, _usage = await _walk_fallbacks(
-        adapter, models=models, messages=messages, body=body
+    request_id = getattr(request.state, "request_id", "") or ""
+    ctx = _build_context(body, match, request_id=request_id)
+
+    model_chain: list[str] = [match.resolved_model, *match.fallbacks]
+
+    orchestrator = Orchestrator(adapter)
+    try:
+        await orchestrator.run(ctx)
+    except (
+        UpstreamError,
+        UpstreamExhaustedError,
+    ) as exc:
+        raise _translate_upstream_exception(exc, models=model_chain) from exc
+
+    response_dict = _response_dict_from_context(ctx)
+    headers = build_response_headers(ctx, request_id=request_id)
+    return JSONResponse(
+        content=response_dict,
+        headers=headers,
+        media_type="application/json",
     )
-
-    response_dict["model"] = match.original_model
-    headers: dict[str, str] = {
-        "x-moaxy-alias-resolved": match.resolved_model,
-        "x-moaxy-fallbacks-used": str(len(fallbacks_used)),
-    }
-    return JSONResponse(content=response_dict, headers=headers, media_type="application/json")
 
 
 __all__ = ["router"]
