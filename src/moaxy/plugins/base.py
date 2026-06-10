@@ -85,3 +85,22 @@ class Plugin(ABC):
             Processed context dict with modifications applied.
         """
         ...
+
+    async def process_async(self, context: dict[str, Any]) -> dict[str, Any]:
+        """Async hook for plugin processing.
+
+        Used by async plugin types (e.g. REFLECTOR, ADVISOR) and by the
+        pipeline orchestrator. The default implementation is a no-op that
+        returns the context unchanged, so existing plugins that only
+        implement `process` continue to work without modification.
+
+        Override this method in subclasses that need to perform async I/O
+        (LLM calls, network requests, etc.) as part of their processing.
+
+        Args:
+            context: Plugin-specific context dict with request/response data.
+
+        Returns:
+            Processed context dict (unchanged by the default no-op).
+        """
+        return context
