@@ -14,6 +14,7 @@ from moaxy.pipeline.message_builders import (
     build_reflection_messages,
     build_revision_messages,
 )
+from moaxy.pipeline.orchestrator import Orchestrator, build_response_headers
 from moaxy.pipeline.prompts import (
     DEFAULT_ADVISOR_PROMPT,
     DEFAULT_REFLECT_PROMPT,
@@ -23,11 +24,13 @@ from moaxy.pipeline.reflector import parse_confidence, reflect_turn
 __all__ = [
     "DEFAULT_ADVISOR_PROMPT",
     "DEFAULT_REFLECT_PROMPT",
+    "Orchestrator",
     "PipelineContext",
     "PipelineEvent",
     "UpstreamExhaustedError",
     "build_advisor_messages",
     "build_reflection_messages",
+    "build_response_headers",
     "build_revision_messages",
     "call_with_fallbacks",
     "parse_confidence",
