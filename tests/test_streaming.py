@@ -270,3 +270,522 @@ class TestComposedSSEStream:
         # a blank line so SSE clients see the event boundary.
         assert rev.startswith(b"event: revision\n")
         assert rev.endswith(b"\n\n")
+
+
+# ────────────────────────────────────────────────────────────────────
+# End-to-end streaming with a FakeAdapter that streams scripted chunks
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestStreamingEndToEnd:
+    """End-to-end M4 streaming tests with a :class:`FakeAdapter`.
+
+    The previous classes pin the wire format in isolation. The
+    tests in this class exercise the full HTTP path: a
+    :class:`FakeAdapter` is wired into the FastAPI app, the client
+    sends a ``stream: true`` request, and the response is parsed
+    back into SSE events. The :mod:`moaxy.server.streaming` helpers
+    do the byte formatting; these tests prove the *integration*
+    produces a valid ``text/event-stream`` response with the
+    expected event sequence.
+
+    These tests pin the M4 contract entries ``VAL-CROSS-018`` and
+    ``VAL-CROSS-019`` (SSE wire format, content type, multiple
+    ``data:`` lines, final ``data: [DONE]``, revision events).
+    """
+
+    @pytest.mark.asyncio
+    async def test_stream_true_returns_text_event_stream_with_data_done(self):
+        """A simple ``stream: true`` request emits
+        ``text/event-stream`` with multiple ``data:`` lines and a
+        final ``data: [DONE]`` terminator (VAL-CROSS-018).
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        from moaxy.adapters.registry import AdapterRegistry
+        from moaxy.models.config import (
+            AdapterConfig,
+            MoaxyConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.server.app import create_app
+        from tests.fixtures.fake_adapter import FakeAdapter
+
+        adapter = FakeAdapter(stream_script=[["Hel", "lo, ", "world!"]])
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(
+                model="*", path="/v1/chat/completions"
+            ),
+            backend="olloma-local",
+        )
+        cfg = MoaxyConfig(
+            backends=[
+                AdapterConfig(
+                    name="olloma-local",
+                    adapter="ollama",
+                    base_url="http://x",
+                )
+            ],
+            routes=[route],
+        )
+        registry = AdapterRegistry({"olloma-local": adapter})
+        app = create_app(config=cfg, adapters=registry)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "minimax-m3:cloud",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith(
+            "text/event-stream"
+        )
+        # Split into SSE events (terminated by a blank line).
+        events = _parse_sse_events(response.text)
+        # At least 2 data events (the role+first-delta chunk and the
+        # final empty-delta chunk carrying the finish_reason) plus
+        # the terminator ``[DONE]``.
+        assert len(events) >= 3
+        assert events[-1] == (None, "[DONE]")
+        # The first data event carries the role assignment and the
+        # first content delta.
+        first = json.loads(events[0][1])
+        assert first["object"] == "chat.completion.chunk"
+        assert first["choices"][0]["delta"]["role"] == "assistant"
+        # All non-terminator data events have a content key.
+        for _event_name, payload in events[:-1]:
+            decoded = json.loads(payload)
+            assert decoded["choices"][0]["delta"].get("content") is not None
+        # The final data event carries the finish_reason.
+        final = json.loads(events[-2][1])
+        assert final["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_multiple_data_lines(self):
+        """The streamed response carries more than one ``data:`` line,
+        with the chunks accumulating to form the assistant message.
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        from moaxy.adapters.registry import AdapterRegistry
+        from moaxy.models.config import (
+            AdapterConfig,
+            MoaxyConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.server.app import create_app
+        from tests.fixtures.fake_adapter import FakeAdapter
+
+        adapter = FakeAdapter(
+            stream_script=[["a", "b", "c", "d", "e"]]
+        )
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(
+                model="*", path="/v1/chat/completions"
+            ),
+            backend="olloma-local",
+        )
+        cfg = MoaxyConfig(
+            backends=[
+                AdapterConfig(
+                    name="olloma-local",
+                    adapter="ollama",
+                    base_url="http://x",
+                )
+            ],
+            routes=[route],
+        )
+        registry = AdapterRegistry({"olloma-local": adapter})
+        app = create_app(config=cfg, adapters=registry)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "minimax-m3:cloud",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 200
+        # The body must contain at least 3 ``data:`` lines (multiple
+        # content deltas + the final empty-delta chunk + the
+        # terminator). We count the literal ``data:`` lines.
+        assert response.text.count("data:") >= 3
+        # The terminator is present.
+        assert response.text.endswith("data: [DONE]\n\n")
+        # The chunks accumulate to the scripted text "abcde" when
+        # concatenated in order.
+        events = _parse_sse_events(response.text)
+        deltas: list[str] = []
+        for _event_name, payload in events[:-1]:
+            decoded = json.loads(payload)
+            content = decoded["choices"][0]["delta"].get("content", "")
+            if content:
+                deltas.append(content)
+        assert "".join(deltas) == "abcde"
+
+    @pytest.mark.asyncio
+    async def test_stream_reflective_route_emits_revision_event(self):
+        """A reflective route streams the initial answer then emits
+        an ``event: revision`` for the post-reflection revised
+        answer (VAL-CROSS-019). The terminator ``data: [DONE]`` is
+        the last line of the stream.
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        from moaxy.adapters.base import ChatResponse, Message, Usage
+        from moaxy.adapters.registry import AdapterRegistry
+        from moaxy.models.config import (
+            AdapterConfig,
+            MoaxyConfig,
+            ReflectionConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.server.app import create_app
+        from tests.fixtures.fake_adapter import FakeAdapter
+
+        def _chat_response(content: str) -> ChatResponse:
+            return ChatResponse(
+                id="chatcmpl-stream",
+                model="minimax-m3:cloud",
+                message=Message(role="assistant", content=content),
+                usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+            )
+
+        adapter = FakeAdapter(
+            stream_script=[["Hello, ", "world!"]],
+            responses=[
+                # Reflection critique.
+                _chat_response("c\nREFLECT_CONFIDENCE: 0.5"),
+                # Reflection revision.
+                _chat_response("revised answer"),
+            ],
+        )
+        route = RouteConfig(
+            name="reflective",
+            match=ConfigRouteMatch(
+                model="*", path="/v1/chat/completions"
+            ),
+            backend="olloma-local",
+            reflection=ReflectionConfig(
+                turns=1, early_exit=False, threshold=0.85
+            ),
+        )
+        cfg = MoaxyConfig(
+            backends=[
+                AdapterConfig(
+                    name="olloma-local",
+                    adapter="ollama",
+                    base_url="http://x",
+                )
+            ],
+            routes=[route],
+        )
+        registry = AdapterRegistry({"olloma-local": adapter})
+        app = create_app(config=cfg, adapters=registry)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "minimax-m3:cloud",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith(
+            "text/event-stream"
+        )
+        events = _parse_sse_events(response.text)
+        # The stream ends with the [DONE] terminator.
+        assert events[-1] == (None, "[DONE]")
+        # Find the revision event.
+        revision_events = [
+            e for e in events if e[0] == "revision"
+        ]
+        assert len(revision_events) == 1
+        payload = json.loads(revision_events[0][1])
+        assert payload["text"] == "revised answer"
+        assert payload["turn"] == 0
+        # The stream header ``x-moaxy-alias-resolved`` is present
+        # (the request did not use an alias; the value is the model
+        # name the client sent).
+        assert "x-moaxy-alias-resolved" in response.headers
+        assert (
+            response.headers["x-moaxy-alias-resolved"]
+            == "minimax-m3:cloud"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_includes_x_moaxy_request_id_header(self):
+        """The streaming response carries the standard
+        ``x-moaxy-request-id`` header so end-to-end log correlation
+        works on streaming requests too.
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        from moaxy.adapters.registry import AdapterRegistry
+        from moaxy.models.config import (
+            AdapterConfig,
+            MoaxyConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.server.app import create_app
+        from tests.fixtures.fake_adapter import FakeAdapter
+
+        adapter = FakeAdapter(stream_script=[["ok"]])
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(
+                model="*", path="/v1/chat/completions"
+            ),
+            backend="olloma-local",
+        )
+        cfg = MoaxyConfig(
+            backends=[
+                AdapterConfig(
+                    name="olloma-local",
+                    adapter="ollama",
+                    base_url="http://x",
+                )
+            ],
+            routes=[route],
+        )
+        registry = AdapterRegistry({"olloma-local": adapter})
+        app = create_app(config=cfg, adapters=registry)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "minimax-m3:cloud",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 200
+        assert "x-moaxy-request-id" in response.headers
+        assert response.headers["x-moaxy-request-id"]
+
+
+# ────────────────────────────────────────────────────────────────────
+# M4 end-to-end: streaming + reflection + alias + advisor
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestStreamingM4EndToEnd:
+    """The M4 reflective streaming flow combined into one request.
+
+    The full vertical:
+    (1) the client sends a ``stream: true`` request with an
+        alias model name (``coder-pro``),
+    (2) the route resolves the alias to a real model
+        (``minimax-m3:cloud``),
+    (3) the orchestrator streams the initial answer, then runs
+        the reflection loop (one turn) and the advisor pass
+        (one turn with a different model), and
+    (4) the final response carries the streaming events plus
+        one or more ``event: revision`` events for the
+        post-reflection and post-advisor answers, then the
+        ``data: [DONE]`` terminator.
+
+    This pins the integration of every M4 feature: streaming
+    protocol, alias resolution, self-reflection, advisor, and
+    the revision SSE event format.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stream_reflection_advisor_alias_full_flow(self):
+        """End-to-end: alias + reflection + advisor + streaming."""
+        from httpx import ASGITransport, AsyncClient
+
+        from moaxy.adapters.base import ChatResponse, Message, Usage
+        from moaxy.adapters.registry import AdapterRegistry
+        from moaxy.models.config import (
+            AdapterConfig,
+            AdvisorConfig,
+            MoaxyConfig,
+            ReflectionConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.server.app import create_app
+        from tests.fixtures.fake_adapter import FakeAdapter
+
+        def _chat_response(content: str, model: str) -> ChatResponse:
+            return ChatResponse(
+                id="chatcmpl-stream",
+                model=model,
+                message=Message(role="assistant", content=content),
+                usage=Usage(
+                    prompt_tokens=10, completion_tokens=5, total_tokens=15
+                ),
+            )
+
+        adapter = FakeAdapter(
+            stream_script=[["Hello, ", "world!"]],
+            responses=[
+                # Reflection critique (primary model).
+                _chat_response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    model="minimax-m3:cloud",
+                ),
+                # Reflection revision (primary model).
+                _chat_response(
+                    "revised answer", model="minimax-m3:cloud"
+                ),
+                # Advisor call (different model).
+                _chat_response(
+                    "ADVISOR_APPROVE",
+                    model="deepseek-v4-pro:cloud",
+                ),
+            ],
+        )
+        route = RouteConfig(
+            name="reflective-coder",
+            match=ConfigRouteMatch(
+                model="*", path="/v1/chat/completions"
+            ),
+            backend="olloma-local",
+            aliases={"coder-pro": "minimax-m3:cloud"},
+            reflection=ReflectionConfig(
+                turns=1, early_exit=False, threshold=0.85
+            ),
+            advisor=AdvisorConfig(
+                model="deepseek-v4-pro:cloud", turns=1
+            ),
+        )
+        cfg = MoaxyConfig(
+            backends=[
+                AdapterConfig(
+                    name="olloma-local",
+                    adapter="ollama",
+                    base_url="http://x",
+                )
+            ],
+            routes=[route],
+        )
+        registry = AdapterRegistry({"olloma-local": adapter})
+        app = create_app(config=cfg, adapters=registry)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "coder-pro",  # alias; resolved to minimax-m3:cloud
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith(
+            "text/event-stream"
+        )
+        # The alias was resolved; the response header carries the
+        # real model name.
+        assert response.headers["x-moaxy-alias-resolved"] == "minimax-m3:cloud"
+        events = _parse_sse_events(response.text)
+        # The stream ends with [DONE].
+        assert events[-1] == (None, "[DONE]")
+        # The initial chunks were streamed (data events with
+        # delta.content accumulating to "Hello, world!").
+        data_events = [e for e in events[:-1] if e[0] is None]
+        deltas: list[str] = []
+        for _event_name, payload in data_events:
+            decoded = json.loads(payload)
+            content = decoded["choices"][0]["delta"].get("content", "")
+            if content:
+                deltas.append(content)
+        assert "".join(deltas) == "Hello, world!"
+        # The reflection produced exactly one revision event.
+        revision_events = [
+            e for e in events if e[0] == "revision"
+        ]
+        assert len(revision_events) == 1
+        rev_payload = json.loads(revision_events[0][1])
+        assert rev_payload["text"] == "revised answer"
+        assert rev_payload["turn"] == 0
+        # The advisor approved, so no advisor-revision event is
+        # emitted. The final response content is the
+        # post-reflection revised answer.
+        # The header ``x-moaxy-alias-resolved`` confirms the
+        # alias was resolved (the original alias ``coder-pro`` is
+        # echoed in the response body via the orchestrator, not
+        # in this header).
+        assert (
+            response.headers["x-moaxy-alias-resolved"]
+            == "minimax-m3:cloud"
+        )
+
+
+# ────────────────────────────────────────────────────────────────────
+# SSE parser helper (used by the end-to-end tests)
+# ────────────────────────────────────────────────────────────────────
+
+
+def _parse_sse_events(body: str) -> list[tuple[str | None, str]]:
+    """Parse an SSE response body into ``(event_name, data_payload)`` pairs.
+
+    Mirrors the helper used by ``test_server_orchestrator_integration``:
+    the response body is a series of events separated by a blank
+    line (``\\n\\n``). Each event may have one or more
+    ``field: value`` lines; the ``event:`` field (default
+    ``"message"`` when absent) and the ``data:`` lines are
+    extracted. The terminator ``[DONE]`` is preserved as a
+    ``data:`` payload so tests can assert on its presence.
+    """
+    events: list[tuple[str | None, str]] = []
+    current_event: str | None = None
+    current_data: list[str] = []
+    for line in body.split("\n"):
+        if line == "":
+            if current_data or current_event is not None:
+                events.append((current_event, "\n".join(current_data)))
+            current_event = None
+            current_data = []
+            continue
+        if line.startswith(":"):
+            continue
+        if ":" in line:
+            field, _, value = line.partition(":")
+            if value.startswith(" "):
+                value = value[1:]
+            if field == "event":
+                current_event = value
+            elif field == "data":
+                current_data.append(value)
+    if current_data or current_event is not None:
+        events.append((current_event, "\n".join(current_data)))
+    return events

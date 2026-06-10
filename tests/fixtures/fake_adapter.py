@@ -140,16 +140,31 @@ class FakeAdapter(Adapter):
 
     name = "fake"
 
-    def __init__(self, responses: list[Any] | None = None) -> None:
+    def __init__(
+        self,
+        responses: list[Any] | None = None,
+        stream_script: list[Any] | None = None,
+    ) -> None:
         self.responses: list[Any] = list(responses or [])
+        self.stream_script: list[Any] = list(stream_script or [])
         self.calls: list[dict[str, Any]] = []
         self._index: int = 0
+        self._stream_index: int = 0
+        self.stream_calls: list[dict[str, Any]] = []
 
-    def reset(self, responses: list[Any] | None = None) -> None:
+    def reset(
+        self,
+        responses: list[Any] | None = None,
+        stream_script: list[Any] | None = None,
+    ) -> None:
         """Reset the call log and (optionally) re-script responses."""
         self.responses = list(responses) if responses is not None else []
         self.calls = []
         self._index = 0
+        if stream_script is not None:
+            self.stream_script = list(stream_script)
+        self.stream_calls = []
+        self._stream_index = 0
 
     @property
     def system_messages(self) -> list[dict[str, Any] | None]:
@@ -224,15 +239,59 @@ class FakeAdapter(Adapter):
             f"ChatResponse, Exception, or None; got {type(entry).__name__}"
         )
 
-    async def stream(  # pragma: no cover - not exercised by reflection tests
+    async def stream(
         self,
         *,
         model: str,
         messages: list[dict[str, Any]],
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        if False:
-            yield ""
+        """Yield scripted text deltas (or raise scripted exceptions).
+
+        Each entry in :attr:`stream_script` is consumed in order; the
+        Nth call to :meth:`stream` returns the Nth entry. Entry grammar:
+
+        * a list of strings — yielded in order as the streamed deltas.
+        * a :class:`BaseException` instance — raised on the call.
+        * ``None`` — convenience for "no scripted response for this
+          call"; the adapter yields the single delta ``"stream-ok"``.
+
+        The :attr:`stream_calls` log records every call's parameters
+        (``model``, ``messages``, forwarded ``**kwargs``) so tests can
+        assert on the streaming call shape. When the script runs out
+        before all calls have been made, the adapter yields a single
+        ``"stream-ok"`` delta as a fallback (this matches the
+        chat-path fallback to :func:`_default_response`).
+
+        The method is an async generator. The orchestrator drives
+        iteration via :func:`moaxy.pipeline.fallback.call_with_fallbacks_stream`,
+        so a transient error raises out of the generator and the
+        walker moves to the next model in the chain. A 4xx (permanent)
+        error is re-raised without consulting the fallbacks.
+        """
+        self.stream_calls.append(
+            {"model": model, "messages": messages, **kwargs}
+        )
+        if self._stream_index >= len(self.stream_script):
+            yield "stream-ok"
+            return
+        entry = self.stream_script[self._stream_index]
+        self._stream_index += 1
+        if isinstance(entry, BaseException):
+            raise entry
+        if isinstance(entry, list):
+            for delta in entry:
+                if isinstance(delta, BaseException):
+                    raise delta
+                yield str(delta)
+            return
+        if entry is None:
+            yield "stream-ok"
+            return
+        raise AssertionError(
+            f"FakeAdapter.stream: scripted entry #{self._stream_index} must be "
+            f"list of str, Exception, or None; got {type(entry).__name__}"
+        )
 
     async def close(self) -> None:  # pragma: no cover - nothing to close
         return None
