@@ -14,6 +14,7 @@ errors against a route handler.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -159,7 +160,18 @@ class UpstreamError(MoaxyError):
         if status_code is not None:
             payload.setdefault("upstream_status", status_code)
         if body is not None and "upstream_body" not in payload:
-            payload["upstream_body"] = body
+            # Scrub the upstream body before exposing it in the
+            # public error envelope. The upstream may echo any
+            # secrets it was sent in its own error message
+            # (e.g. an OpenRouter 401 response that includes the
+            # bearer token in the error text), and surfacing the
+            # raw body would make moaxy a leak vector for the
+            # very secrets it is supposed to protect. The
+            # full body is preserved in ``self.upstream_body``
+            # for internal logging / debug surfaces, but the
+            # client-facing ``details["upstream_body"]`` is
+            # always the scrubbed form.
+            payload["upstream_body"] = _scrub_secrets(body)
         super().__init__(safe_message, details=payload or None)
         self.upstream_status_code = status_code
         self.upstream_body = body
@@ -256,6 +268,49 @@ def _sanitize_message(message: str) -> str:
         # Keep the tail past the last "/moaxy/" segment.
         text = text.split("/moaxy/", 1)[-1]
     return text.strip() or "upstream error"
+
+
+# Patterns that, if present in a public-facing error body, would leak
+# a secret. The scrubber replaces each match with a redaction marker
+# so the public envelope preserves the shape of the original body
+# (useful for debugging) without exposing the secret. New patterns
+# can be added here as new secret formats are introduced.
+#
+# Notes on the patterns:
+# - ``Bearer <token>`` covers HTTP ``Authorization:`` headers in
+#   upstream error bodies (some upstreams echo the bad token back in
+#   the 401 response).
+# - ``sk-or-v1-...``, ``sk-...``, and ``gsk_...`` cover common LLM
+#   provider API key formats (OpenRouter, OpenAI, Groq).
+# - The <KEY>...</KEY> XML-style pattern is defensive: a few legacy
+#   upstream APIs echo API keys in error bodies wrapped in custom
+#   XML tags.
+_SECRET_PATTERNS: tuple[str, ...] = (
+    r"Bearer\s+[A-Za-z0-9._\-+/=]{8,}",
+    r"sk-or-v1-[A-Za-z0-9_\-]+",
+    r"sk-[A-Za-z0-9_\-]{20,}",
+    r"gsk_[A-Za-z0-9_\-]{20,}",
+    r"<KEY>[^<]*</KEY>",
+)
+
+
+def _scrub_secrets(body: str) -> str:
+    """Return a copy of ``body`` with known secret patterns redacted.
+
+    The scrubber is a defensive measure for the M6 contract: the
+    moaxy error envelope (sent to the client) MUST NOT include the
+    API key in plain text, even when the upstream's own error
+    message happens to reference the key. The scrubber replaces
+    every match with ``<redacted>`` so the client still sees a
+    useful body shape (e.g. ``{"error": "<redacted>"}``) without
+    the secret.
+    """
+    if not body:
+        return body
+    text = str(body)
+    for pattern in _SECRET_PATTERNS:
+        text = re.sub(pattern, "<redacted>", text)
+    return text
 
 
 def _envelope(

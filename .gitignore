@@ -9,3 +9,24 @@ build/
 .venv/
 venv/
 .tokensave
+
+# Secrets and credential files.
+#
+# The .env entry above covers the canonical secrets file. The
+# explicit OPENROUTER_API_KEY pattern below is a defensive
+# marker so a future maintainer cannot accidentally remove the
+# intent without seeing the rationale. The key is read from
+# the environment at adapter construction time
+# (`OpenRouterAdapter` raises if it is missing); it is never
+# stored on disk by the project, but if a future debug script
+# dumps the literal token into a file, the patterns below
+# ensure the file is still excluded from version control.
+#
+# NB: ``.env.*`` is intentionally NOT listed here so that
+# ``.env.example`` (and any future ``.env.sample``) can be
+# committed. The literal ``.env`` line above is the only
+# gitignore rule that covers the populated secrets file.
+*.secret
+*sk-or-v1-*.key
+*OPENROUTER_API_KEY*
+

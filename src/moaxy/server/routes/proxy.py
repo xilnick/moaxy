@@ -64,6 +64,7 @@ from moaxy.server.errors import (
     NoRouteMatchError,
     ServiceUnavailableError,
     UnsupportedMediaTypeError,
+    _scrub_secrets,
 )
 from moaxy.server.errors import (
     UpstreamError as UpstreamHTTPError,
@@ -240,77 +241,81 @@ def _translate_upstream_exception(exc: BaseException, *, models: list[str]) -> E
         underlying = exc.last_error
         details_models = list(exc.models) if exc.models else list(models)
         details_last_error = (
-            str(underlying) if underlying is not None else None
+            _scrub_secrets(str(underlying)) if underlying is not None else None
         )
         if isinstance(underlying, AdapterUpstreamTimeoutError):
             return UpstreamTimeoutHTTPError(
-                str(underlying) or "upstream timeout",
+                _scrub_secrets(str(underlying)) or "upstream timeout",
                 details={"models": details_models, "last_error": details_last_error},
             )
         if isinstance(underlying, AdapterUpstreamUnavailableError):
             return UpstreamUnavailableHTTPError(
-                str(underlying) or "upstream unavailable",
+                _scrub_secrets(str(underlying)) or "upstream unavailable",
                 details={"models": details_models, "last_error": details_last_error},
             )
         if isinstance(underlying, UpstreamError):
             status = underlying.status_code
+            scrubbed_body = _scrub_secrets(underlying.body) if underlying.body else None
             if status is not None and 400 <= status < 500:
                 return BadRequestError(
-                    f"upstream rejected the request (HTTP {status}): {underlying}",
+                    f"upstream rejected the request (HTTP {status}): "
+                    f"{_scrub_secrets(str(underlying))}",
                     details={
                         "status": status,
                         "models": details_models,
-                        "response_body": underlying.body,
+                        "response_body": scrubbed_body,
                         "last_error": details_last_error,
                     },
                 )
             return UpstreamHTTPError(
-                str(underlying) or "upstream error",
+                _scrub_secrets(str(underlying)) or "upstream error",
                 status_code=status,
-                body=underlying.body,
+                body=scrubbed_body,
                 details={"models": details_models, "last_error": details_last_error},
             )
         # No recognisable last_error: degrade to 502 upstream_error
         # because the user-facing message is a generic summary that
         # still mentions the underlying cause.
         return UpstreamHTTPError(
-            str(exc)
+            _scrub_secrets(str(exc))
             or "all backends failed; no model in the fallback chain succeeded",
             status_code=502,
             details={"models": details_models, "last_error": details_last_error},
         )
     if isinstance(exc, AdapterUpstreamTimeoutError):
         return UpstreamTimeoutHTTPError(
-            str(exc) or "upstream timeout",
+            _scrub_secrets(str(exc)) or "upstream timeout",
             details={"models": models},
         )
     if isinstance(exc, AdapterUpstreamUnavailableError):
         return UpstreamUnavailableHTTPError(
-            str(exc) or "upstream unavailable",
+            _scrub_secrets(str(exc)) or "upstream unavailable",
             details={"models": models},
         )
     if isinstance(exc, UpstreamError):
         status = exc.status_code
+        scrubbed_body = _scrub_secrets(exc.body) if exc.body else None
         if status is not None and 400 <= status < 500:
             return BadRequestError(
-                f"upstream rejected the request (HTTP {status}): {exc}",
+                f"upstream rejected the request (HTTP {status}): "
+                f"{_scrub_secrets(str(exc))}",
                 details={
                     "status": status,
                     "models": models,
-                    "response_body": exc.body,
+                    "response_body": scrubbed_body,
                 },
             )
         return UpstreamHTTPError(
-            str(exc),
+            _scrub_secrets(str(exc)),
             status_code=status,
-            body=exc.body,
+            body=scrubbed_body,
             details={"models": models},
         )
     # Any other exception type is treated as a 502 with a generic
     # message; the registered exception handler sanitises the message
     # before it leaves the process.
     return LegacyUpstreamUnavailableHTTPError(
-        str(exc) or "upstream error",
+        _scrub_secrets(str(exc)) or "upstream error",
         details={"models": models, "error_type": type(exc).__name__},
     )
 
