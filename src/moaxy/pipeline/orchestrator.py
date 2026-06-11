@@ -148,6 +148,143 @@ def _advisor_model_chain(ctx: PipelineContext) -> list[str]:
     return [advisor_model, *list(route.fallbacks)]
 
 
+# DELTA 1: the conditional-advisor-skip threshold. The orchestrator
+# skips the advisor LLM call when the parsed REFLECT_CONFIDENCE
+# (carried in ``ctx.__dict__["last_confidence"]``) is greater than
+# or equal to this value. The threshold is hardcoded at 0.85 (the
+# default ReflectionConfig.threshold). When the parsed confidence
+# is exactly 0.85 the advisor is skipped; at 0.849 the advisor
+# runs. The boundary is inclusive: ``confidence >= 0.85`` skips.
+ADVISOR_SKIP_CONFIDENCE_THRESHOLD = 0.85
+
+
+def _should_skip_advisor(ctx: PipelineContext) -> bool:
+    """Return True when the DELTA 1 advisor-skip conditions all hold.
+
+    The conditional skip is engaged when ALL of the following are true:
+
+    1. The reflection loop produced a parsed
+       :attr:`PipelineContext.__dict__["last_confidence"]` that is
+       greater than or equal to the hardcoded threshold (0.85).
+    2. The route's advisor is configured (``advisor.turns >= 1``
+       and ``advisor.model`` is set).
+    3. The reflection loop ran at least one turn (so the confidence
+       signal exists; the value is the default 0.0 when reflection
+       was disabled, in which case the skip is NOT engaged).
+
+    When the helper returns ``True``, the orchestrator MUST skip
+    the advisor LLM call entirely. The caller is responsible for
+    appending the ``advisor_skipped`` event and setting the
+    ``advisor_skipped`` / ``advisor_skip_confidence`` runtime
+    attributes on the context for the response builder.
+    """
+    route = ctx.route
+    if route is None:
+        return False
+    advisor_cfg = route.advisor
+    if advisor_cfg.turns < 1 or not advisor_cfg.model:
+        return False
+    # DELTA 1: the skip requires a real confidence signal. When the
+    # reflection loop did not run (turns=0), the runtime attribute
+    # is the dataclass default 0.0; the helper must NOT skip in
+    # that case (no confidence was reported, so the model's
+    # confidence is unknown). The "no reflection ran" case is
+    # distinguished by ``last_confidence == 0.0`` AND the absence
+    # of any reflect_critique event in ``ctx.events``.
+    if route.reflection.turns < 1:
+        return False
+    has_critique = any(
+        e.type == "reflect_critique" for e in ctx.events
+    )
+    if not has_critique:
+        return False
+    last_confidence = ctx.__dict__.get("last_confidence", 0.0) or 0.0
+    return last_confidence >= ADVISOR_SKIP_CONFIDENCE_THRESHOLD
+
+
+def _resolve_advisor_model_name(ctx: PipelineContext) -> str:
+    """Return the configured advisor model name for the matched route.
+
+    This is a small helper used by the self-advise warning and by
+    tests that need to compare ``route.advisor.model`` to the
+    primary's resolved model. The orchestrator does NOT call
+    alias resolution on the advisor model name; the route's
+    configured ``advisor.model`` is used verbatim, mirroring the
+    semantics in :func:`_advisor_model_chain`.
+    """
+    route = ctx.route
+    assert route is not None
+    return route.advisor.model or ""
+
+
+def _resolve_primary_model_name(ctx: PipelineContext) -> str:
+    """Return the primary model's resolved (alias-aware) name.
+
+    Mirrors :func:`_resolved_model_chain`'s primary-selection rule
+    so the self-advise warning compares the same name the adapter
+    actually receives. When no alias resolution happened (e.g. a
+    test that did not populate ``ctx.model_alias_resolved``), the
+    helper falls back to ``ctx.route.resolved_model``.
+    """
+    route = ctx.route
+    assert route is not None
+    return ctx.model_alias_resolved or route.resolved_model
+
+
+def _record_advisor_skipped(
+    ctx: PipelineContext,
+    *,
+    confidence: float,
+) -> None:
+    """Append the ``advisor_skipped`` event and stamp runtime attributes.
+
+    The orchestrator calls this when the DELTA 1 conditional skip
+    fires. The event makes the skip observable in the structured
+    log / events list, and the runtime attributes are read by
+    :func:`build_response_headers` to emit the
+    ``x-moaxy-advisor-skipped: 1/confidence=<x>`` response header.
+    The log line is an INFO record so operators can confirm the
+    skip happened and inspect the parsed confidence that triggered
+    it.
+    """
+    ctx.append_event(
+        "advisor_skipped",
+        text=f"confidence={confidence:g}",
+    )
+    ctx.__dict__["advisor_skipped"] = True
+    ctx.__dict__["advisor_skip_confidence"] = confidence
+    logger.info(
+        "orchestrator: advisor skipped (confidence=%.3f >= %.2f) on model=%s",
+        confidence,
+        ADVISOR_SKIP_CONFIDENCE_THRESHOLD,
+        _resolve_advisor_model_name(ctx),
+    )
+
+
+def _maybe_warn_self_advise(ctx: PipelineContext) -> None:
+    """Emit a one-shot WARNING when advisor.model equals the primary.
+
+    Self-advise (advisor.model == primary resolved_model) is a
+    legitimate pattern (some operators want a second pass on the
+    same model with a fresh prompt context), but it is worth
+    flagging once per request because the cost is effectively
+    doubled with no model-diversity benefit. The orchestrator
+    logs a WARNING the first time it observes the match and
+    proceeds; the advisor call still runs (the orchestrator does
+    not short-circuit the self-advise path).
+    """
+    advisor_model = _resolve_advisor_model_name(ctx)
+    primary_model = _resolve_primary_model_name(ctx)
+    if not advisor_model or not primary_model:
+        return
+    if advisor_model != primary_model:
+        return
+    logger.warning(
+        "advisor.model == primary resolved_model; "
+        "running self-advise with a fresh prompt context"
+    )
+
+
 def _reflect_system_prompt(ctx: PipelineContext) -> str:
     """Return the reflector system prompt to use for this request.
 
@@ -855,19 +992,58 @@ class Orchestrator:
         ``primary_chain`` with the advisor's feedback baked into the
         prompt; the primary model's response becomes the final answer.
 
+        DELTA 1: when the parsed REFLECT_CONFIDENCE from the
+        reflection loop is ``>= 0.85`` (the hardcoded
+        :data:`ADVISOR_SKIP_CONFIDENCE_THRESHOLD`), the advisor
+        LLM call is short-circuited. The orchestrator appends an
+        ``advisor_skipped`` event to ``ctx.events`` and stamps the
+        ``advisor_skipped`` / ``advisor_skip_confidence`` runtime
+        attributes on the context. The post-reflection answer is
+        returned unchanged and no advisor LLM call is made.
+
         Returns:
             A ``(final_answer, fallbacks_used)`` tuple. ``final_answer``
             is the assistant text to use as the response body. On
             ``ADVISOR_APPROVE`` the post-reflection answer is returned
             unchanged. On ``ADVISOR_REVISE:`` the post-primary-revision
-            text is returned. ``fallbacks_used`` aggregates the fallback
-            models the walker used across both the advisor and the
-            post-advisor primary revision.
+            text is returned. On a DELTA 1 skip, the post-reflection
+            answer is returned unchanged. ``fallbacks_used``
+            aggregates the fallback models the walker used across both
+            the advisor and the post-advisor primary revision. On a
+            skip the tuple is ``(answer, [])`` — the orchestrator
+            did not invoke the walker.
         """
         assert ctx.route is not None
         advisor_cfg = ctx.route.advisor
         if advisor_cfg.turns < 1 or not advisor_cfg.model:
             return answer, []
+
+        # DELTA 1: conditional advisor skip. The orchestrator
+        # short-circuits the advisor pass when the parsed
+        # REFLECT_CONFIDENCE from the reflection loop clears the
+        # hardcoded threshold (0.85). The skip saves one LLM
+        # round-trip per request; the response is the
+        # post-reflection answer unchanged. The orchestrator
+        # records the skip via :func:`_record_advisor_skipped` so
+        # operators can see the skip in the structured log and
+        # the response header (``x-moaxy-advisor-skipped:
+        # 1/confidence=<x>``) carries the parsed confidence.
+        if _should_skip_advisor(ctx):
+            confidence = (
+                ctx.__dict__.get("last_confidence", 0.0) or 0.0
+            )
+            _record_advisor_skipped(ctx, confidence=confidence)
+            return answer, []
+
+        # DELTA 1 (self-advise warning): when the configured
+        # advisor model resolves to the same name as the primary
+        # resolved model, log a one-shot WARNING. The advisor
+        # call still proceeds (self-advise is a legitimate
+        # pattern, just worth flagging). The check runs after the
+        # skip check so a skipped advisor does not also fire the
+        # self-advise warning (the warning is about "the advisor
+        # will run, but it is the same model as the primary").
+        _maybe_warn_self_advise(ctx)
 
         # Stage 1: the advisor LLM call. The orchestrator dispatches
         # through ``call_with_fallbacks`` for retry/fallback support,
@@ -1013,6 +1189,26 @@ class Orchestrator:
         advisor_cfg = ctx.route.advisor
         if advisor_cfg.turns < 1 or not advisor_cfg.model:
             return current_answer, []
+
+        # DELTA 1: conditional advisor skip. The parallel path
+        # applies the same skip rule as the sequential path: when
+        # the parsed REFLECT_CONFIDENCE clears the hardcoded
+        # threshold (0.85), the advisor LLM call (and the
+        # parallel self-reflection path) is short-circuited. The
+        # orchestrator records the skip and returns the
+        # post-reflection answer unchanged.
+        if _should_skip_advisor(ctx):
+            confidence = (
+                ctx.__dict__.get("last_confidence", 0.0) or 0.0
+            )
+            _record_advisor_skipped(ctx, confidence=confidence)
+            return current_answer, []
+
+        # DELTA 1 (self-advise warning): one-shot WARNING per
+        # request when the configured advisor model resolves to
+        # the same name as the primary resolved model. The
+        # advisor call still proceeds.
+        _maybe_warn_self_advise(ctx)
 
         # The advisor path: a thin wrapper that runs the sequential
         # advisor logic and returns the (possibly revised) final
@@ -1947,6 +2143,25 @@ def build_response_headers(ctx: PipelineContext, *, request_id: str) -> dict[str
                 advisor_model = event.model
     if advisor_model:
         headers["x-moaxy-advisor-model"] = advisor_model
+
+    # DELTA 1: the ``x-moaxy-advisor-skipped`` header is ALWAYS
+    # present (consistent observability). The value is
+    # ``1/confidence=<x>`` when the advisor was skipped, and
+    # ``0/no`` when the advisor ran (or was disabled). The header
+    # is derived from the ``advisor_skipped`` runtime attribute
+    # on the context; the orchestrator sets the attribute (and
+    # appends the ``advisor_skipped`` event) when the conditional
+    # skip fires in :meth:`_run_advisor` /
+    # :meth:`_run_advisor_parallel`.
+    if ctx.__dict__.get("advisor_skipped"):
+        skip_confidence = ctx.__dict__.get(
+            "advisor_skip_confidence", 0.0
+        ) or 0.0
+        headers["x-moaxy-advisor-skipped"] = (
+            f"1/confidence={skip_confidence:g}"
+        )
+    else:
+        headers["x-moaxy-advisor-skipped"] = "0/no"
 
     return headers
 

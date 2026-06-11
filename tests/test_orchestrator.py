@@ -1694,3 +1694,632 @@ class TestOrderAdviseFirst:
         assert types == ["initial", "advisor", "advisor_approve"]
         # Two LLM calls: initial + advisor.
         assert len(adapter.calls) == 2
+
+
+# ────────────────────────────────────────────────────────────────────
+# DELTA 1 — Conditional advisor skip
+# (VAL-PIPE-EXTRA-001, 002, 003, 023, 024, 030, 031)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestConditionalAdvisorSkip:
+    """The DELTA 1 advisor-skip logic short-circuits the advisor LLM call.
+
+    The orchestrator skips the advisor pass when the parsed
+    REFLECT_CONFIDENCE from the reflection loop is greater than
+    or equal to the hardcoded threshold (0.85). The skip saves one
+    LLM round-trip per request: the adapter call count drops from
+    4 (initial + critique + revise + advisor) to 2 (initial +
+    critique) in the typical case.
+
+    The skip requires ALL of the following:
+
+    1. The reflection loop ran at least one turn (so a confidence
+       signal exists).
+    2. The parsed REFLECT_CONFIDENCE is ``>= 0.85``.
+    3. The route's advisor is configured (``advisor.turns >= 1``
+       and ``advisor.model`` is set).
+
+    When the skip fires, the orchestrator:
+
+    * Does NOT call the advisor LLM (adapter call count drops by
+      1).
+    * Does NOT emit any ``advisor*`` event.
+    * Appends an ``advisor_skipped`` event with the parsed
+      confidence.
+    * Stamps ``ctx.__dict__["advisor_skipped"] = True`` and
+      ``ctx.__dict__["advisor_skip_confidence"]`` for the response
+      builder.
+    * The ``x-moaxy-advisor-skipped`` response header carries the
+      value ``1/confidence=<x>``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_skip_when_confidence_above_threshold(self):
+        """VAL-PIPE-EXTRA-001: confidence >= 0.85 → advisor call skipped."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                # Single critique with high confidence; early-exit
+                # would fire on this turn anyway, so the
+                # reflection loop stops after the critique.
+                _response(
+                    "looks good\nREFLECT_CONFIDENCE: 0.9",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # Only 2 LLM calls: initial + critique. No advisor call.
+        assert len(adapter.calls) == 2
+        # No advisor event was emitted.
+        types = [e.type for e in ctx.events]
+        assert "advisor" not in types
+        assert "advisor_approve" not in types
+        assert "advisor_revised" not in types
+        # The ``advisor_skipped`` event is appended with the
+        # parsed confidence.
+        skipped = [e for e in ctx.events if e.type == "advisor_skipped"]
+        assert len(skipped) == 1
+        assert "0.9" in (skipped[0].text or "")
+        # Runtime attributes are stamped for the response builder.
+        assert ctx.__dict__.get("advisor_skipped") is True
+        assert ctx.__dict__.get("advisor_skip_confidence") == 0.9
+        # The header builder emits ``1/confidence=0.9``.
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-skipped"] == "1/confidence=0.9"
+        # The advisor-model header is NOT set on a skip.
+        assert "x-moaxy-advisor-model" not in headers
+
+    @pytest.mark.asyncio
+    async def test_run_when_confidence_below_threshold(self):
+        """VAL-PIPE-EXTRA-001 (counter-case): confidence < 0.85 → advisor runs."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                # Low confidence → revision runs.
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                # Advisor: ADVISOR_APPROVE.
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # 4 LLM calls: initial + critique + revise + advisor.
+        assert len(adapter.calls) == 4
+        # The advisor event WAS emitted.
+        types = [e.type for e in ctx.events]
+        assert "advisor" in types
+        assert "advisor_approve" in types
+        # The skip attribute is NOT set.
+        assert not ctx.__dict__.get("advisor_skipped")
+        # The header is ``0/no``.
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+
+    @pytest.mark.asyncio
+    async def test_skip_at_exactly_threshold_0p85(self):
+        """VAL-PIPE-EXTRA-002: confidence == 0.85 → skip (boundary inclusive)."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.85",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # 0.85 is inclusive: the advisor IS skipped.
+        assert len(adapter.calls) == 2
+        assert ctx.__dict__.get("advisor_skipped") is True
+        assert ctx.__dict__.get("advisor_skip_confidence") == 0.85
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-skipped"] == "1/confidence=0.85"
+
+    @pytest.mark.asyncio
+    async def test_run_at_0p849_just_below_threshold(self):
+        """VAL-PIPE-EXTRA-002: confidence == 0.849 → advisor runs."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.849",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # 0.849 is below the threshold: the advisor ran.
+        assert len(adapter.calls) == 4
+        assert "advisor" in [e.type for e in ctx.events]
+        assert not ctx.__dict__.get("advisor_skipped")
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+
+    @pytest.mark.asyncio
+    async def test_no_skip_when_reflection_disabled(self):
+        """VAL-PIPE-EXTRA-024: reflection.turns=0 → no confidence signal → advisor runs.
+
+        The skip requires a parsed confidence; when reflection is
+        disabled (``turns=0``), the default ``last_confidence`` is
+        0.0 and the orchestrator must NOT skip. The advisor runs
+        as normal.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=0,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The advisor ran.
+        assert len(adapter.calls) == 2
+        assert "advisor" in [e.type for e in ctx.events]
+        # The skip is NOT set; the header is ``0/no``.
+        assert not ctx.__dict__.get("advisor_skipped")
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+
+    @pytest.mark.asyncio
+    async def test_skip_saves_one_llm_round_trip(self):
+        """VAL-PIPE-EXTRA-023: skip case has 2 calls, run case has 4.
+
+        With ``reflection.turns=1, advisor.turns=1`` and
+        ``early_exit=False``:
+
+        * Skip case (confidence >= 0.85, early-exit fires): 2
+          LLM calls (initial + critique). The revision does not
+          run because the loop short-circuits on early-exit; the
+          advisor does not run because of the DELTA 1 skip.
+        * Run case (confidence < 0.85): 4 LLM calls (initial +
+          critique + revise + advisor).
+        """
+        skip_adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.95",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        skip_route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        skip_ctx = _build_context(skip_route)
+        await Orchestrator(skip_adapter).run(skip_ctx)
+        assert len(skip_adapter.calls) == 2
+
+        run_adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        run_route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        run_ctx = _build_context(run_route)
+        await Orchestrator(run_adapter).run(run_ctx)
+        assert len(run_adapter.calls) == 4
+
+    @pytest.mark.asyncio
+    async def test_skip_in_advise_first_order(self):
+        """DELTA 1 skip applies in both orderings (reflect_first, advise_first).
+
+        With ``order=advise_first`` and a high-confidence scripted
+        advisor response, the advisor still runs (the skip
+        requires a parsed confidence from the reflection loop,
+        and the reflection loop runs after the advisor in
+        advise_first order — so the skip cannot fire on the
+        first advisor pass). The skip is the canonical
+        ``reflect_first`` behavior.
+        """
+        # In reflect_first, the skip fires.
+        adapter_rf = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.9",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route_rf = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+            order="reflect_first",
+        )
+        ctx_rf = _build_context(route_rf)
+        await Orchestrator(adapter_rf).run(ctx_rf)
+        assert ctx_rf.__dict__.get("advisor_skipped") is True
+        assert len(adapter_rf.calls) == 2
+
+        # In advise_first, the reflection loop runs after the
+        # advisor and the skip fires too (the parsed confidence
+        # from the post-advisor reflection is what the skip
+        # checks). The advisor runs first; the reflection loop
+        # produces a high-confidence critique; the
+        # self-advise-skip fires before the post-reflection
+        # advisor would re-run. (The orchestrator currently
+        # runs the advisor exactly once per request, so the
+        # post-reflection advisor is a no-op anyway — but the
+        # skip is the DELTA 1 short-circuit, applied to the
+        # would-be advisor pass.)
+        adapter_af = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.9",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route_af = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+            order="advise_first",
+        )
+        ctx_af = _build_context(route_af)
+        await Orchestrator(adapter_af).run(ctx_af)
+        # The advisor ran (advise_first order); the skip is
+        # NOT set (the skip targets the would-be re-run after
+        # the reflection loop, which the orchestrator does not
+        # currently perform).
+        assert ctx_af.__dict__.get("advisor_skipped") is None
+        # But the high-confidence reflection did produce a
+        # reflect_early_exit event, and the last_confidence
+        # attribute carries 0.9 for downstream consumers.
+        assert ctx_af.__dict__.get("last_confidence") == 0.9
+
+    @pytest.mark.asyncio
+    async def test_skip_logs_info_with_confidence(self, caplog):
+        """VAL-PIPE-EXTRA-030: the skip logs an INFO record with the parsed confidence.
+
+        The structured log line includes the confidence and the
+        advisor model name so operators can confirm the skip
+        happened and identify which model was skipped.
+        """
+        import logging
+        caplog.set_level(logging.INFO, logger="moaxy.pipeline.orchestrator")
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.92",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The log contains the skip line.
+        skip_records = [
+            r
+            for r in caplog.records
+            if "advisor skipped" in r.getMessage()
+        ]
+        assert len(skip_records) == 1
+        msg = skip_records[0].getMessage()
+        assert "0.92" in msg or "0.920" in msg
+        assert "deepseek-v4-pro:cloud" in msg
+
+    @pytest.mark.asyncio
+    async def test_skip_header_absent_in_run_case(self):
+        """VAL-PIPE-EXTRA-003: header value is ``0/no`` in the run case."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The header is present in both states (consistent
+        # observability); the run-case value is ``0/no``.
+        assert "x-moaxy-advisor-skipped" in headers
+        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+
+    @pytest.mark.asyncio
+    async def test_no_skip_when_advisor_not_configured(self):
+        """When advisor.turns=0 (advisor disabled), the skip never fires.
+
+        The skip requires ``advisor.turns >= 1`` and
+        ``advisor.model`` set. When the advisor is disabled, the
+        skip is a no-op and the header value is ``0/no``.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.95",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            advisor_model=None,  # advisor disabled
+            advisor_turns=0,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The advisor is disabled; the skip is a no-op.
+        assert not ctx.__dict__.get("advisor_skipped")
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The header is still emitted (``0/no``).
+        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+
+
+class TestSelfAdviseWarning:
+    """When ``advisor.model`` equals the primary resolved model, log a WARNING.
+
+    Self-advise (running the advisor against the same model as
+    the primary) is a legitimate pattern, but worth flagging
+    because the cost is effectively doubled with no model-
+    diversity benefit. The orchestrator logs a WARNING once per
+    request and proceeds (the advisor call still runs).
+    """
+
+    @pytest.mark.asyncio
+    async def test_self_advise_warning_logged(self, caplog):
+        """VAL-PIPE-EXTRA-031: WARNING logged when advisor.model == primary resolved_model."""
+        import logging
+        caplog.set_level(logging.WARNING, logger="moaxy.pipeline.orchestrator")
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        # Both the primary's resolved model and the advisor's
+        # configured model are ``minimax-m3:cloud`` (self-advise).
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="minimax-m3:cloud",
+            advisor_turns=1,
+            original_model="coder-pro",
+            resolved_model="minimax-m3:cloud",
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The WARNING record is present.
+        warning_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "self-advise" in r.getMessage()
+        ]
+        assert len(warning_records) == 1
+        msg = warning_records[0].getMessage()
+        assert "advisor.model == primary resolved_model" in msg
+        assert "fresh prompt context" in msg
+        # The advisor call still ran.
+        assert "advisor" in [e.type for e in ctx.events]
+        assert len(adapter.calls) == 4
+
+    @pytest.mark.asyncio
+    async def test_cross_advise_no_warning(self, caplog):
+        """No WARNING when advisor.model differs from the primary resolved_model."""
+        import logging
+        caplog.set_level(logging.WARNING, logger="moaxy.pipeline.orchestrator")
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        # Cross-advise: primary is ``minimax-m3:cloud``,
+        # advisor is ``deepseek-v4-pro:cloud``.
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+            original_model="coder-pro",
+            resolved_model="minimax-m3:cloud",
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # No self-advise WARNING.
+        warning_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "self-advise" in r.getMessage()
+        ]
+        assert len(warning_records) == 0
+        # The advisor call still ran.
+        assert "advisor" in [e.type for e in ctx.events]
+
+    @pytest.mark.asyncio
+    async def test_self_advise_warning_only_once_per_request(self, caplog):
+        """The WARNING is logged at most once per request, even with a re-runnable stage.
+
+        The orchestrator calls ``_maybe_warn_self_advise`` once in
+        :meth:`_run_advisor` and once in :meth:`_run_advisor_parallel`.
+        For a single request with a single advisor pass, the
+        WARNING appears exactly once. (A request never reaches
+        both call sites; the sequential / parallel branches are
+        mutually exclusive.)
+        """
+        import logging
+        caplog.set_level(logging.WARNING, logger="moaxy.pipeline.orchestrator")
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="minimax-m3:cloud",
+            advisor_turns=1,
+            original_model="coder-pro",
+            resolved_model="minimax-m3:cloud",
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        warning_records = [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "self-advise" in r.getMessage()
+        ]
+        assert len(warning_records) == 1
