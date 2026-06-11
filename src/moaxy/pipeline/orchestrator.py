@@ -1088,13 +1088,32 @@ class Orchestrator:
         # extra fields are ignored by the orchestrator's flow but
         # the runtime attributes are set on the pipeline context
         # later (see the build_response_headers DELTA 6 block).
-        decision, revised_text, _advisor_score, _advisor_issues = (
+        decision, revised_text, advisor_score, _advisor_issues = (
             parse_advisor_response(text)
         )
         plugin_ctx["advisor_decision"] = decision
         plugin_ctx["advisor_text"] = text
         plugin_ctx["advisor_revised_text"] = revised_text
         plugin_ctx["advisor_model"] = response.model or advisor_cfg.model
+        # DELTA 6 (advisor_score event / ctx attribute): when the
+        # parsed ``ADVISOR_SCORE:`` value is present, append an
+        # ``advisor_score`` event to the event log and stamp the
+        # ``advisor_score`` runtime attribute on the context.
+        # :func:`build_response_headers` reads the runtime
+        # attribute to emit the ``x-moaxy-advisor-score`` response
+        # header. The event's ``text`` is the integer score as a
+        # string so log consumers can grep for it. When the
+        # model did not emit an ``ADVISOR_SCORE:`` line the event
+        # is NOT appended and the runtime attribute is left
+        # unset; the header builder falls back to ``"0"`` per
+        # the M5 contract (VAL-PIPE-EXTRA-021).
+        if advisor_score is not None:
+            ctx.__dict__["advisor_score"] = advisor_score
+            ctx.append_event(
+                "advisor_score",
+                model=response.model or advisor_cfg.model,
+                text=str(advisor_score),
+            )
         if self.plugin_manager is not None:
             from moaxy.plugins.types import PluginType
 

@@ -1731,16 +1731,15 @@ class TestStreamingM5ReflectAndAdvisorScoreEvents:
                 headers={"Content-Type": "application/json"},
             )
 
-        # The trailer carries the default ``x-moaxy-advisor-score:
-        # 0`` (the orchestrator has not yet populated
-        # ``ctx.__dict__["advisor_score"]``; the
-        # ``m5-delta-advisor-score-event`` feature is a separate
-        # future feature that will populate this from the parsed
-        # ``ADVISOR_SCORE:`` line).
+        # The trailer carries the parsed ``x-moaxy-advisor-score:
+        # 7`` (the orchestrator stamps
+        # ``ctx.__dict__["advisor_score"]`` from the parsed
+        # ``ADVISOR_SCORE:`` line, per
+        # ``m5-delta-advisor-score-event``).
         events = _parse_sse_events(response.text)
         trailer = json.loads(events[-2][1])
         x_moaxy = trailer["x_moaxy"]
-        assert x_moaxy["x-moaxy-advisor-score"] == "0"
+        assert x_moaxy["x-moaxy-advisor-score"] == "7"
         # The advisor-model header is set (advisor ran).
         assert x_moaxy["x-moaxy-advisor-model"] == "deepseek-v4-pro:cloud"
         # The advisor-skipped header is "0/no" (advisor ran).

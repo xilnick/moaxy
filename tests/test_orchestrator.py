@@ -1685,6 +1685,203 @@ class TestM5DeltaResponseHeaders:
 
 
 # ────────────────────────────────────────────────────────────────────
+# M5 DELTA 6 — advisor_score event / ctx attribute
+# (VAL-PIPE-EXTRA-019, VAL-PIPE-EXTRA-021)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestAdvisorScoreEvent:
+    """The orchestrator wires a parsed ``ADVISOR_SCORE:`` into the event log.
+
+    When the advisor's LLM response contains an ``ADVISOR_SCORE: <int>``
+    line, the orchestrator (M5 DELTA 6) MUST:
+
+    * Append a new event of type ``advisor_score`` to ``ctx.events``
+      whose ``text`` field is the integer score as a string.
+    * Stamp ``ctx.__dict__["advisor_score"]`` to the parsed integer
+      so :func:`build_response_headers` can render the
+      ``x-moaxy-advisor-score`` response header.
+
+    When the advisor's response does NOT contain an
+    ``ADVISOR_SCORE:`` line, no ``advisor_score`` event is appended
+    and the runtime attribute is left unset; the response header
+    falls back to ``"0"`` per the M5 contract.
+    """
+
+    @pytest.mark.asyncio
+    async def test_advisor_score_event_appended_when_score_present(self):
+        """VAL-PIPE-EXTRA-019: ``ADVISOR_SCORE: 8`` → ctx.events has an ``advisor_score`` event."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                # No reflection (turns=0). The advisor call returns
+                # both a decision and a score.
+                _response(
+                    "ADVISOR_DECISION: APPROVE\nADVISOR_SCORE: 8",
+                    model="deepseek-v4-pro:cloud",
+                    prompt_tokens=4,
+                    completion_tokens=4,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=0,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The ``advisor_score`` event is appended with text="8".
+        score_events = [
+            e for e in ctx.events if e.type == "advisor_score"
+        ]
+        assert len(score_events) == 1
+        assert score_events[0].text == "8"
+        # The runtime attribute is stamped.
+        assert ctx.__dict__.get("advisor_score") == 8
+        # The response header carries the parsed score.
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-score"] == "8"
+
+    @pytest.mark.asyncio
+    async def test_no_advisor_score_event_when_score_absent(self):
+        """No ``advisor_score`` event when ``ADVISOR_SCORE:`` is missing; header is ``"0"``."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                # Legacy ADVISOR_APPROVE only — no ADVISOR_SCORE: line.
+                _response(
+                    "ADVISOR_APPROVE",
+                    model="deepseek-v4-pro:cloud",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=0,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # No ``advisor_score`` event was appended.
+        score_events = [
+            e for e in ctx.events if e.type == "advisor_score"
+        ]
+        assert score_events == []
+        # The runtime attribute is NOT set.
+        assert "advisor_score" not in ctx.__dict__
+        # The header falls back to ``"0"``.
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-score"] == "0"
+
+    @pytest.mark.asyncio
+    async def test_advisor_score_event_with_reflection_and_revise(self):
+        """The ``advisor_score`` event fires after reflection in a full pipeline.
+
+        When the advisor emits ``ADVISOR_DECISION: REVISE`` alongside
+        ``ADVISOR_SCORE: 7`` (cross-critique format), the event is
+        appended exactly once and the runtime attribute reflects the
+        parsed score. The downstream ``advisor_revised`` /
+        ``advisor_revision`` events still emit (the score event is
+        additive).
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                # Advisor: REVISE with score and issues.
+                _response(
+                    "ADVISOR_DECISION: REVISE\n"
+                    "ADVISOR_SCORE: 7\n"
+                    "ADVISOR_REVISE: better",
+                    model="deepseek-v4-pro:cloud",
+                    prompt_tokens=4,
+                    completion_tokens=4,
+                ),
+                # Primary-model revision after advisor REVISE.
+                _response(
+                    "primary-final",
+                    prompt_tokens=4,
+                    completion_tokens=4,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # Exactly one ``advisor_score`` event.
+        score_events = [
+            e for e in ctx.events if e.type == "advisor_score"
+        ]
+        assert len(score_events) == 1
+        assert score_events[0].text == "7"
+        assert ctx.__dict__.get("advisor_score") == 7
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-score"] == "7"
+        # The downstream advisor_revised / advisor_revision events
+        # still emit (the score event is additive).
+        types = [e.type for e in ctx.events]
+        assert "advisor_revised" in types
+        assert "advisor_revision" in types
+
+    @pytest.mark.asyncio
+    async def test_advisor_score_event_after_legacy_advisor_revise(self):
+        """Legacy ``ADVISOR_REVISE:`` (no ADVISOR_DECISION) → no score event.
+
+        When the model emits the legacy ``ADVISOR_REVISE:`` marker
+        without a corresponding ``ADVISOR_SCORE:`` line, the parser
+        returns ``score=None`` and the orchestrator must NOT append
+        an ``advisor_score`` event. The runtime attribute is unset
+        and the header falls back to ``"0"``.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "ADVISOR_REVISE: legacy-revised",
+                    model="deepseek-v4-pro:cloud",
+                    prompt_tokens=4,
+                    completion_tokens=4,
+                ),
+                _response(
+                    "primary-final",
+                    prompt_tokens=4,
+                    completion_tokens=4,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=0,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # No ``advisor_score`` event.
+        score_events = [
+            e for e in ctx.events if e.type == "advisor_score"
+        ]
+        assert score_events == []
+        # Runtime attribute unset; header is ``"0"``.
+        assert "advisor_score" not in ctx.__dict__
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-score"] == "0"
+
+
+# ────────────────────────────────────────────────────────────────────
 # Self-advise and cross-advise
 # ────────────────────────────────────────────────────────────────────
 
