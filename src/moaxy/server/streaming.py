@@ -235,6 +235,124 @@ def build_revision_payload(
     return payload
 
 
+def build_trailer_payload(
+    headers: dict[str, str],
+    *,
+    chunk_id: str = "chatcmpl-stream",
+    created: int | None = None,
+) -> dict[str, Any]:
+    """Build the trailing-SSE-trailer payload from a header dict.
+
+    The M5 trailing SSE trailer carries the ``x-moaxy-*`` response
+    headers as a sidecar ``x_moaxy`` field on a
+    ``chat.completion.chunk``-shaped event. The chunk shape is
+    preserved (empty delta, ``finish_reason: "stop"``) so the
+    trailer is structurally indistinguishable from the final-
+    initial chunk from a vanilla OpenAI client's perspective;
+    the sidecar ``x_moaxy`` key identifies it as a moaxy trailer
+    and carries the M5 ``x-moaxy-*`` headers (which the
+    validation contract pins for the streaming path).
+
+    The chat.completion.chunk shape is chosen specifically to
+    satisfy the M4 streaming contract's
+    "all data events have a choices[0].delta.content key"
+    invariant: the trailer's delta always carries a ``content``
+    key (the empty string), so existing M4 streaming clients
+    that walk the events see a well-formed chunk in the trailer
+    position. The sidecar ``x_moaxy`` field is additive — vanilla
+    OpenAI clients ignore it (the chunk parser doesn't read
+    unknown top-level fields), and moaxy clients can read it
+    after the last ``data:`` event.
+
+    The HTTP response envelope still carries the same headers
+    (the proxy server sets them on the
+    :class:`StreamingResponse`); the SSE trailer is an additive
+    channel so streaming clients (which may not have direct
+    access to the response headers in some SSE libraries) can
+    read them after the last ``data:`` event.
+
+    Args:
+        headers: The header dict from
+            :func:`moaxy.pipeline.orchestrator.build_response_headers`.
+            Keys are the full header names (``x-moaxy-*``);
+            values are the stringified header values.
+        chunk_id: The id shared with the initial chunks of this
+            completion; useful for client-side correlation.
+        created: The unix-seconds timestamp for the trailer.
+            ``None`` means "use the current time".
+
+    Returns:
+        A ``chat.completion.chunk``-shaped dict with a
+        ``x_moaxy`` sidecar field carrying the M5 headers,
+        ready to be serialised by :func:`format_sse_data`.
+    """
+    chunk = build_chat_completion_chunk(
+        model="",
+        delta={"content": ""},
+        finish_reason="stop",
+        chunk_id=chunk_id,
+        created=created,
+    )
+    chunk["x_moaxy"] = dict(headers)
+    return chunk
+
+
+def format_sse_trailer(
+    headers: dict[str, str],
+    *,
+    chunk_id: str = "chatcmpl-stream",
+    created: int | None = None,
+) -> bytes:
+    """Encode the trailing-SSE-trailer event carrying the response headers.
+
+    The trailing SSE trailer is the M5 streaming-path channel for
+    the ``x-moaxy-*`` observability surface. Buffered
+    (``stream: false``) clients see the headers on the HTTP
+    response envelope (the proxy server passes them via
+    :class:`StreamingResponse(headers=...)`); streaming
+    (``stream: true``) clients additionally receive this event
+    right before the ``data: [DONE]`` terminator.
+
+    The wire format is ``b"data: {<json>}\\n\\n"`` — a vanilla
+    ``data:`` event whose JSON payload is a
+    ``chat.completion.chunk``-shaped dict with a sidecar
+    ``x_moaxy`` field carrying the M5 headers. The chunk shape
+    is preserved (empty delta, ``finish_reason: "stop"``) so the
+    trailer is structurally indistinguishable from the final-
+    initial chunk from a vanilla OpenAI client's perspective;
+    the sidecar ``x_moaxy`` key identifies it as a moaxy trailer.
+
+    Vanilla OpenAI clients that walk ``events[:-1]`` and assert
+    on ``decoded["choices"][0]["delta"].get("content")`` still
+    see a well-formed chunk in the trailer position (the
+    assertion holds because the chunk's delta carries a
+    ``content`` key, even though its value is the empty string).
+    moaxy clients can read ``decoded["x_moaxy"]`` after the last
+    data event to get the same observability that buffered
+    clients see in the HTTP response envelope.
+
+    Args:
+        headers: The header dict to encode. Keys are the full
+            header names (``x-moaxy-*``); values are the
+            stringified header values. The dict is serialised
+            as JSON; empty values are preserved (e.g. the
+            ``x-moaxy-reflect-score: 0`` case when no score was
+            parsed).
+        chunk_id: The id shared with the initial chunks of this
+            completion; useful for client-side correlation.
+        created: The unix-seconds timestamp for the trailer.
+            ``None`` means "use the current time".
+
+    Returns:
+        The bytes ``b"data: {<json>}\\n\\n"`` ready to be
+        written to the streaming response.
+    """
+    payload = build_trailer_payload(
+        headers, chunk_id=chunk_id, created=created
+    )
+    return format_sse_data(payload)
+
+
 __all__ = [
     "SSE_DONE_EVENT",
     "SSE_DONE_PAYLOAD",
@@ -244,7 +362,9 @@ __all__ = [
     "SSE_TERMINATOR_BYTES",
     "build_chat_completion_chunk",
     "build_revision_payload",
+    "build_trailer_payload",
     "format_sse_data",
     "format_sse_done",
     "format_sse_event",
+    "format_sse_trailer",
 ]

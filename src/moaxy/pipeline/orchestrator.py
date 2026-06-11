@@ -1752,7 +1752,28 @@ class Orchestrator:
                reflection revision (one per executed turn).
             4. ``event: revision\\ndata: {advisor-revised-text}\\n\\n``
                for the optional advisor revision.
-            5. ``data: [DONE]\\n\\n`` as the final terminator.
+            5. ``data: {chunk-with-x_moaxy-sidecar}\\n\\n`` — the
+               M5 trailing SSE trailer. The payload is a
+               ``chat.completion.chunk``-shaped event (empty
+               delta, ``finish_reason: "stop"``) with a sidecar
+               ``x_moaxy`` field carrying the ``x-moaxy-*``
+               response headers from
+               :func:`build_response_headers` (e.g.
+               ``{"x_moaxy": {"x-moaxy-reflect-score": "8", "x-moaxy-advisor-score": "7"}}``).
+               The trailer is the streaming-path equivalent of the
+               HTTP response envelope's ``x-moaxy-*`` headers and
+               is emitted on every ``stream: true`` response,
+               regardless of whether reflection or advisor ran.
+               The chat.completion.chunk shape preserves the M4
+               streaming contract's
+               "every data event has choices[0].delta.content"
+               invariant (the empty string is a valid
+               ``content`` value), so vanilla OpenAI clients
+               ignore it while moaxy clients read
+               ``decoded["x_moaxy"]`` to get the same
+               observability that buffered clients see in the
+               HTTP response envelope.
+            6. ``data: [DONE]\\n\\n`` as the final terminator.
 
         Raises:
             UpstreamError: A permanent (4xx) failure from the
@@ -1778,6 +1799,7 @@ class Orchestrator:
             format_sse_data,
             format_sse_done,
             format_sse_event,
+            format_sse_trailer,
         )
 
         if ctx.route is None:
@@ -2045,6 +2067,32 @@ class Orchestrator:
 
         ctx.__dict__["fallbacks_used"] = fallbacks_used
         ctx.__dict__["streamed"] = True
+
+        # DELTA 6 (streaming): emit the trailing SSE trailer event
+        # carrying the ``x-moaxy-*`` response headers as a sidecar
+        # ``x_moaxy`` field on a ``chat.completion.chunk``-shaped
+        # ``data:`` event. The proxy server already sets the same
+        # headers on the HTTP response envelope (so buffered
+        # ``stream: false`` clients see them as HTTP headers);
+        # the trailing trailer is the streaming-path channel so
+        # ``stream: true`` clients observe the same
+        # ``x-moaxy-reflect-score`` / ``x-moaxy-advisor-score`` /
+        # ``x-moaxy-advisor-skipped`` observability that the
+        # validation contract pins. The chat.completion.chunk
+        # shape is preserved (empty delta, ``finish_reason:
+        # "stop"``) so vanilla OpenAI clients ignore the trailer
+        # while moaxy clients can read ``decoded["x_moaxy"]`` to
+        # get the same observability. The header dict is built
+        # via the same :func:`build_response_headers` helper the
+        # buffered path uses, so the trailer mirrors the HTTP
+        # envelope verbatim (the ``request_id`` argument is the
+        # same opaque UUID the proxy's request-id middleware
+        # generated; we read it from the context to keep the
+        # helper pure).
+        trailer_headers = build_response_headers(
+            ctx, request_id=ctx.request_id
+        )
+        yield format_sse_trailer(trailer_headers)
 
         # Stage 4: end of stream marker.
         yield format_sse_done()
