@@ -43,6 +43,20 @@ backends:
   #   api_key: "${OPENAI_API_KEY}"
   #   timeout: 30.0
 
+  # OpenRouter is a multi-provider LLM gateway (300+ models behind a
+  # single OpenAI-compatible API). Set ``OPENROUTER_API_KEY`` in your
+  # environment (or in a local ``.env`` file that is in .gitignore) and
+  # the route below can talk to any of the OpenRouter model ids.
+  - name: "openrouter-prod"
+    adapter: "openrouter"
+    base_url: "https://openrouter.ai/api/v1"
+    api_key: "${OPENROUTER_API_KEY}"
+    timeout: 60.0
+    http_referer: "https://moaxy.example.com"
+    x_title: "moaxy"
+    transforms:
+      - "middle-out"
+
 # ── Routes ──────────────────────────────────────────────────
 # First-match-wins. ``model`` and ``path`` use fnmatch globs.
 # ``aliases`` is a per-route alias table: clients send the alias,
@@ -78,6 +92,23 @@ routes:
       path: "/v1/chat/completions"
     strategy: "single"
     backend: "ollama-local"
+
+  # OpenRouter route. The client sends ``my-coder`` (an alias); moaxy
+  # rewrites it to ``anthropic/claude-3-haiku`` for the OpenRouter
+  # backend. If the primary model fails, moaxy walks the ``fallbacks``
+  # list and tries ``openai/gpt-4o-mini`` next. ``OPENROUTER_API_KEY``
+  # must be set in the environment for this route to work.
+  - name: "openrouter-coder"
+    match:
+      model: "my-coder"
+      path: "/v1/chat/completions"
+    strategy: "single"
+    backend: "openrouter-prod"
+    aliases:
+      "my-coder": "anthropic/claude-3-haiku"
+    fallbacks:
+      - "openai/gpt-4o-mini"
+    retry: 1
 
 # ── Per-model defaults (used when a route doesn't override) ──
 # models:

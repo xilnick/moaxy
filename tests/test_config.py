@@ -2250,3 +2250,118 @@ plugins:
         cfg = load_config(path=path)
         assert cfg.plugins.plugins_dir == "plugins"
         assert cfg.plugins.plugin_config == {}
+
+
+# ── M6 OpenRouter example in config.example.yaml ────────────────────────
+
+
+class TestConfigExampleOpenRouter:
+    """The M6 ``config.example.yaml`` advertises an OpenRouter backend
+    and a route that uses it. The example must:
+
+    * contain a backend with ``adapter: 'openrouter'`` and the canonical
+      ``base_url: 'https://openrouter.ai/api/v1'``,
+    * contain a route that references the openrouter backend,
+    * use ``anthropic/claude-3-haiku`` as the primary model with at
+      least one fallback,
+    * define the alias ``my-coder`` -> ``anthropic/claude-3-haiku``, and
+    * load cleanly through ``MoaxyConfig.model_validate``.
+
+    The file is loaded as raw YAML via ``yaml.safe_load`` (no
+    ``${ENV_VAR}`` substitution), so the canonical
+    ``${OPENROUTER_API_KEY}`` token is preserved in the parsed payload.
+    """
+
+    EXAMPLE_PATH = (
+        Path(__file__).resolve().parent.parent / "config.example.yaml"
+    )
+
+    def _load_example_payload(self) -> dict:
+        assert self.EXAMPLE_PATH.is_file(), (
+            f"config.example.yaml not found at {self.EXAMPLE_PATH}; "
+            "the M6 example must live at the repo root"
+        )
+        with self.EXAMPLE_PATH.open("r", encoding="utf-8") as fh:
+            return yaml.safe_load(fh)
+
+    def test_example_yaml_exists(self):
+        assert self.EXAMPLE_PATH.is_file()
+
+    def test_openrouter_backend_present_in_raw_yaml(self):
+        payload = self._load_example_payload()
+        backends = payload.get("backends") or []
+        or_backends = [b for b in backends if b.get("adapter") == "openrouter"]
+        assert or_backends, (
+            "config.example.yaml must contain at least one backend with "
+            "adapter: 'openrouter' (the M6 canonical example)"
+        )
+        or_backend = or_backends[0]
+        assert or_backend["base_url"] == "https://openrouter.ai/api/v1"
+        # Optional M6 fields may be present and must use the canonical
+        # http_referer / x_title / transforms fields when set.
+        if or_backend.get("http_referer") is not None:
+            assert isinstance(or_backend["http_referer"], str)
+            assert or_backend["http_referer"].startswith(("http://", "https://"))
+        if or_backend.get("x_title") is not None:
+            assert isinstance(or_backend["x_title"], str)
+            assert or_backend["x_title"].strip() != ""
+        if or_backend.get("transforms") is not None:
+            assert isinstance(or_backend["transforms"], list)
+            assert len(or_backend["transforms"]) > 0
+            assert all(isinstance(t, str) and t.strip() for t in or_backend["transforms"])
+
+    def test_openrouter_route_present_in_raw_yaml(self):
+        payload = self._load_example_payload()
+        backends = payload.get("backends") or []
+        or_backend_names = {
+            b["name"] for b in backends if b.get("adapter") == "openrouter"
+        }
+        assert or_backend_names, "no openrouter backend declared"
+        routes = payload.get("routes") or []
+        or_routes = [r for r in routes if r.get("backend") in or_backend_names]
+        assert or_routes, (
+            "config.example.yaml must contain at least one route that "
+            "references the openrouter backend"
+        )
+        or_route = or_routes[0]
+        # Aliases must include the canonical my-coder → anthropic/claude-3-haiku
+        aliases = or_route.get("aliases") or {}
+        assert "my-coder" in aliases, (
+            f"openrouter route must define alias 'my-coder'; got aliases={aliases}"
+        )
+        assert aliases["my-coder"] == "anthropic/claude-3-haiku"
+        # Primary (alias target) and at least one fallback.
+        assert or_route["fallbacks"], (
+            "openrouter route must declare at least one fallback model"
+        )
+
+    def test_example_parses_with_moaxy_config(self):
+        payload = self._load_example_payload()
+        cfg = MoaxyConfig.model_validate(payload)
+        assert isinstance(cfg, MoaxyConfig)
+        or_backends = [b for b in cfg.backends if b.adapter == "openrouter"]
+        assert or_backends
+        or_backend = or_backends[0]
+        assert or_backend.base_url == "https://openrouter.ai/api/v1"
+        # M6 adapter fields survive the Pydantic v2 round-trip.
+        assert or_backend.http_referer is None or isinstance(
+            or_backend.http_referer, str
+        )
+        assert or_backend.x_title is None or isinstance(or_backend.x_title, str)
+        assert or_backend.transforms is None or (
+            isinstance(or_backend.transforms, list)
+            and all(isinstance(t, str) for t in or_backend.transforms)
+        )
+        # A route must reference the openrouter backend.
+        or_backend_names = {b.name for b in or_backends}
+        or_routes = [r for r in cfg.routes if r.backend in or_backend_names]
+        assert or_routes
+        or_route = or_routes[0]
+        assert or_route.aliases.get("my-coder") == "anthropic/claude-3-haiku"
+        # At least one fallback (the spec requires "with at least one fallback").
+        assert len(or_route.fallbacks) >= 1
+        # The fallback target is openai/gpt-4o-mini per the M6 spec.
+        assert "openai/gpt-4o-mini" in or_route.fallbacks
+        # The primary alias target must be anthropic/claude-3-haiku.
+        assert or_route.aliases["my-coder"] == "anthropic/claude-3-haiku"
+
