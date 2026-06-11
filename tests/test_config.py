@@ -245,6 +245,9 @@ class TestReflectionConfig:
         assert r.parallel is False
         assert r.system_prompt is None
         assert r.system_prompt_file is None
+        assert r.order == "reflect_first"
+        assert r.trust_verbal == 0.6
+        assert r.trust_score == 0.4
 
     @pytest.mark.parametrize("turns", [0, 1, 2, 3])
     def test_accepts_in_range_turns(self, turns):
@@ -284,6 +287,205 @@ class TestReflectionConfig:
     def test_accepts_either_system_prompt(self):
         ReflectionConfig(system_prompt="hello")
         ReflectionConfig(system_prompt_file="./p.txt")
+
+
+# ── ReflectionConfig M5 delta fields ──────────────────────────────────────
+
+
+class TestReflectionConfigM5DeltaFields:
+    """M5 delta 1: order, trust_verbal, trust_score on ReflectionConfig.
+
+    These fields are backward-compatible: their defaults preserve the
+    v1-v4 behavior. The defaults come from the M5 alignment document
+    (order='reflect_first', trust_verbal=0.6, trust_score=0.4). See
+    `m5-delta-config-fields` in features.json and the
+    `m5-delta-pydantic-config-fields` section of architecture.md.
+    """
+
+    def test_default_order_is_reflect_first(self):
+        # VAL-PIPE-EXTRA-027 invariant: default preserves v1 ordering.
+        r = ReflectionConfig()
+        assert r.order == "reflect_first"
+
+    def test_default_trust_verbal_is_zero_point_six(self):
+        # alignment document default for the verbal-confidence weight.
+        r = ReflectionConfig()
+        assert r.trust_verbal == 0.6
+
+    def test_default_trust_score_is_zero_point_four(self):
+        # alignment document default for the score-weight in the
+        # weighted early-exit signal.
+        r = ReflectionConfig()
+        assert r.trust_score == 0.4
+
+    def test_explicit_order_reflect_first_parses(self):
+        r = ReflectionConfig(order="reflect_first")
+        assert r.order == "reflect_first"
+
+    def test_explicit_order_advise_first_parses(self):
+        r = ReflectionConfig(order="advise_first")
+        assert r.order == "advise_first"
+
+    @pytest.mark.parametrize(
+        "bad_value",
+        [
+            "reflect-first",  # hyphens not allowed
+            "advise",  # missing suffix
+            "REJECT",
+            "first",
+            "advise_first ",  # trailing whitespace
+            " reflect_first",  # leading whitespace
+        ],
+    )
+    def test_rejects_invalid_order_literal(self, bad_value):
+        with pytest.raises(ValidationError) as exc:
+            ReflectionConfig(order=bad_value)
+        assert "order" in str(exc.value)
+
+    def test_rejects_non_string_order(self):
+        with pytest.raises(ValidationError) as exc:
+            ReflectionConfig(order=42)  # type: ignore[arg-type]
+        assert "order" in str(exc.value)
+
+    def test_rejects_none_order(self):
+        with pytest.raises(ValidationError) as exc:
+            ReflectionConfig(order=None)  # type: ignore[arg-type]
+        assert "order" in str(exc.value)
+
+    def test_explicit_trust_verbal_parses(self):
+        r = ReflectionConfig(trust_verbal=0.5)
+        assert r.trust_verbal == 0.5
+
+    def test_explicit_trust_score_parses(self):
+        r = ReflectionConfig(trust_score=0.0)
+        assert r.trust_score == 0.0
+
+    @pytest.mark.parametrize("value", [0.0, 0.3, 0.6, 0.4, 1.0, 2.5, 100.0])
+    def test_accepts_non_negative_trust_verbal(self, value):
+        # No upper bound per the alignment document; weights can be
+        # arbitrarily large when the other weight is zero.
+        r = ReflectionConfig(trust_verbal=value)
+        assert r.trust_verbal == value
+
+    @pytest.mark.parametrize("value", [0.0, 0.3, 0.6, 0.4, 1.0, 2.5, 100.0])
+    def test_accepts_non_negative_trust_score(self, value):
+        r = ReflectionConfig(trust_score=value)
+        assert r.trust_score == value
+
+    def test_rejects_negative_trust_verbal(self):
+        with pytest.raises(ValidationError) as exc:
+            ReflectionConfig(trust_verbal=-0.1)
+        assert "trust_verbal" in str(exc.value)
+
+    def test_rejects_negative_trust_score(self):
+        with pytest.raises(ValidationError) as exc:
+            ReflectionConfig(trust_score=-0.01)
+        assert "trust_score" in str(exc.value)
+
+    def test_rejects_very_negative_trust_verbal(self):
+        with pytest.raises(ValidationError):
+            ReflectionConfig(trust_verbal=-100.0)
+
+    def test_rejects_very_negative_trust_score(self):
+        with pytest.raises(ValidationError):
+            ReflectionConfig(trust_score=-50.5)
+
+    def test_rejects_non_numeric_trust_verbal(self):
+        with pytest.raises(ValidationError):
+            ReflectionConfig(trust_verbal="high")  # type: ignore[arg-type]
+
+    def test_rejects_non_numeric_trust_score(self):
+        with pytest.raises(ValidationError):
+            ReflectionConfig(trust_score="low")  # type: ignore[arg-type]
+
+    def test_all_three_fields_round_trip(self):
+        # Combined: order, trust_verbal, and trust_score all set at once.
+        r = ReflectionConfig(
+            order="advise_first",
+            trust_verbal=0.25,
+            trust_score=0.75,
+        )
+        assert r.order == "advise_first"
+        assert r.trust_verbal == 0.25
+        assert r.trust_score == 0.75
+
+    def test_yaml_load_with_new_fields(self, tmp_path, monkeypatch):
+        # End-to-end: a YAML config carrying the new fields parses into
+        # a typed ReflectionConfig.
+        monkeypatch.delenv("MOAXY_CONFIG_PATH", raising=False)
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            """
+backends:
+  - name: b
+    adapter: ollama
+    base_url: http://127.0.0.1:11434
+routes:
+  - name: r
+    match: {model: "*", path: "/v1/chat/completions"}
+    reflection:
+      turns: 1
+      order: advise_first
+      trust_verbal: 0.7
+      trust_score: 0.3
+""",
+            encoding="utf-8",
+        )
+        from moaxy.config import load_config
+
+        cfg = load_config(path=path)
+        refl = cfg.routes[0].reflection
+        assert refl.order == "advise_first"
+        assert refl.trust_verbal == 0.7
+        assert refl.trust_score == 0.3
+
+    def test_yaml_load_with_invalid_order_raises(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("MOAXY_CONFIG_PATH", raising=False)
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            """
+backends:
+  - name: b
+    adapter: ollama
+    base_url: http://127.0.0.1:11434
+routes:
+  - name: r
+    match: {model: "*", path: "/v1/chat/completions"}
+    reflection:
+      turns: 1
+      order: reflect-first
+""",
+            encoding="utf-8",
+        )
+        from moaxy.config import load_config
+
+        with pytest.raises(ValidationError) as exc:
+            load_config(path=path)
+        assert "order" in str(exc.value)
+
+    def test_yaml_load_with_negative_trust_score_raises(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("MOAXY_CONFIG_PATH", raising=False)
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            """
+backends:
+  - name: b
+    adapter: ollama
+    base_url: http://127.0.0.1:11434
+routes:
+  - name: r
+    match: {model: "*", path: "/v1/chat/completions"}
+    reflection:
+      turns: 1
+      trust_score: -0.1
+""",
+            encoding="utf-8",
+        )
+        from moaxy.config import load_config
+
+        with pytest.raises(ValidationError) as exc:
+            load_config(path=path)
+        assert "trust_score" in str(exc.value)
 
 
 # ── AdvisorConfig ─────────────────────────────────────────────────────────

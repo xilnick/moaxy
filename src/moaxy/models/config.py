@@ -112,6 +112,9 @@ class ReflectionConfig(BaseModel):
     parallel: bool = False
     system_prompt: str | None = None
     system_prompt_file: str | None = None
+    order: Literal["reflect_first", "advise_first"] = "reflect_first"
+    trust_verbal: float = Field(0.6, ge=0.0)
+    trust_score: float = Field(0.4, ge=0.0)
 
     @model_validator(mode="after")
     def _system_prompt_xor(self) -> ReflectionConfig:
