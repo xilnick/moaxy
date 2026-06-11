@@ -19,6 +19,8 @@ from collections.abc import Callable, Iterable
 
 from moaxy.adapters.base import Adapter
 from moaxy.adapters.ollama import OllamaAdapter
+from moaxy.adapters.openrouter import DEFAULT_BASE_URL as OPENROUTER_DEFAULT_BASE_URL
+from moaxy.adapters.openrouter import OpenRouterAdapter
 from moaxy.models.config import AdapterConfig
 
 logger = logging.getLogger(__name__)
@@ -54,6 +56,25 @@ def _build_ollama(config: AdapterConfig) -> Adapter:
     )
 
 
+def _build_openrouter(config: AdapterConfig) -> Adapter:
+    # ``base_url`` falls back to OpenRouter's canonical default when the
+    # config did not set one (i.e. the field is the empty string or
+    # whitespace). The ``OpenRouterAdapter`` itself applies the same
+    # default, but doing it here keeps the contract explicit at the
+    # registry boundary and makes the resolved ``base_url`` observable
+    # via the config object passed to the factory.
+    base_url = config.base_url.strip() if config.base_url else ""
+    if not base_url:
+        base_url = OPENROUTER_DEFAULT_BASE_URL
+    return OpenRouterAdapter(
+        base_url=base_url,
+        timeout=config.timeout,
+        http_referer=config.http_referer,
+        x_title=config.x_title,
+        transforms=config.transforms,
+    )
+
+
 # Mapping of config-level adapter kind → factory callable.
 # The OpenAI-compatible adapter is not implemented in M1, so the entry
 # exists for forward compatibility but raises NotImplementedError when
@@ -68,6 +89,7 @@ def _build_openai(config: AdapterConfig) -> Adapter:
 _ADAPTER_FACTORIES: dict[str, Callable[[AdapterConfig], Adapter]] = {
     "ollama": _build_ollama,
     "openai": _build_openai,
+    "openrouter": _build_openrouter,
 }
 
 

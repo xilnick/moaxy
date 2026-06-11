@@ -20,6 +20,13 @@ import pytest
 
 from moaxy.adapters.base import Adapter
 from moaxy.adapters.ollama import OllamaAdapter
+from moaxy.adapters.openrouter import (
+    API_KEY_ENV_VAR,
+    OpenRouterAdapter,
+)
+from moaxy.adapters.openrouter import (
+    DEFAULT_BASE_URL as OPENROUTER_DEFAULT_BASE_URL,
+)
 from moaxy.adapters.registry import AdapterRegistry, build_registry
 from moaxy.models.config import AdapterConfig, MoaxyConfig
 
@@ -41,6 +48,28 @@ def _make_ollama_config(
         base_url=base_url,
         api_key=api_key,
         timeout=timeout,
+    )
+
+
+def _make_openrouter_config(
+    *,
+    name: str = "openrouter",
+    base_url: str = "https://openrouter.ai/api/v1",
+    api_key: str | None = None,
+    timeout: float = 30.0,
+    http_referer: str | None = None,
+    x_title: str | None = None,
+    transforms: list[str] | None = None,
+) -> AdapterConfig:
+    return AdapterConfig(
+        name=name,
+        adapter="openrouter",
+        base_url=base_url,
+        api_key=api_key,
+        timeout=timeout,
+        http_referer=http_referer,
+        x_title=x_title,
+        transforms=transforms,
     )
 
 
@@ -328,3 +357,261 @@ class TestRegistryIsolation:
         assert "only-in-r1" not in r2.adapters
         assert "only-in-r2" in r2.adapters
         assert "only-in-r2" not in r1.adapters
+
+
+# ────────────────────────────────────────────────────────────────────
+# OpenRouter dispatch (M6)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestRegistryDispatchesOpenRouter:
+    """The registry instantiates an :class:`OpenRouterAdapter` for adapter='openrouter'."""
+
+    def test_openrouter_keyword_resolves_to_openrouter_adapter(self, monkeypatch):
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        config = _make_openrouter_config(name="or")
+        registry = AdapterRegistry.build([config])
+        adapter = registry.get("or")
+        assert adapter is not None
+        assert isinstance(adapter, OpenRouterAdapter)
+        assert isinstance(adapter, Adapter)
+        # Class-level name is "openrouter".
+        assert OpenRouterAdapter.name == "openrouter"
+
+    def test_openrouter_adapter_uses_configured_base_url(self, monkeypatch):
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        custom = "https://proxy.example.com/openrouter/v1"
+        config = _make_openrouter_config(name="or", base_url=custom)
+        registry = AdapterRegistry.build([config])
+        adapter = registry.get("or")
+        assert adapter is not None
+        # Trailing-slash stripping is the adapter's responsibility; the
+        # config-provided value is forwarded verbatim (the registry must
+        # not transform the URL beyond falling back to the default when
+        # the field is unset).
+        assert adapter.base_url == custom
+
+    def test_openrouter_adapter_default_base_url_applied_when_unset(
+        self, monkeypatch
+    ):
+        # ``AdapterConfig.base_url`` is required (Field min_length=1), so
+        # the only way to test the "default base_url" registry branch
+        # is to bypass Pydantic validation with ``model_construct`` and
+        # pass an empty ``base_url``. The registry must then fall back
+        # to ``OpenRouterAdapter.DEFAULT_BASE_URL``.
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        config = AdapterConfig.model_construct(
+            name="or-default",
+            adapter="openrouter",  # type: ignore[arg-type]
+            base_url="",
+            api_key=None,
+            timeout=30.0,
+            http_referer=None,
+            x_title=None,
+            transforms=None,
+        )
+        registry = AdapterRegistry.build([config])
+        adapter = registry.get("or-default")
+        assert adapter is not None
+        assert isinstance(adapter, OpenRouterAdapter)
+        assert adapter.base_url == OPENROUTER_DEFAULT_BASE_URL
+        assert adapter.base_url == "https://openrouter.ai/api/v1"
+
+    def test_openrouter_default_base_url_also_applied_for_whitespace(self, monkeypatch):
+        # Whitespace-only base_url is treated the same as an unset value.
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        config = AdapterConfig.model_construct(
+            name="or-ws",
+            adapter="openrouter",  # type: ignore[arg-type]
+            base_url="   ",
+            api_key=None,
+            timeout=30.0,
+            http_referer=None,
+            x_title=None,
+            transforms=None,
+        )
+        registry = AdapterRegistry.build([config])
+        adapter = registry.get("or-ws")
+        assert adapter is not None
+        assert adapter.base_url == OPENROUTER_DEFAULT_BASE_URL
+
+    def test_openrouter_adapter_forwards_timeout(self, monkeypatch):
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        config = _make_openrouter_config(name="or", timeout=22.5)
+        registry = AdapterRegistry.build([config])
+        adapter = registry.get("or")
+        assert adapter is not None
+        assert adapter.timeout == 22.5
+
+    def test_openrouter_adapter_default_timeout(self, monkeypatch):
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        # When ``timeout`` is omitted on the config, the config's own
+        # default (30.0) is applied. The registry must NOT override it
+        # with a different value.
+        config = AdapterConfig(name="or", adapter="openrouter", base_url="https://openrouter.ai/api/v1")
+        registry = AdapterRegistry.build([config])
+        adapter = registry.get("or")
+        assert adapter is not None
+        assert adapter.timeout == 30.0
+
+    def test_openrouter_adapter_forwards_http_referer(self, monkeypatch):
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        config = _make_openrouter_config(
+            name="or", http_referer="https://my.app.example.com"
+        )
+        registry = AdapterRegistry.build([config])
+        adapter = registry.get("or")
+        assert adapter is not None
+        assert adapter.http_referer == "https://my.app.example.com"
+
+    def test_openrouter_adapter_forwards_x_title(self, monkeypatch):
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        config = _make_openrouter_config(name="or", x_title="My App")
+        registry = AdapterRegistry.build([config])
+        adapter = registry.get("or")
+        assert adapter is not None
+        assert adapter.x_title == "My App"
+
+    def test_openrouter_adapter_forwards_transforms(self, monkeypatch):
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        config = _make_openrouter_config(
+            name="or", transforms=["middle-out", "filter-top-p"]
+        )
+        registry = AdapterRegistry.build([config])
+        adapter = registry.get("or")
+        assert adapter is not None
+        assert adapter.transforms == ["middle-out", "filter-top-p"]
+
+    def test_openrouter_adapter_omits_unset_optional_fields(self, monkeypatch):
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        config = _make_openrouter_config(name="or")
+        registry = AdapterRegistry.build([config])
+        adapter = registry.get("or")
+        assert adapter is not None
+        assert adapter.http_referer is None
+        assert adapter.x_title is None
+        assert adapter.transforms is None
+
+    def test_openrouter_dispatch_does_not_set_api_key_on_adapter(self, monkeypatch):
+        # The OpenRouterAdapter reads its key from the OPENROUTER_API_KEY
+        # env var; the ``AdapterConfig.api_key`` field is intentionally
+        # NOT forwarded (the env var is the canonical source for
+        # OpenRouter). The factory must NOT pass ``api_key`` through.
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        config = _make_openrouter_config(
+            name="or", api_key="should-not-be-forwarded"
+        )
+        registry = AdapterRegistry.build([config])
+        adapter = registry.get("or")
+        assert adapter is not None
+        # The OpenRouterAdapter does not expose an ``api_key`` attribute
+        # (its key lives on the private ``_api_key`` slot and is read
+        # from env). The sanity check: the adapter constructed by the
+        # registry has the env-resolved key, not the config value. We
+        # check the private attribute and via the redaction in __repr__.
+        assert getattr(adapter, "_api_key", None) == "test-key-placeholder"
+        # The config-provided key MUST NOT appear in __repr__.
+        assert "should-not-be-forwarded" not in repr(adapter)
+
+    def test_openrouter_build_raises_when_api_key_missing(self, monkeypatch):
+        # The adapter constructor reads OPENROUTER_API_KEY from env; the
+        # registry must surface the resulting OpenRouterConfigError to
+        # the caller, NOT swallow it. Use ``monkeypatch.delenv`` to
+        # ensure the env var is unset for the duration of the call.
+        monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+        config = _make_openrouter_config(name="or")
+        from moaxy.adapters.openrouter import OpenRouterConfigError
+
+        with pytest.raises(OpenRouterConfigError):
+            AdapterRegistry.build([config])
+
+    def test_openrouter_registry_key_uses_config_name(self, monkeypatch):
+        # The registry key is the config's ``name`` (not the class-level
+        # ``OpenRouterAdapter.name`` which is "openrouter"). A user can
+        # register two openrouter backends with different config names
+        # and they MUST coexist.
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        a_cfg = _make_openrouter_config(
+            name="openrouter-primary",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        b_cfg = _make_openrouter_config(
+            name="openrouter-fallback",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        registry = AdapterRegistry.build([a_cfg, b_cfg])
+        assert "openrouter-primary" in registry.adapters
+        assert "openrouter-fallback" in registry.adapters
+        # The adapter class-level name is NOT used as the key.
+        assert "openrouter" not in registry.adapters
+        # And the two adapters are distinct objects.
+        assert (
+            registry.get("openrouter-primary")
+            is not registry.get("openrouter-fallback")
+        )
+
+    def test_openrouter_can_coexist_with_ollama_in_same_registry(self, monkeypatch):
+        # Backward-compat: a single registry can hold both ollama and
+        # openrouter backends. The ollama branch MUST still work.
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        cfg_ollama = _make_ollama_config(name="o")
+        cfg_or = _make_openrouter_config(name="or")
+        registry = AdapterRegistry.build([cfg_ollama, cfg_or])
+        assert isinstance(registry.get("o"), OllamaAdapter)
+        assert isinstance(registry.get("or"), OpenRouterAdapter)
+
+    def test_openrouter_registry_does_not_break_ollama_constructor(self, monkeypatch):
+        # The ollama branch MUST keep working unchanged when openrouter
+        # is registered. This is the explicit "ollama still works"
+        # backward-compat invariant from the M6 spec.
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        cfg_ollama = _make_ollama_config(
+            name="ollama-local",
+            base_url="http://127.0.0.1:11434",
+            timeout=12.5,
+            api_key=None,
+        )
+        registry = AdapterRegistry.build([cfg_ollama])
+        adapter = registry.get("ollama-local")
+        assert adapter is not None
+        assert isinstance(adapter, OllamaAdapter)
+        assert adapter.base_url == "http://127.0.0.1:11434"
+        assert adapter.timeout == 12.5
+        assert adapter.api_key is None
+
+    def test_openrouter_factory_table_includes_openrouter_key(self):
+        # Belt-and-braces: the private ``_ADAPTER_FACTORIES`` table MUST
+        # list the openrouter kind so future code can introspect it.
+        from moaxy.adapters.registry import _ADAPTER_FACTORIES
+
+        assert "openrouter" in _ADAPTER_FACTORIES
+        assert "ollama" in _ADAPTER_FACTORIES
+        assert "openai" in _ADAPTER_FACTORIES
+
+    def test_openrouter_unknown_adapter_error_for_unknown_kind(self, monkeypatch):
+        # Belt-and-braces: an unknown kind raises the existing
+        # ``UnknownAdapterError``; the openrouter branch does not
+        # interfere with that contract.
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        bad = AdapterConfig.model_construct(
+            name="bogus",
+            adapter="anthropic",  # type: ignore[arg-type]
+            base_url="http://x",
+            api_key=None,
+            timeout=30.0,
+        )
+        with pytest.raises((ValueError, KeyError)):
+            AdapterRegistry.build([bad])
+
+    def test_openrouter_build_uses_moaxy_config_backends(self, monkeypatch):
+        # The registry composes cleanly with ``MoaxyConfig.backends``.
+        monkeypatch.setenv(API_KEY_ENV_VAR, "test-key-placeholder")
+        moaxy = MoaxyConfig(
+            backends=[
+                _make_ollama_config(name="ollama-local"),
+                _make_openrouter_config(name="or-prod"),
+            ]
+        )
+        registry = AdapterRegistry.build(moaxy.backends)
+        assert isinstance(registry.get("ollama-local"), OllamaAdapter)
+        assert isinstance(registry.get("or-prod"), OpenRouterAdapter)
