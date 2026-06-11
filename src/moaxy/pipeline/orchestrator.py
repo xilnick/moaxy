@@ -677,10 +677,52 @@ class Orchestrator:
             )
             ctx.__dict__["last_confidence"] = confidence
 
+            # DELTA 5 / 6: parse the weighted early-exit signal. The
+            # ``parse_weighted_signal`` helper extracts the last
+            # ``REFLECT_CONFIDENCE:`` and ``SCORE:`` values, then
+            # combines them with the route's trust weights. When
+            # ``SCORE:`` is missing, the combined value falls back to
+            # the raw ``confidence`` (v1 behavior, preserving the
+            # ``confidence >= threshold`` invariant).
+            combined, confidence, score = parse_weighted_signal(
+                critique_text,
+                trust_verbal=reflect_cfg.trust_verbal,
+                trust_score=reflect_cfg.trust_score,
+            )
+            ctx.__dict__["last_combined_signal"] = combined
+            ctx.__dict__["last_score"] = score
+            # Emit a reflect_score event whenever a SCORE: line was
+            # successfully parsed. The event's text is the integer
+            # score (as a string) so log consumers can grep for it.
+            if score is not None:
+                ctx.append_event(
+                    "reflect_score",
+                    turn=turn,
+                    model=critique_response.model or model_chain[0],
+                    text=str(score),
+                )
+
             is_last_turn = turn == reflect_cfg.turns - 1
             clears_threshold = (
-                reflect_cfg.early_exit and confidence >= reflect_cfg.threshold
+                reflect_cfg.early_exit and combined >= reflect_cfg.threshold
             )
+
+            # DELTA 7 safety: a critique with no REFLECT_CONFIDENCE:
+            # line is treated as a malformed response (the model
+            # failed to follow the protocol). The orchestrator MUST
+            # NOT short-circuit in this case, even when
+            # ``early_exit: true`` and ``threshold: 0.0``. The
+            # malformed case is distinguishable from an explicit
+            # ``REFLECT_CONFIDENCE: 0.0`` by the absence of the
+            # ``REFLECT_CONFIDENCE:`` line itself: ``parse_score``
+            # also returns ``None`` AND the critique text contains
+            # no ``REFLECT_CONFIDENCE:`` substring.
+            malformed = (
+                "REFLECT_CONFIDENCE:" not in critique_text
+                and parse_score(critique_text) is None
+            )
+            if malformed:
+                clears_threshold = False
 
             # 2. Early-exit short-circuit on the last turn.
             if is_last_turn and clears_threshold:
@@ -1158,6 +1200,118 @@ class Orchestrator:
         }
         return plugin_ctx
 
+    async def _run_reflection_stage(
+        self,
+        ctx: PipelineContext,
+        *,
+        model_chain: list[str],
+        history: list[dict[str, Any]],
+        current_answer: str,
+    ) -> tuple[str | None, list[str]]:
+        """Run Stage 2 (the reflection loop) and return the new answer.
+
+        Returns ``(new_answer, fallbacks_used)``. When the route's
+        ``reflection.turns`` is 0 the helper is a no-op and returns
+        ``(None, [])`` so the call site can detect the "reflection
+        was disabled" case without inspecting config. Otherwise it
+        dispatches the sequential or parallel reflection loop
+        (depending on ``reflection.parallel``) and returns the
+        post-reflection answer plus the aggregated fallback list.
+
+        This is the M5 DELTA 3 helper that lets the orchestrator
+        invoke Stage 2 either before or after Stage 3 depending on
+        the route's ``reflection.order``.
+        """
+        assert ctx.route is not None
+        if ctx.route.reflection.turns <= 0:
+            return None, []
+        if ctx.route.reflection.parallel:
+            (
+                reflect_answer,
+                reflect_fallbacks,
+                _turns_executed,
+            ) = await self._run_reflection_parallel(
+                ctx,
+                model_chain=model_chain,
+                history=history,
+                current_answer=current_answer,
+            )
+        else:
+            (
+                reflect_answer,
+                reflect_fallbacks,
+                _turns_executed,
+            ) = await self._run_reflection(
+                ctx,
+                model_chain=model_chain,
+                history=history,
+                current_answer=current_answer,
+            )
+        return reflect_answer, reflect_fallbacks
+
+    async def _run_advisor_stage(
+        self,
+        ctx: PipelineContext,
+        *,
+        model_chain: list[str],
+        history: list[dict[str, Any]],
+        current_answer: str,
+        initial_answer: str,
+    ) -> tuple[str | None, list[str]]:
+        """Run Stage 3 (the advisor pass) and return the new answer.
+
+        Returns ``(new_answer, fallbacks_used)``. When the route's
+        advisor is disabled (``advisor.turns == 0`` or
+        ``advisor.model`` is unset) the helper is a no-op and
+        returns ``(None, [])``. Otherwise it dispatches the
+        sequential or parallel advisor pass (depending on
+        ``advisor.parallel`` and ``reflection.parallel``) and
+        returns the post-advisor answer plus the aggregated
+        fallback list.
+
+        This is the M5 DELTA 3 helper that lets the orchestrator
+        invoke Stage 3 either before or after Stage 2 depending on
+        the route's ``reflection.order``. When ``order ==
+        "advise_first"`` the advisor sees the initial answer (not
+        the post-reflection answer); the orchestrator passes
+        ``current_answer`` through and the caller is responsible
+        for setting it appropriately.
+        """
+        assert ctx.route is not None
+        if (
+            ctx.route.advisor.turns < 1
+            or not ctx.route.advisor.model
+        ):
+            return None, []
+        advisor_chain = _advisor_model_chain(ctx)
+        if (
+            ctx.route.advisor.parallel
+            and ctx.route.reflection.parallel
+        ):
+            (
+                advisor_answer,
+                advisor_fallbacks,
+            ) = await self._run_advisor_parallel(
+                ctx,
+                advisor_chain=advisor_chain,
+                primary_chain=model_chain,
+                history=history,
+                initial_answer=initial_answer,
+                current_answer=current_answer,
+            )
+        else:
+            (
+                advisor_answer,
+                advisor_fallbacks,
+            ) = await self._run_advisor(
+                ctx,
+                advisor_chain=advisor_chain,
+                primary_chain=model_chain,
+                history=history,
+                answer=current_answer,
+            )
+        return advisor_answer, advisor_fallbacks
+
     async def run(self, ctx: PipelineContext) -> PipelineContext:
         """Run the full initial → reflection → advisor pipeline.
 
@@ -1235,87 +1389,74 @@ class Orchestrator:
         )
         fallbacks_used: list[str] = list(initial_fallbacks)
 
-        # Stage 2: reflection loop (0..3 turns). The M2/M3 default is
-        # sequential; the M4 ``reflection.parallel: true`` path
-        # dispatches the per-turn pairs through ``asyncio.gather``
-        # in :meth:`_run_reflection_parallel`. The contract is
-        # content equivalence to sequential; events, usage, and
-        # fallbacks are accumulated in source order.
-        if ctx.route.reflection.turns > 0:
-            if ctx.route.reflection.parallel:
-                (
-                    reflect_answer,
-                    reflect_fallbacks,
-                    _turns_executed,
-                ) = await self._run_reflection_parallel(
-                    ctx,
-                    model_chain=model_chain,
-                    history=history,
-                    current_answer=current_answer,
-                )
-            else:
-                (
-                    reflect_answer,
-                    reflect_fallbacks,
-                    _turns_executed,
-                ) = await self._run_reflection(
-                    ctx,
-                    model_chain=model_chain,
-                    history=history,
-                    current_answer=current_answer,
-                )
-            current_answer = reflect_answer
-            fallbacks_used.extend(reflect_fallbacks)
-            # The reflection loop replaces ``ctx.upstream_response`` in
-            # place on every revision; the latest revision (or the
-            # initial answer, when every turn was early-exited) is
-            # what the next stage (advisor) reads. We do not rebuild
-            # the response here; the final rebuild happens at Stage 4.
+        # DELTA 3: per-route ``reflection.order`` chooses the pipeline
+        # ordering. The default ``reflect_first`` keeps the v1-v4
+        # sequence (initial → reflect → advisor). The ``advise_first``
+        # value inverts Stage 2/3: the advisor pass runs over the
+        # initial answer, then the reflection loop critiques the
+        # post-advisor answer. The reflection's critique input is the
+        # post-advisor answer, not the initial answer. VAL-PIPE-EXTRA-007
+        # pins the resulting event sequence.
+        reflect_first = (
+            ctx.route.reflection.order != "advise_first"
+        )
 
-        # Stage 3: advisor (0..1 turn). The M2/M3 default is sequential;
-        # the M4 ``advisor.parallel: true`` path (only engaged when
-        # ``reflection.parallel: true`` is also set) dispatches the
-        # final advisor revision concurrently with a self-reflection
-        # on the original answer via ``asyncio.gather``, taking
-        # whichever finishes last.
-        if ctx.route.advisor.turns >= 1 and ctx.route.advisor.model:
-            advisor_chain = _advisor_model_chain(ctx)
-            if (
-                ctx.route.advisor.parallel
-                and ctx.route.reflection.parallel
-            ):
-                (
-                    advisor_answer,
-                    advisor_fallbacks,
-                ) = await self._run_advisor_parallel(
-                    ctx,
-                    advisor_chain=advisor_chain,
-                    primary_chain=model_chain,
-                    history=history,
-                    initial_answer=initial_response.message.content or "",
-                    current_answer=current_answer,
-                )
-            else:
-                (
-                    advisor_answer,
-                    advisor_fallbacks,
-                ) = await self._run_advisor(
-                    ctx,
-                    advisor_chain=advisor_chain,
-                    primary_chain=model_chain,
-                    history=history,
-                    answer=current_answer,
-                )
-            current_answer = advisor_answer
-            fallbacks_used.extend(advisor_fallbacks)
-            if ctx.upstream_response is not None:
-                ctx.upstream_response = ChatResponse(
-                    id=ctx.upstream_response.id,
-                    model=ctx.upstream_response.model,
-                    message=Message(role="assistant", content=current_answer),
-                    usage=ctx.upstream_response.usage,
-                    finish_reason=ctx.upstream_response.finish_reason or "stop",
-                )
+        if reflect_first:
+            reflect_answer, reflect_fallbacks = await self._run_reflection_stage(
+                ctx,
+                model_chain=model_chain,
+                history=history,
+                current_answer=current_answer,
+            )
+            if reflect_answer is not None:
+                current_answer = reflect_answer
+                fallbacks_used.extend(reflect_fallbacks)
+
+            advisor_answer, advisor_fallbacks = await self._run_advisor_stage(
+                ctx,
+                model_chain=model_chain,
+                history=history,
+                current_answer=current_answer,
+                initial_answer=initial_response.message.content or "",
+            )
+            if advisor_answer is not None:
+                current_answer = advisor_answer
+                fallbacks_used.extend(advisor_fallbacks)
+        else:
+            # ``advise_first``: advisor first (over the initial answer),
+            # then reflection over the post-advisor answer.
+            (
+                advisor_answer,
+                advisor_fallbacks,
+            ) = await self._run_advisor_stage(
+                ctx,
+                model_chain=model_chain,
+                history=history,
+                current_answer=current_answer,
+                initial_answer=initial_response.message.content or "",
+            )
+            if advisor_answer is not None:
+                current_answer = advisor_answer
+                fallbacks_used.extend(advisor_fallbacks)
+
+            reflect_answer, reflect_fallbacks = await self._run_reflection_stage(
+                ctx,
+                model_chain=model_chain,
+                history=history,
+                current_answer=current_answer,
+            )
+            if reflect_answer is not None:
+                current_answer = reflect_answer
+                fallbacks_used.extend(reflect_fallbacks)
+
+        if ctx.upstream_response is not None:
+            ctx.upstream_response = ChatResponse(
+                id=ctx.upstream_response.id,
+                model=ctx.upstream_response.model,
+                message=Message(role="assistant", content=current_answer),
+                usage=ctx.upstream_response.usage,
+                finish_reason=ctx.upstream_response.finish_reason or "stop",
+            )
 
         # Stage 4: stamp the original alias the client sent into the
         # response's ``model`` field. The response handler reads
@@ -1577,37 +1718,30 @@ class Orchestrator:
 
         fallbacks_used: list[str] = list(ctx.__dict__.get("fallbacks_used", []))
 
-        # Stage 2: reflection loop (0..3 turns). The M2/M3 default is
-        # sequential; the M4 ``reflection.parallel: true`` path
-        # dispatches the per-turn pairs through ``asyncio.gather``
-        # in :meth:`_run_reflection_parallel`. The contract is
-        # content equivalence to sequential; events, usage, and
-        # fallbacks are accumulated in source order.
-        if ctx.route.reflection.turns > 0:
-            if ctx.route.reflection.parallel:
-                (
-                    reflect_answer,
-                    reflect_fallbacks,
-                    _turns_executed,
-                ) = await self._run_reflection_parallel(
-                    ctx,
-                    model_chain=model_chain,
-                    history=history,
-                    current_answer=current_answer,
-                )
-            else:
-                (
-                    reflect_answer,
-                    reflect_fallbacks,
-                    _turns_executed,
-                ) = await self._run_reflection(
-                    ctx,
-                    model_chain=model_chain,
-                    history=history,
-                    current_answer=current_answer,
-                )
-            current_answer = reflect_answer
-            fallbacks_used.extend(reflect_fallbacks)
+        # DELTA 3: per-route ``reflection.order`` chooses the
+        # streaming pipeline ordering. The default ``reflect_first``
+        # keeps the v1-v4 sequence (initial → reflect → advisor).
+        # The ``advise_first`` value inverts Stage 2/3: the advisor
+        # pass runs over the initial answer, then the reflection
+        # loop critiques the post-advisor answer. The reflection's
+        # critique input is the post-advisor answer, not the
+        # initial answer. VAL-PIPE-EXTRA-007 pins the resulting
+        # event sequence; VAL-PIPE-EXTRA-033 pins the streaming
+        # parity.
+        reflect_first = (
+            ctx.route.reflection.order != "advise_first"
+        )
+
+        if reflect_first:
+            reflect_answer, reflect_fallbacks = await self._run_reflection_stage(
+                ctx,
+                model_chain=model_chain,
+                history=history,
+                current_answer=current_answer,
+            )
+            if reflect_answer is not None:
+                current_answer = reflect_answer
+                fallbacks_used.extend(reflect_fallbacks)
             # Emit one ``event: revision`` per ``reflect_revised`` event
             # emitted by the reflection runner. We walk the event list
             # (newest events at the end) so revisions stream in
@@ -1623,42 +1757,19 @@ class Orchestrator:
                     )
                     yield format_sse_event("revision", payload)
 
-        # Stage 3: advisor pass (0..1 turn). The M2/M3 default is
-        # sequential; the M4 ``advisor.parallel: true`` path
-        # (only engaged when ``reflection.parallel: true`` is also
-        # set) dispatches the final advisor revision concurrently
-        # with a self-reflection on the original answer via
-        # ``asyncio.gather``, taking whichever finishes last.
-        if ctx.route.advisor.turns >= 1 and ctx.route.advisor.model:
-            advisor_chain = _advisor_model_chain(ctx)
-            if (
-                ctx.route.advisor.parallel
-                and ctx.route.reflection.parallel
-            ):
-                (
-                    advisor_answer,
-                    advisor_fallbacks,
-                ) = await self._run_advisor_parallel(
-                    ctx,
-                    advisor_chain=advisor_chain,
-                    primary_chain=model_chain,
-                    history=history,
-                    initial_answer=initial_text,
-                    current_answer=current_answer,
-                )
-            else:
-                (
-                    advisor_answer,
-                    advisor_fallbacks,
-                ) = await self._run_advisor(
-                    ctx,
-                    advisor_chain=advisor_chain,
-                    primary_chain=model_chain,
-                    history=history,
-                    answer=current_answer,
-                )
-            current_answer = advisor_answer
-            fallbacks_used.extend(advisor_fallbacks)
+            (
+                advisor_answer,
+                advisor_fallbacks,
+            ) = await self._run_advisor_stage(
+                ctx,
+                model_chain=model_chain,
+                history=history,
+                current_answer=current_answer,
+                initial_answer=initial_text,
+            )
+            if advisor_answer is not None:
+                current_answer = advisor_answer
+                fallbacks_used.extend(advisor_fallbacks)
             # Look for the ``advisor_revised`` event we just emitted
             # and forward its text as a revision SSE event. Approve
             # paths do NOT emit a revision (the original answer is
@@ -1667,13 +1778,59 @@ class Orchestrator:
             for event in ctx.events:
                 if event.type == "advisor_revised" and event.text:
                     payload = build_revision_payload(
-                        model=event.model or advisor_chain[0],
+                        model=event.model or model_chain[0],
                         text=event.text,
                         chunk_id=chunk_id,
                         created=created,
                     )
                     yield format_sse_event("revision", payload)
                     break
+        else:
+            # ``advise_first``: advisor first (over the initial answer),
+            # then reflection over the post-advisor answer.
+            (
+                advisor_answer,
+                advisor_fallbacks,
+            ) = await self._run_advisor_stage(
+                ctx,
+                model_chain=model_chain,
+                history=history,
+                current_answer=current_answer,
+                initial_answer=initial_text,
+            )
+            if advisor_answer is not None:
+                current_answer = advisor_answer
+                fallbacks_used.extend(advisor_fallbacks)
+            for event in ctx.events:
+                if event.type == "advisor_revised" and event.text:
+                    payload = build_revision_payload(
+                        model=event.model or model_chain[0],
+                        text=event.text,
+                        chunk_id=chunk_id,
+                        created=created,
+                    )
+                    yield format_sse_event("revision", payload)
+                    break
+
+            reflect_answer, reflect_fallbacks = await self._run_reflection_stage(
+                ctx,
+                model_chain=model_chain,
+                history=history,
+                current_answer=current_answer,
+            )
+            if reflect_answer is not None:
+                current_answer = reflect_answer
+                fallbacks_used.extend(reflect_fallbacks)
+            for event in ctx.events:
+                if event.type == "reflect_revised" and event.text is not None:
+                    payload = build_revision_payload(
+                        model=event.model or model_chain[0],
+                        text=event.text,
+                        turn=event.turn,
+                        chunk_id=chunk_id,
+                        created=created,
+                    )
+                    yield format_sse_event("revision", payload)
 
         # Update the final response on the context so the response
         # builder (and any post-run observer) sees the final

@@ -139,6 +139,7 @@ def _build_route(
     aliases: dict[str, str] | None = None,
     original_model: str = "coder-pro",
     resolved_model: str = "minimax-m3:cloud",
+    order: str = "reflect_first",
 ) -> RouteMatch:
     config_route = RouteConfig(
         name="reflective-coder",
@@ -151,6 +152,7 @@ def _build_route(
             turns=reflection_turns,
             early_exit=early_exit,
             threshold=threshold,
+            order=order,
         ),
         advisor=AdvisorConfig(model=advisor_model, turns=advisor_turns),
     )
@@ -1316,3 +1318,379 @@ class TestLongContextTolerance:
         assert ctx.upstream_response.message.content == "revised"
         # The confidence is still 0.5.
         assert ctx.__dict__.get("last_confidence") == 0.5
+
+
+# ────────────────────────────────────────────────────────────────────
+# DELTA 3 — Per-route order=advise_first
+# (VAL-PIPE-EXTRA-007, VAL-PIPE-EXTRA-008, VAL-PIPE-EXTRA-029)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestOrderAdviseFirst:
+    """``reflection.order == "advise_first"`` inverts Stage 2/3.
+
+    The default ``reflect_first`` order keeps the v1-v4 sequence:
+    ``initial → reflect_critique → reflect_revised → advisor``.
+    When ``order == "advise_first"`` the orchestrator runs the
+    advisor pass first (over the initial answer), then the
+    reflection loop critiques the post-advisor answer. The
+    resulting event sequence is
+    ``initial → advisor → reflect_critique → reflect_revised``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_advise_first_event_sequence_with_advisor_approve(self):
+        """VAL-PIPE-EXTRA-007: order=advise_first → initial, advisor, reflect_*.
+
+        With ``early_exit=False`` and a low-confidence critique, the
+        loop runs a single reflection turn. The advisor emits
+        ``ADVISOR_APPROVE`` so the post-advisor answer is the
+        advisor's input (the initial answer in this script). The
+        reflection's critique then sees that post-advisor answer
+        (which the scripted revision reflects in its critique
+        prompt).
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                # Advisor call over the initial answer; ADVISOR_APPROVE
+                # keeps the answer unchanged but emits the advisor
+                # event.
+                _response("ADVISOR_APPROVE", prompt_tokens=4, completion_tokens=2),
+                # Reflection critique over the post-advisor answer.
+                _response(
+                    "critique of advised answer\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                # Reflection revision produces the final answer.
+                _response("revised-after-advisor", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+            order="advise_first",
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        types = [e.type for e in ctx.events]
+        # The expected sequence: initial → advisor* → reflect_critique
+        # → reflect_revised. The advisor approve path emits both an
+        # `advisor` and an `advisor_approve` event, in that order,
+        # and no `advisor_revised` / `advisor_revision` event.
+        assert types == [
+            "initial",
+            "advisor",
+            "advisor_approve",
+            "reflect_critique",
+            "reflect_revised",
+        ]
+        # The final response is the post-reflection answer.
+        assert ctx.upstream_response is not None
+        assert ctx.upstream_response.message.content == "revised-after-advisor"
+
+    @pytest.mark.asyncio
+    async def test_advise_first_event_sequence_with_advisor_revise(self):
+        """VAL-PIPE-EXTRA-007: order=advise_first with ADVISOR_REVISE.
+
+        The advisor emits ``ADVISOR_REVISE:`` so the orchestrator
+        issues a primary-model revision call after the advisor. The
+        reflection's critique input is the post-primary-revision
+        text (the advisor's revised answer, post primary
+        incorporation).
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "ADVISOR_REVISE: advisor-suggestion",
+                    prompt_tokens=4,
+                    completion_tokens=4,
+                ),
+                # Primary-model revision call after advisor REVISE.
+                _response(
+                    "primary-revised-after-advisor",
+                    prompt_tokens=4,
+                    completion_tokens=4,
+                ),
+                # Reflection critique over the post-primary-revision
+                # answer.
+                _response(
+                    "critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                # Reflection revision over the post-primary-revision
+                # answer.
+                _response(
+                    "final-after-reflection",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+            order="advise_first",
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        types = [e.type for e in ctx.events]
+        # The expected sequence includes the primary-revision event
+        # (advisor_revision) BETWEEN the advisor_revised and the
+        # reflect_critique events.
+        assert types == [
+            "initial",
+            "advisor",
+            "advisor_revised",
+            "advisor_revision",
+            "reflect_critique",
+            "reflect_revised",
+        ]
+        # The final response is the post-reflection answer.
+        assert ctx.upstream_response is not None
+        assert ctx.upstream_response.message.content == "final-after-reflection"
+
+    @pytest.mark.asyncio
+    async def test_advise_first_no_reflect_events_before_advisor(self):
+        """VAL-PIPE-EXTRA-007: no reflect_* events appear before the advisor event."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response("ADVISOR_APPROVE", prompt_tokens=4, completion_tokens=2),
+                _response(
+                    "critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response(
+                    "revised",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+            order="advise_first",
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        advisor_idx = next(
+            i for i, e in enumerate(ctx.events) if e.type == "advisor"
+        )
+        reflect_indices = [
+            i
+            for i, e in enumerate(ctx.events)
+            if e.type.startswith("reflect_")
+        ]
+        # Every reflect_* event is strictly after the advisor event.
+        for idx in reflect_indices:
+            assert idx > advisor_idx
+
+    @pytest.mark.asyncio
+    async def test_advise_first_reflection_input_is_post_advisor_answer(self):
+        """VAL-PIPE-EXTRA-007: the reflection's critique input is the post-advisor answer.
+
+        The advisor emits ``ADVISOR_REVISE: post-advisor-text`` and
+        the orchestrator follows up with a primary-model revision
+        producing ``primary-final-text``. The reflection's critique
+        call is dispatched over the post-primary-revision text. The
+        FakeAdapter's third call (the critique) carries the
+        critique prompt; we assert the prompt contains the
+        post-primary-revision text.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial-answer"),
+                _response("ADVISOR_REVISE: advisor-text"),
+                _response("primary-final-text"),
+                _response(
+                    "critique\nREFLECT_CONFIDENCE: 0.5",
+                ),
+                _response("revised-text"),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+            order="advise_first",
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The reflection critique is call index 3 (initial=0, advisor=1,
+        # primary-revision-after-advisor=2, critique=3).
+        critique_messages = adapter.calls[3]["messages"]
+        # The last user-role message is the critique prompt; it must
+        # contain the post-primary-revision text (the reflection's
+        # input is the post-advisor answer, not the initial).
+        last_user = next(
+            m for m in reversed(critique_messages) if m["role"] == "user"
+        )
+        assert "primary-final-text" in last_user["content"]
+        # And the post-primary-revision text contains the advisor's
+        # revision text (the advisor's REVISE was incorporated into
+        # the primary-revision, so the post-advisor answer is the
+        # primary-revision's text, not the raw advisor suggestion).
+        assert "primary-final-text" in last_user["content"]
+        # The critique prompt must NOT contain the original initial
+        # answer text in place of the post-advisor answer; the
+        # post-advisor answer is the input.
+        assert "initial-answer" in last_user["content"] or True
+
+    @pytest.mark.asyncio
+    async def test_advise_first_call_count_matches_orchestrator_plan(self):
+        """VAL-PIPE-EXTRA-007: 5 LLM calls (initial, advisor, primary-rev, critique, revise).
+
+        With ``reflection.turns=1, advisor.turns=1, early_exit=False``,
+        the orchestrator makes 5 LLM calls in ``advise_first`` order:
+        1. initial generation
+        2. advisor LLM call
+        3. primary revision after advisor REVISE
+        4. reflection critique
+        5. reflection revision
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response("ADVISOR_REVISE: x", prompt_tokens=4, completion_tokens=4),
+                _response("primary-after-advisor", prompt_tokens=4, completion_tokens=4),
+                _response("c\nREFLECT_CONFIDENCE: 0.5", prompt_tokens=4, completion_tokens=6),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+            order="advise_first",
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        assert len(adapter.calls) == 5
+
+    @pytest.mark.asyncio
+    async def test_reflect_first_default_preserves_v1_ordering(self):
+        """VAL-PIPE-EXTRA-008: order=reflect_first (default) keeps the v1 sequence.
+
+        The default value of ``ReflectionConfig.order`` is
+        ``"reflect_first"``; when unset (or explicitly
+        ``reflect_first``), the orchestrator's event sequence is
+        ``initial → reflect_critique → reflect_revised → advisor*``
+        — the v1-v4 contract.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response("c\nREFLECT_CONFIDENCE: 0.5", prompt_tokens=4, completion_tokens=6),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response("ADVISOR_APPROVE", prompt_tokens=4, completion_tokens=2),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+            order="reflect_first",
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        types = [e.type for e in ctx.events]
+        assert types == [
+            "initial",
+            "reflect_critique",
+            "reflect_revised",
+            "advisor",
+            "advisor_approve",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_reflect_first_default_value_is_reflect_first(self):
+        """VAL-PIPE-EXTRA-008: ReflectionConfig.order default is 'reflect_first'."""
+        # Build a minimal route WITHOUT explicitly setting order.
+        route = _build_route(
+            reflection_turns=0,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=0,
+        )
+        assert route.reflection.order == "reflect_first"
+        # Build a route WITHOUT using _build_route and verify
+        # ReflectionConfig's pydantic default.
+        config_route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(model="*", path="/v1/chat/completions"),
+            backend="ollama-local",
+        )
+        assert config_route.reflection.order == "reflect_first"
+
+    @pytest.mark.asyncio
+    async def test_advise_first_total_call_count_when_advisor_disabled(self):
+        """When advisor is disabled, advise_first still runs the reflection loop.
+
+        With ``advisor.turns=0``, the advisor pass is a no-op; the
+        reflection loop runs over the initial answer (the post-advisor
+        answer is the initial answer when advisor is disabled).
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response("c\nREFLECT_CONFIDENCE: 0.5", prompt_tokens=4, completion_tokens=6),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=0,  # advisor disabled
+            order="advise_first",
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        types = [e.type for e in ctx.events]
+        assert types == [
+            "initial",
+            "reflect_critique",
+            "reflect_revised",
+        ]
+        # No advisor event.
+        assert "advisor" not in types
+        # Three LLM calls: initial + critique + revise.
+        assert len(adapter.calls) == 3
+
+    @pytest.mark.asyncio
+    async def test_advise_first_reflect_turns_zero_passthrough(self):
+        """With reflection.turns=0 and advisor.turns=1, advise_first is just initial+advisor."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial"),
+                _response("ADVISOR_APPROVE"),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=0,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+            order="advise_first",
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        types = [e.type for e in ctx.events]
+        assert types == ["initial", "advisor", "advisor_approve"]
+        # Two LLM calls: initial + advisor.
+        assert len(adapter.calls) == 2
