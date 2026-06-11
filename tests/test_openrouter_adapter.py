@@ -35,6 +35,8 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
+import yaml
+from pydantic import ValidationError
 
 if TYPE_CHECKING:
     from tests.fixtures.fake_adapter import FakeAdapter
@@ -53,6 +55,10 @@ from moaxy.adapters.openrouter import (
     DEFAULT_TIMEOUT_S,
     OpenRouterAdapter,
     OpenRouterConfigError,
+)
+from moaxy.models.config import (
+    AdapterConfig,
+    MoaxyConfig,
 )
 
 # ────────────────────────────────────────────────────────────────────
@@ -2859,3 +2865,452 @@ class TestM5DeltasOnOpenRouter:
                 os.environ.pop("OPENROUTER_API_KEY", None)
             else:
                 os.environ["OPENROUTER_API_KEY"] = previous
+
+
+# ────────────────────────────────────────────────────────────────────
+# m6-openrouter-pydantic-config (VAL-OR-001, 002, 003, 025)
+#
+# These tests pin the Pydantic-side contract of the M6 OpenRouter
+# follow-up: the new ``openrouter`` literal in ``AdapterKind``, the
+# new ``http_referer`` and ``transforms`` fields on ``AdapterConfig``,
+# and the canonical ``config.example.yaml`` example.
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestM6PydanticConfigContract:
+    """VAL-OR-001..003, VAL-OR-025: Pydantic config contract for OpenRouter.
+
+    Each test method maps 1-to-1 to a single bullet in the
+    ``m6-openrouter-pydantic-config`` feature's expectedBehavior list
+    (and the corresponding ``VAL-OR-00X`` assertion in the
+    validation contract). The tests are written to be readable in
+    isolation — a reviewer can match each method to a contract
+    bullet without jumping around the file.
+    """
+
+    def test_or_001_adapter_kind_literal_accepts_openrouter(self):
+        """VAL-OR-001: ``AdapterConfig.adapter`` accepts
+        ``"openrouter"``.
+
+        ``AdapterKind`` is a Pydantic ``Literal["ollama", "openai",
+        "openrouter"]``; constructing an :class:`AdapterConfig` with
+        ``adapter="openrouter"`` succeeds and the value is preserved
+        on the resulting instance.
+        """
+        cfg = AdapterConfig(
+            name="openrouter-prod",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        assert cfg.adapter == "openrouter"
+
+    def test_or_001_adapter_kind_literal_accepts_ollama_and_openai(self):
+        """VAL-OR-001: ``AdapterKind`` literal preserves the
+        pre-existing ``"ollama"`` and ``"openai"`` values.
+
+        The M6 change is additive: the existing backend kinds MUST
+        continue to parse. The literal does not regress.
+        """
+        ollama_cfg = AdapterConfig(
+            name="ollama-local",
+            adapter="ollama",
+            base_url="http://127.0.0.1:11434",
+        )
+        openai_cfg = AdapterConfig(
+            name="openai-prod",
+            adapter="openai",
+            base_url="https://api.openai.com/v1",
+        )
+        assert ollama_cfg.adapter == "ollama"
+        assert openai_cfg.adapter == "openai"
+
+    def test_or_001_adapter_kind_literal_rejects_unknown_value(self):
+        """VAL-OR-001: ``AdapterConfig.adapter`` rejects an
+        unknown backend kind with a :class:`pydantic.ValidationError`
+        whose message mentions the field name and lists the valid
+        choices.
+
+        The error message is the contract the user sees when they
+        mistype the kind (e.g. ``"anthropic"`` instead of
+        ``"openrouter"``); a reviewer of the contract checks the
+        message names the field and the valid options.
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            AdapterConfig(
+                name="x",
+                adapter="anthropic",
+                base_url="https://example.test",
+            )
+        msg = str(exc_info.value)
+        assert "adapter" in msg
+        # The error message lists the valid literal choices.
+        assert "openrouter" in msg
+
+    def test_or_002_http_referer_field_accepts_valid_url(self):
+        """VAL-OR-002: ``AdapterConfig.http_referer`` accepts a
+        valid absolute URL.
+
+        The validator requires a scheme + host (e.g.
+        ``https://example.com``). When set, the value is preserved
+        on the resulting instance.
+        """
+        cfg = AdapterConfig(
+            name="openrouter-prod",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            http_referer="https://example.com",
+        )
+        assert cfg.http_referer == "https://example.com"
+
+    def test_or_002_http_referer_field_rejects_invalid_url(self):
+        """VAL-OR-002: ``AdapterConfig.http_referer`` rejects a
+        non-URL string with :class:`pydantic.ValidationError`.
+
+        The validator requires an absolute URL (scheme + host);
+        bare strings, paths, and hostless values are rejected
+        so a typo at config-load time produces a clear error
+        rather than leaking through to the OpenRouter request.
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            AdapterConfig(
+                name="openrouter-prod",
+                adapter="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                http_referer="not-a-url",
+            )
+        assert "http_referer" in str(exc_info.value)
+
+    def test_or_002_http_referer_field_defaults_to_none(self):
+        """VAL-OR-002: ``AdapterConfig.http_referer`` defaults to
+        ``None`` when unset.
+
+        The default means the ``HTTP-Referer`` header is omitted
+        from outbound OpenRouter requests; the M6 spec requires
+        the header to be present only when the user has
+        configured it.
+        """
+        cfg = AdapterConfig(
+            name="openrouter-prod",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        assert cfg.http_referer is None
+
+    def test_or_003_transforms_field_accepts_non_empty_list(self):
+        """VAL-OR-003: ``AdapterConfig.transforms`` accepts a
+        non-empty list of strings.
+
+        The validator rejects empty lists (which would translate
+        to an empty ``transforms`` body field on the OpenRouter
+        request and silently degrade behaviour). When set, the
+        value is preserved on the resulting instance.
+        """
+        cfg = AdapterConfig(
+            name="openrouter-prod",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            transforms=["middle-out"],
+        )
+        assert cfg.transforms == ["middle-out"]
+
+    def test_or_003_transforms_field_rejects_empty_list(self):
+        """VAL-OR-003: ``AdapterConfig.transforms`` rejects an
+        empty list with :class:`pydantic.ValidationError`.
+
+        An empty ``transforms`` is semantically equivalent to
+        "no transforms" and the canonical way to express that
+        is to set ``transforms: null`` (the default). The
+        validator rejects ``[]`` so config authors do not
+        accidentally no-op the field.
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            AdapterConfig(
+                name="openrouter-prod",
+                adapter="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                transforms=[],
+            )
+        assert "transforms" in str(exc_info.value)
+
+    def test_or_003_transforms_field_defaults_to_none(self):
+        """VAL-OR-003: ``AdapterConfig.transforms`` defaults to
+        ``None`` when unset.
+
+        The default means the ``transforms`` body field is
+        omitted from outbound OpenRouter requests; the M6 spec
+        requires the field to be present only when the user
+        has configured it.
+        """
+        cfg = AdapterConfig(
+            name="openrouter-prod",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        assert cfg.transforms is None
+
+    def test_or_003_transforms_field_accepts_none_explicitly(self):
+        """VAL-OR-003: ``AdapterConfig(transforms=None)`` is a
+        valid config and is treated the same as the default
+        (the field is omitted from the request body).
+        """
+        cfg = AdapterConfig(
+            name="openrouter-prod",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            transforms=None,
+        )
+        assert cfg.transforms is None
+
+    def test_or_025_config_example_yaml_has_openrouter_block(self):
+        """VAL-OR-025: ``config.example.yaml`` includes a
+        canonical ``openrouter`` backend and route example.
+
+        The example must parse as a valid :class:`MoaxyConfig`
+        and reference the OpenRouter backend from at least one
+        route. The wiring (base_url, optional http_referer /
+        x_title / transforms, alias, fallbacks) is documented
+        in the file itself so a user can copy it directly into
+        their ``config.yaml``.
+        """
+        repo_root = Path(__file__).resolve().parent.parent
+        example_path = repo_root / "config.example.yaml"
+        assert example_path.is_file(), (
+            f"config.example.yaml missing from repo root: {example_path}"
+        )
+        with example_path.open(encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+
+        # ``MoaxyConfig`` parses the YAML (the file may have
+        # extra YAML keys ignored by the model; the relevant
+        # contract is that the openrouter backend and route
+        # shapes match the schema).
+        cfg = MoaxyConfig.model_validate(data)
+
+        # The openrouter backend is declared.
+        openrouter_backends = [
+            b for b in cfg.backends if b.adapter == "openrouter"
+        ]
+        assert len(openrouter_backends) >= 1, (
+            "config.example.yaml does not declare any openrouter backend"
+        )
+        or_backend = openrouter_backends[0]
+        assert or_backend.base_url == "https://openrouter.ai/api/v1"
+        # The example uses ``anthropic/claude-3-haiku`` as the
+        # primary model and ``openai/gpt-4o-mini`` as a
+        # fallback — the canonical OpenRouter demo pair.
+        assert or_backend.adapter == "openrouter"
+
+        # At least one route references the OpenRouter backend.
+        openrouter_routes = [
+            r for r in cfg.routes if r.backend == or_backend.name
+        ]
+        assert len(openrouter_routes) >= 1, (
+            "config.example.yaml does not reference the openrouter "
+            "backend from any route"
+        )
+        # The primary model on the OpenRouter route is
+        # ``anthropic/claude-3-haiku``; the alias mechanism
+        # maps a client-side alias to that model name.
+        openrouter_route = openrouter_routes[0]
+        # The route declares a fallback chain (or the global
+        # default supplies one). The contract document says
+        # ``fallbacks: [openai/gpt-4o-mini]`` is the canonical
+        # pair.
+        assert any(
+            "openai/gpt-4o-mini" in entry
+            for entry in openrouter_route.fallbacks
+        ), (
+            f"openrouter route does not list openai/gpt-4o-mini in "
+            f"fallbacks: {openrouter_route.fallbacks!r}"
+        )
+
+
+# ────────────────────────────────────────────────────────────────────
+# m6-tests-and-compat (VAL-OR-023, 024, and the M6 backward-compat
+# contract). The M6 milestone requires the OpenRouterAdapter
+# addition to be strictly additive: the existing
+# ``tests/test_plugins.py`` MUST continue to pass unchanged and the
+# full M5+ test suite (1354+ tests) MUST continue to pass. These
+# tests pin that contract at the test level: they spawn a
+# subprocess to run ``tests/test_plugins.py`` (so a regression in
+# the plugins layer shows up here, not in the M6 hermetic
+# surface) and they assert the full pytest suite exits 0.
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestM6TestsAndCompat:
+    """m6-tests-and-compat feature contract.
+
+    The M6 OpenRouterAdapter change MUST NOT regress any pre-existing
+    test. The tests in this class pin the contract for the two
+    backward-compat dimensions of the M6 contract:
+
+    1. ``tests/test_plugins.py`` still passes unchanged (the most
+       sensitive regression target — the plugin system is the
+       pre-existing public surface the OpenRouterAdapter is
+       additive to).
+    2. The full pytest suite still passes (1354+ tests in the M5
+       baseline; the M6 hermetic tests in this file are added on
+       top).
+    """
+
+    def test_compat_001_m6_specific_backward_compat_subprocess(self):
+        """VAL-OR-023 / m6-tests-and-compat: the M6-specific
+        backward-compat test runs ``tests/test_plugins.py`` in a
+        subprocess and asserts the exit code is 0.
+
+        The M6 OpenRouterAdapter is additive to the existing
+        plugin system. A regression in the plugin layer (e.g. a
+        stale import, a broken fixture) is the most likely
+        failure mode of an M6 commit; this test surfaces that
+        regression at the M6 test surface rather than letting
+        it slip into the M6 hermetic tests where it would be
+        harder to attribute.
+
+        The subprocess invocation uses the same Python
+        interpreter the test runner is using and runs with
+        ``-x -q`` (exit on first failure, quiet output) so the
+        test fails fast on a regression.
+        """
+        repo_root = Path(__file__).resolve().parent.parent
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "tests/test_plugins.py",
+                "-x",
+                "-q",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        # The M6-specific contract: the subprocess exit code is
+        # 0. The M5 baseline (30 tests in test_plugins.py)
+        # continues to pass; the M6 OpenRouterAdapter addition
+        # is purely additive.
+        assert result.returncode == 0, (
+            f"tests/test_plugins.py failed (exit code "
+            f"{result.returncode}) after the M6 OpenRouterAdapter "
+            f"change. The M6 contract requires the pre-existing "
+            f"plugin test suite to pass unchanged.\n"
+            f"stdout: {result.stdout}\n"
+            f"stderr: {result.stderr}"
+        )
+
+    def test_compat_002_full_suite_1354_plus_tests_pass(self):
+        """VAL-OR-024: the full pytest suite exits 0 after the
+        M6 OpenRouterAdapter addition.
+
+        The M5 baseline is 1354 tests (1 pre-existing skip).
+        The M6 hermetic tests in this file are added on top;
+        the M6 contract is that the full suite (1354+ tests)
+        continues to pass. The subprocess invocation uses
+        ``-q`` (quiet output) and an explicit timeout to keep
+        the test bounded.
+
+        The subprocess is spawned with the same Python
+        interpreter so it picks up the same dependencies and
+        fixtures as the in-process runner. The ``cwd`` is the
+        repo root so the test files resolve correctly.
+
+        Implementation note: this test would recurse if the
+        subprocess re-ran this file (the full-suite test
+        would spawn another full-suite test, ad infinitum).
+        To break the recursion, the subprocess invocation
+        ``--deselect``s the recursive test (this very method)
+        and ``test_compat_001_m6_specific_backward_compat_subprocess``
+        (which spawns its own subprocess on test_plugins.py —
+        running both at once would double the subprocess
+        cost). The contract being tested is the rest of the
+        suite: every M1-M5 test, every M6 hermetic test in
+        this file other than the two recursive ones, and the
+        real-API tests (skipped by their own gating when
+        ``OPENROUTER_API_KEY`` is unset).
+        """
+        repo_root = Path(__file__).resolve().parent.parent
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                # Break the recursion: the subprocess does not
+                # re-run this test, and does not re-run the
+                # plugins-only subprocess test (which is the
+                # same surface, just with a narrower selection).
+                "--deselect",
+                "tests/test_openrouter_adapter.py::TestM6TestsAndCompat::test_compat_002_full_suite_1354_plus_tests_pass",
+                "--deselect",
+                "tests/test_openrouter_adapter.py::TestM6TestsAndCompat::test_compat_001_m6_specific_backward_compat_subprocess",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert result.returncode == 0, (
+            f"full pytest suite failed (exit code "
+            f"{result.returncode}) after the M6 OpenRouterAdapter "
+            f"change. The M6 contract requires the full suite "
+            f"(1354+ tests) to pass.\n"
+            f"stdout (last 1500 chars): {result.stdout[-1500:]}\n"
+            f"stderr (last 1500 chars): {result.stderr[-1500:]}"
+        )
+
+    def test_compat_003_lint_ruff_check_src_tests_is_clean(self):
+        """The M6 contract requires ``ruff check src tests`` to
+        exit 0 (clean) for the OpenRouterAdapter and its tests.
+        The subprocess invocation uses the same Python
+        interpreter (which makes ``ruff`` importable as a
+        module via ``python -m ruff``) so the test is
+        independent of any shell PATH.
+        """
+        repo_root = Path(__file__).resolve().parent.parent
+        result = subprocess.run(
+            [sys.executable, "-m", "ruff", "check", "src", "tests"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"ruff check src tests failed (exit code "
+            f"{result.returncode}) after the M6 OpenRouterAdapter "
+            f"change.\n"
+            f"stdout: {result.stdout}\n"
+            f"stderr: {result.stderr}"
+        )
+
+    def test_compat_004_compileall_src_tests_is_clean(self):
+        """The M6 contract requires ``python -m compileall -q
+        src tests`` to exit 0 (clean) for the OpenRouterAdapter
+        and its tests. ``compileall`` is a syntax check that
+        does not require the test dependencies to be installed;
+        it pins the M6 commit to be syntactically valid Python
+        across both the source tree and the test tree.
+        """
+        repo_root = Path(__file__).resolve().parent.parent
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "compileall",
+                "-q",
+                "src",
+                "tests",
+            ],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"python -m compileall -q src tests failed (exit "
+            f"code {result.returncode}) after the M6 "
+            f"OpenRouterAdapter change.\n"
+            f"stdout: {result.stdout}\n"
+            f"stderr: {result.stderr}"
+        )
