@@ -33,6 +33,7 @@ from moaxy.benchmark.prompts import (
     FunctionFromDocstringPrompt,
     RefactorPrompt,
 )
+from moaxy.benchmark.report import MarkdownReportGenerator
 from moaxy.benchmark.scoring import (
     DEFAULT_FALLBACK_SCORE,
     DEFAULT_JUDGE_MODEL,
@@ -51,6 +52,7 @@ __all__ = [
     "DEFAULT_FALLBACK_SCORE",
     "DEFAULT_JUDGE_MODEL",
     "LLMJudgeScorer",
+    "MarkdownReportGenerator",
     "MODEL_ALIASES",
     "PromptResult",
     "PromptScorer",
