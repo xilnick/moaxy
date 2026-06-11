@@ -110,6 +110,8 @@ def _build_route(
     retry: int = 0,
     original_model: str = "coder-pro",
     resolved_model: str = "minimax-m3:cloud",
+    trust_verbal: float = 0.6,
+    trust_score: float = 0.4,
 ) -> RouteMatch:
     config_route = RouteConfig(
         name="parallel-test-route",
@@ -123,6 +125,8 @@ def _build_route(
             early_exit=early_exit,
             threshold=threshold,
             parallel=reflection_parallel,
+            trust_verbal=trust_verbal,
+            trust_score=trust_score,
         ),
         advisor=AdvisorConfig(
             model=advisor_model,
@@ -713,3 +717,391 @@ class TestStreamRunParallelAdvisorInitialText:
             "post-reflection text; the M3+M4 contract pins the "
             "self-reflection's input to the original initial text"
         )
+
+
+# ────────────────────────────────────────────────────────────────────
+# 5. M5 weighted early-exit in the PARALLEL reflection path
+# ────────────────────────────────────────────────────────────────────
+
+
+def _critique_with_score_response(
+    body: str,
+    confidence: float | None,
+    score: int | None,
+    *,
+    model: str = "minimax-m3:cloud",
+) -> ChatResponse:
+    """Build a critique response carrying both a REFLECT_CONFIDENCE
+    and an optional SCORE: line. ``confidence=None`` and
+    ``score=None`` omit their respective lines entirely.
+    """
+    parts = [body]
+    if confidence is not None:
+        parts.append(f"REFLECT_CONFIDENCE: {confidence}")
+    if score is not None:
+        parts.append(f"SCORE: {score}")
+    return _response("\n".join(parts), model=model)
+
+
+class TestParallelWeightedEarlyExit:
+    """M5: the PARALLEL reflection path uses ``parse_weighted_signal``.
+
+    The M5 weighted-early-exit change in the SEQUENTIAL path
+    (``_run_reflection``) is mirrored in the PARALLEL path
+    (``_run_reflection_parallel``): the threshold check now uses
+    ``trust_verbal * confidence + trust_score * (score / 10)``
+    instead of the v1 ``confidence >= threshold`` check, and the
+    DELTA 7 safety rule (a missing ``REFLECT_CONFIDENCE:`` line is
+    treated as malformed and does NOT short-circuit) applies in
+    the parallel path too. These tests pin both behaviors.
+    """
+
+    @pytest.mark.asyncio
+    async def test_parallel_uses_weighted_signal_for_threshold_check(self):
+        """VAL-PIPE-EXTRA-010 (parallel): trust_verbal=1.0, trust_score=0.0
+        reduces to v1 ``confidence >= threshold`` in the parallel
+        path; early-exit fires when confidence clears the threshold.
+        """
+        adapter = FakeAdapter(
+            [
+                _response("initial"),
+                _critique_with_score_response("c", confidence=0.9, score=5),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            reflection_parallel=True,
+            trust_verbal=1.0,
+            trust_score=0.0,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+
+        # 0.9 >= 0.85 → early-exit; 2 LLM calls (initial + critique).
+        # The reflect_score event is emitted because the SCORE: line
+        # is parsed, between reflect_critique and reflect_early_exit.
+        assert [e.type for e in ctx.events] == [
+            "initial",
+            "reflect_critique",
+            "reflect_score",
+            "reflect_early_exit",
+        ]
+        assert len(adapter.calls) == 2
+        # The combined signal equals the raw confidence.
+        assert ctx.__dict__["last_combined_signal"] == 0.9
+        # The score is parsed and stored, but does not affect the check.
+        assert ctx.__dict__["last_score"] == 5
+
+    @pytest.mark.asyncio
+    async def test_parallel_score_only_threshold(self):
+        """VAL-PIPE-EXTRA-011 (parallel): trust_verbal=0.0, trust_score=1.0
+        makes the early-exit check driven by score/10 only.
+        """
+        # REFLECT_CONFIDENCE: 0.5 (would clear no threshold), SCORE: 9.
+        # With trust_verbal=0.0, trust_score=1.0 the combined = 0.9,
+        # which is >= 0.85 → early-exit.
+        adapter = FakeAdapter(
+            [
+                _response("initial"),
+                _critique_with_score_response("c", confidence=0.5, score=9),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            reflection_parallel=True,
+            trust_verbal=0.0,
+            trust_score=1.0,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+
+        # Early-exit fires. The reflect_score event is emitted because
+        # the SCORE: line is parsed.
+        event_types = [e.type for e in ctx.events]
+        assert "reflect_early_exit" in event_types
+        assert "reflect_score" in event_types
+        assert len(adapter.calls) == 2
+        # combined = 0.0 * 0.5 + 1.0 * 0.9 = 0.9.
+        assert ctx.__dict__["last_combined_signal"] == pytest.approx(0.9)
+        assert ctx.__dict__["last_score"] == 9
+        # last_confidence is the raw parsed confidence.
+        assert ctx.__dict__["last_confidence"] == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
+    async def test_parallel_combined_weights(self):
+        """VAL-PIPE-EXTRA-012 (parallel): trust_verbal=0.5, trust_score=0.5
+        combines confidence and score. The combined signal is stored
+        on ``ctx.__dict__['last_combined_signal']``.
+        """
+        # REFLECT_CONFIDENCE: 0.6, SCORE: 9.
+        # combined = 0.5 * 0.6 + 0.5 * 0.9 = 0.75, which is < 0.85
+        # → revision runs.
+        adapter = FakeAdapter(
+            [
+                _response("initial"),
+                _critique_with_score_response("c", confidence=0.6, score=9),
+                _response("revised"),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            reflection_parallel=True,
+            trust_verbal=0.5,
+            trust_score=0.5,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+
+        # 3 LLM calls; the revision runs because combined < threshold.
+        assert len(adapter.calls) == 3
+        assert "reflect_early_exit" not in [e.type for e in ctx.events]
+        # The combined signal is the weighted formula's result.
+        assert ctx.__dict__["last_combined_signal"] == pytest.approx(0.75)
+        assert ctx.__dict__["last_score"] == 9
+        assert ctx.__dict__["last_confidence"] == pytest.approx(0.6)
+
+    @pytest.mark.asyncio
+    async def test_parallel_reflect_score_event_emitted(self):
+        """VAL-PIPE-EXTRA-018 (parallel): a parsed SCORE: line emits
+        a ``reflect_score`` event in the parallel path.
+        """
+        adapter = FakeAdapter(
+            [
+                _response("initial"),
+                _critique_with_score_response("c", confidence=0.5, score=8),
+                _response("revised"),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            reflection_parallel=True,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+
+        # A 'reflect_score' event is appended with text="8" and turn=0.
+        score_events = [e for e in ctx.events if e.type == "reflect_score"]
+        assert len(score_events) == 1
+        assert score_events[0].text == "8"
+        assert score_events[0].turn == 0
+        # The ctx.__dict__['last_score'] is also set.
+        assert ctx.__dict__["last_score"] == 8
+
+    @pytest.mark.asyncio
+    async def test_parallel_reflect_score_event_not_emitted_when_score_missing(self):
+        """The parallel path does not emit ``reflect_score`` when the
+        model omits the SCORE: line.
+        """
+        adapter = FakeAdapter(
+            [
+                _response("initial"),
+                _critique_response("c", confidence=0.5),
+                _response("revised"),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            reflection_parallel=True,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # No reflect_score event in the list.
+        assert "reflect_score" not in [e.type for e in ctx.events]
+        # last_score is None.
+        assert ctx.__dict__["last_score"] is None
+
+    @pytest.mark.asyncio
+    async def test_parallel_delta7_safety_malformed_critique_continues(self):
+        """VAL-PIPE-EXTRA-016 (parallel): DELTA 7 safety rule applies in
+        the parallel path. A critique with NO ``REFLECT_CONFIDENCE:``
+        line is treated as a malformed response; the revision runs
+        as if ``early_exit: false`` for that turn.
+        """
+        adapter = FakeAdapter(
+            [
+                _response("initial"),
+                _critique_response("a critique with no confidence line", confidence=None),
+                _response("revised after missing line"),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.0,  # extreme threshold
+            reflection_parallel=True,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+
+        # Even with threshold=0.0, the malformed safety rule forces
+        # clears_threshold=False; the revision runs.
+        assert len(adapter.calls) == 3
+        assert "reflect_early_exit" not in [e.type for e in ctx.events]
+        assert [e.type for e in ctx.events] == [
+            "initial",
+            "reflect_critique",
+            "reflect_revised",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_parallel_explicit_zero_confidence_not_malformed(self):
+        """VAL-PIPE-EXTRA-017 (parallel): ``REFLECT_CONFIDENCE: 0.0``
+        is NOT malformed. The v1 threshold check applies: 0.0 < 0.85
+        → revision runs (not the safety path).
+        """
+        adapter = FakeAdapter(
+            [
+                _response("initial"),
+                _critique_response("c", confidence=0.0),
+                _response("revised"),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            reflection_parallel=True,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # 0.0 < 0.85 → revision runs; no early-exit.
+        assert len(adapter.calls) == 3
+        assert "reflect_early_exit" not in [e.type for e in ctx.events]
+
+    @pytest.mark.asyncio
+    async def test_parallel_combined_signal_exposed_on_context(self):
+        """The combined weighted-signal result is stored on
+        ``ctx.__dict__['last_combined_signal']`` in the parallel
+        path. The ``last_score`` attribute carries the parsed score.
+        """
+        crit = ChatResponse(
+            id="c1",
+            model="minimax-m3:cloud",
+            message=Message(
+                role="assistant",
+                content="c\nREFLECT_CONFIDENCE: 0.6\nSCORE: 9",
+            ),
+            usage=Usage(prompt_tokens=4, completion_tokens=6, total_tokens=10),
+            finish_reason="stop",
+        )
+        adapter = FakeAdapter(
+            [_response("initial"), crit, _response("revised")]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            reflection_parallel=True,
+            trust_verbal=0.6,
+            trust_score=0.4,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # 0.6 * 0.6 + 0.4 * 0.9 = 0.72; revision runs.
+        assert len(adapter.calls) == 3
+        assert ctx.__dict__["last_combined_signal"] == pytest.approx(0.72)
+        assert ctx.__dict__["last_score"] == 9
+        assert ctx.__dict__["last_confidence"] == pytest.approx(0.6)
+
+    @pytest.mark.asyncio
+    async def test_parallel_weighted_early_exit_2_turn_loop(self):
+        """The weighted-signal threshold check works on every turn
+        of the 2-turn parallel loop, not just the last turn.
+        """
+        # Turn 0: REFLECT_CONFIDENCE: 0.5, SCORE: 9 → combined 0.5*0.5+0.5*0.9=0.7
+        # (0.7 < 0.85, no early-exit; revision runs).
+        # Turn 1: REFLECT_CONFIDENCE: 0.95, SCORE: 5 → combined 0.5*0.95+0.5*0.5=0.725
+        # Wait, that's still < 0.85. Let me use values that clear the threshold
+        # for the early-exit on the LAST turn.
+        # Turn 0: confidence 0.5, score 5 → combined 0.5 → no early-exit.
+        # Turn 1: confidence 0.95, score 5 → combined 0.5*0.95+0.5*0.5=0.725
+        # Hmm, still < 0.85. Let me increase trust_score to push it above.
+        # Actually, with trust_verbal=0.5, trust_score=0.5,
+        # combined = 0.5*conf + 0.5*score/10.
+        # For 0.95 conf and 5 score: 0.5*0.95 + 0.5*0.5 = 0.475 + 0.25 = 0.725. < 0.85.
+        # Let me use SCORE: 9 instead: 0.5*0.95 + 0.5*0.9 = 0.475 + 0.45 = 0.925. >= 0.85. Early-exit!
+        adapter = FakeAdapter(
+            [
+                _response("initial"),
+                _critique_with_score_response("c0", confidence=0.5, score=5),
+                _response("rev0"),
+                _critique_with_score_response("c1", confidence=0.95, score=9),
+                # No revision on the last turn when early-exit fires.
+            ]
+        )
+        route = _build_route(
+            reflection_turns=2,
+            early_exit=True,
+            threshold=0.85,
+            reflection_parallel=True,
+            trust_verbal=0.5,
+            trust_score=0.5,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+
+        # 4 LLM calls: initial, c0, rev0, c1. The c1 critique clears
+        # the threshold and is the last turn, so the revision is skipped.
+        assert len(adapter.calls) == 4
+        # The early-exit event is emitted at turn 1.
+        event_types = [e.type for e in ctx.events]
+        assert "reflect_early_exit" in event_types
+        # Only one early-exit (at the last turn).
+        early_exits = [e for e in ctx.events if e.type == "reflect_early_exit"]
+        assert len(early_exits) == 1
+        # The last combined signal corresponds to turn 1's critique.
+        assert ctx.__dict__["last_combined_signal"] == pytest.approx(0.925)
+        # The last score is 9 (parsed from turn 1's critique).
+        assert ctx.__dict__["last_score"] == 9
+
+    @pytest.mark.asyncio
+    async def test_parallel_existing_event_ordering_preserved(self):
+        """The weighted-signal refactor in the parallel path does NOT
+        change the v1 event ordering for the standard 2-turn full
+        loop (no early-exit).
+        """
+        adapter = FakeAdapter(
+            [
+                _response("initial"),
+                _critique_with_score_response("c0", confidence=0.5, score=5),
+                _response("rev0"),
+                _critique_with_score_response("c1", confidence=0.5, score=5),
+                _response("rev1"),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=2,
+            early_exit=True,
+            threshold=0.85,
+            reflection_parallel=True,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+
+        # The standard v1 ordering is preserved: initial, then per-turn
+        # (critique, revised, optional reflect_score when SCORE: present).
+        event_types = [e.type for e in ctx.events]
+        assert event_types == [
+            "initial",
+            "reflect_critique",
+            "reflect_score",
+            "reflect_revised",
+            "reflect_critique",
+            "reflect_score",
+            "reflect_revised",
+        ]
+        # Two reflect_score events, one per turn.
+        score_events = [e for e in ctx.events if e.type == "reflect_score"]
+        assert len(score_events) == 2
+        assert [e.turn for e in score_events] == [0, 1]
+        assert [e.text for e in score_events] == ["5", "5"]
