@@ -538,3 +538,178 @@ class TestParallelPassthrough:
         # No advisor event in the events list.
         event_types = [e.type for e in ctx.events]
         assert not any(t.startswith("advisor") for t in event_types)
+
+
+# ────────────────────────────────────────────────────────────────────
+# 4. Stream-run parallel advisor: self-reflection critique must
+#    target the original initial text, not the post-reflection text
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestStreamRunParallelAdvisorInitialText:
+    """The M4 streaming path's parallel-advisor branch must mirror
+    the buffered path's call site for :meth:`_run_advisor_parallel`:
+    it has to pass the **original** Stage-1 initial text as
+    ``initial_answer`` (not the post-reflection text).
+
+    The buffered ``Orchestrator.run`` correctly captures
+    ``initial_response.message.content`` and uses it as
+    ``initial_answer``; the streaming ``Orchestrator.stream_run``
+    must do the same. The bug previously caused
+    ``stream_run`` to pass ``current_answer`` (the
+    post-reflection text) for both arguments, so the
+    self-reflection path in :meth:`_run_advisor_parallel` built
+    its critique prompt from the post-reflection text. This
+    broke the M3+M4 contract for any client that enabled
+    ``reflection.parallel + advisor.parallel + stream: true``
+    simultaneously.
+
+    The test below exercises ``stream_run`` end-to-end with a
+    scripted :class:`FakeAdapter` (extended with a stream
+    script) and pins the self-reflection critique's input
+    message content equals the original initial text.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stream_run_parallel_advisor_critique_uses_initial_text(self):
+        """``stream_run`` with ``reflection.parallel + advisor.parallel``
+        passes the **original** Stage-1 initial text to the
+        self-reflection critique, not the post-reflection text.
+
+        Setup:
+        * ``reflection.turns: 1``, ``reflection.parallel: true`` —
+          the parallel reflection loop mutates ``current_answer``
+          to the post-reflection text.
+        * ``advisor.turns: 1``, ``advisor.parallel: true`` —
+          :meth:`Orchestrator._run_advisor_parallel` runs the
+          advisor pass AND a self-reflection on the original
+          answer concurrently. The self-reflection critique
+          must target the *initial* text, not the
+          *post-reflection* text.
+
+        The streamed initial answer uses a unique marker
+        (``"INITIAL_ANSWER"``) so the test can assert that the
+        self-reflection critique's input message content
+        contains the original initial text.
+        """
+        # Use distinct, recognisable strings for the initial and
+        # post-reflection texts so the test can pinpoint which
+        # one the self-reflection critique was built from.
+        INITIAL_TEXT = "INITIAL_ANSWER_FROM_STREAM"
+        POST_REFLECTION_TEXT = "POST_REFLECTION_REVISED_ANSWER"
+
+        adapter = FakeAdapter(
+            # The initial answer is streamed as a single chunk.
+            stream_script=[[INITIAL_TEXT]],
+            responses=[
+                # Stage 2 parallel reflection turn 0: critique.
+                _critique_response("c0", confidence=0.5),
+                # Stage 2 parallel reflection turn 0: revision.
+                _response(POST_REFLECTION_TEXT),
+                # Stage 3 self-reflection (parallel advisor): critique.
+                # The stage-3 self-reflection critique must be
+                # built from the *original* initial text
+                # (``INITIAL_TEXT``), NOT the post-reflection
+                # text. We do not constrain its response here.
+                _critique_response("csr", confidence=0.5),
+                # Stage 3 self-reflection (parallel advisor): revision.
+                _response("self-revised"),
+                # Stage 3 advisor call (ADVISOR_APPROVE so the
+                # advisor path makes no follow-up primary call).
+                _response(
+                    "ADVISOR_APPROVE",
+                    model="deepseek-v4-pro:cloud",
+                ),
+            ],
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            reflection_parallel=True,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+            advisor_parallel=True,
+        )
+        ctx = _build_context(route)
+
+        # Drive the streaming entry point end-to-end. The
+        # ``stream_run`` coroutine is an async generator; the
+        # test drains it into a list of bytes to fully consume
+        # the pipeline (including the Stage 2 reflection loop
+        # and the Stage 3 parallel advisor + self-reflection
+        # gather). The test does not assert on the SSE bytes;
+        # it asserts on the adapter call log.
+        chunks: list[bytes] = []
+        async for chunk in Orchestrator(adapter).stream_run(ctx):
+            chunks.append(chunk)
+        # Sanity: the stream terminated cleanly.
+        assert chunks, "stream_run produced no chunks"
+        assert b"data: [DONE]" in b"".join(chunks)
+
+        # The fix: the self-reflection critique's input message
+        # content contains the *original* initial text (the
+        # Stage-1 answer), NOT the post-reflection text.
+        # Identify all critique calls — those whose last
+        # user-role message starts with "Please critique the
+        # following answer:" (the revision calls' last user
+        # message starts with "Please revise" or "Please
+        # incorporate", and the advisor-revision call's last
+        # user message starts with "Please incorporate"). The
+        # critique calls are exactly two: Stage 2 reflection
+        # critique and Stage 3 self-reflection critique.
+        critique_answers: list[str] = []
+        for call in adapter.calls:
+            last_critique_user_msg: str | None = None
+            for msg in call.get("messages", []):
+                if (
+                    isinstance(msg, dict)
+                    and msg.get("role") == "user"
+                    and isinstance(msg.get("content"), str)
+                    and msg["content"].startswith(
+                        "Please critique the following answer:"
+                    )
+                ):
+                    last_critique_user_msg = msg["content"]
+            if last_critique_user_msg is not None:
+                # Check the *last* user message in the call is
+                # the critique message (not the revision /
+                # advisor-revision message that also includes
+                # a critique message earlier in the history).
+                user_messages = [
+                    m["content"]
+                    for m in call.get("messages", [])
+                    if isinstance(m, dict)
+                    and m.get("role") == "user"
+                    and isinstance(m.get("content"), str)
+                ]
+                if user_messages and user_messages[-1] == last_critique_user_msg:
+                    critique_answers.append(
+                        last_critique_user_msg.split(
+                            "Please critique the following answer:\n", 1
+                        )[1]
+                    )
+        # Both critique calls — Stage 2 reflection critique and
+        # Stage 3 self-reflection critique — must use the
+        # original initial text as the input answer. The
+        # original bug caused the Stage 3 self-reflection
+        # critique to use the post-reflection text.
+        assert critique_answers, "no critique calls were recorded"
+        assert len(critique_answers) == 2, (
+            f"expected exactly 2 critique calls "
+            f"(Stage 2 reflection + Stage 3 self-reflection), "
+            f"got {len(critique_answers)}: {critique_answers!r}"
+        )
+        for answer in critique_answers:
+            assert answer == INITIAL_TEXT, (
+                f"critique input answer is not the original initial text: "
+                f"{answer!r}"
+            )
+        # Negative pin: the post-reflection text must NOT be the
+        # answer passed to any critique call. This is the
+        # symptom of the original bug.
+        assert POST_REFLECTION_TEXT not in critique_answers, (
+            "self-reflection critique was built from the "
+            "post-reflection text; the M3+M4 contract pins the "
+            "self-reflection's input to the original initial text"
+        )

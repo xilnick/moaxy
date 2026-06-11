@@ -1416,6 +1416,20 @@ class Orchestrator:
         chunk_id = "chatcmpl-stream"
         created = int(time.time())
 
+        # The Stage-1 initial text is captured here so the
+        # parallel-advisor branch can pass it to
+        # :meth:`_run_advisor_parallel` as ``initial_answer``.
+        # The mirror of the buffered path's capture of
+        # ``initial_response.message.content``; the streaming
+        # path does not have a single ``initial_response`` object
+        # because the answer is consumed chunk-by-chunk, so the
+        # equivalent is the accumulated text after the stream
+        # completes. The variable starts as an empty string and
+        # is reassigned once the stream has produced the full
+        # initial answer; if the stream is empty the empty
+        # string is the truthful "no initial text" value.
+        initial_text: str = ""
+
         # Stage 1: stream the initial answer incrementally. The
         # adapter's ``stream()`` is an async generator yielding text
         # deltas; we wrap each delta as a chat.completion.chunk SSE
@@ -1474,6 +1488,15 @@ class Orchestrator:
             raise
 
         current_answer = "".join(current_answer_parts)
+        # Capture the Stage-1 initial text BEFORE any reflection
+        # overwrites ``current_answer``. The parallel-advisor
+        # branch in Stage 3 needs the *original* initial text
+        # for the self-reflection path's critique input; if we
+        # waited until Stage 3 to read it, ``current_answer``
+        # would already be the post-reflection text. This
+        # mirrors the buffered path's capture of
+        # ``initial_response.message.content``.
+        initial_text = current_answer
         ctx.append_event(
             "initial",
             model=initial_model_name,
@@ -1574,7 +1597,7 @@ class Orchestrator:
                     advisor_chain=advisor_chain,
                     primary_chain=model_chain,
                     history=history,
-                    initial_answer=current_answer,
+                    initial_answer=initial_text,
                     current_answer=current_answer,
                 )
             else:
