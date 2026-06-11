@@ -1977,3 +1977,552 @@ def test_package_init_exports_judge_scorer_symbols():
         DEFAULT_FALLBACK_SCORE_REEXPORT
         is scoring_module.DEFAULT_FALLBACK_SCORE
     )
+
+
+# ────────────────────────────────────────────────────────────────────
+# BenchmarkRunner
+# ────────────────────────────────────────────────────────────────────
+#
+# M7 feature m7-benchmark-harness-core: the
+# :mod:`moaxy.benchmark.harness` module owns the
+# :class:`BenchmarkRunner` class that drives the M7 benchmark
+# sweep. The contract (VAL-BENCH-003) requires:
+#
+# * ``BenchmarkRunner(models=[...], config_variants=[...],
+#   prompts=PROMPT_SET, fake_adapter=True)`` executes all
+#   ``len(models) * len(config_variants) = 8`` cells.
+# * Each cell produces a :class:`CellResult` whose
+#   ``prompt_count >= 10``.
+# * Each :class:`CellResult` has ``mean_latency_ms``,
+#   ``mean_quality``, ``mean_tokens``, ``pass_rate``, and
+#   per-prompt details.
+# * No exceptions are raised during execution.
+#
+# The :class:`TestBenchmarkRunnerHermetic` test class enforces
+# every contract invariant with a focused test, plus a single
+# table-driven test that catches any regression in one place.
+# The class uses the in-process hermetic path
+# (``fake_adapter=True``) so it does not require a real
+# OpenRouter key or a network listener.
+
+
+class TestBenchmarkRunnerHermetic:
+    """VAL-BENCH-003: BenchmarkRunner executes all 8 cells without errors.
+
+    The test class exercises the :class:`BenchmarkRunner`'s
+    hermetic path end-to-end. The runner is constructed with
+    the canonical 2-model × 4-variant sweep, the curated
+    :data:`PROMPT_SET`, and ``fake_adapter=True`` (no real
+    OpenRouter key needed). Every test method below targets
+    a single contract invariant so a failure message points
+    directly at the broken invariant.
+    """
+
+    def _build_runner(self):
+        """Build a hermetic :class:`BenchmarkRunner` over the full 2×4 sweep.
+
+        The helper is the single source of truth for the
+        runner construction; every test in the class uses it
+        so a future edit to the runner's constructor signature
+        (e.g. renaming ``fake_adapter`` to ``use_fake_adapter``)
+        only has to be updated in one place.
+        """
+        from moaxy.benchmark.harness import BenchmarkRunner
+
+        return BenchmarkRunner(
+            models=COMPARISON_MODELS,
+            config_variants=list(ConfigVariant),
+            prompts=PROMPT_SET,
+            fake_adapter=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_runner_executes_all_eight_cells(self):
+        # Contract: the runner produces one :class:`CellResult`
+        # per ``(model, variant)`` cell. With
+        # :data:`COMPARISON_MODELS` of length 2 and
+        # :class:`ConfigVariant` of length 4, the expected
+        # result count is 8. The test asserts the exact
+        # cardinality; future edits that drop a model or a
+        # variant are caught here with a clear failure
+        # message.
+        runner = self._build_runner()
+        results = await runner.execute()
+        expected = len(COMPARISON_MODELS) * len(ConfigVariant)
+        assert len(results) == expected, (
+            f"expected {expected} cells, got {len(results)}; "
+            f"each (model, variant) cell must produce exactly one CellResult"
+        )
+
+    @pytest.mark.asyncio
+    async def test_eight_cells_table(self):
+        # Single table-driven test that pins the full
+        # (model, variant) → CellResult-shape mapping in one
+        # place. A regression in any cell shows up with a
+        # clear pointer to the cell that failed. The test
+        # loops over the Cartesian product and asserts every
+        # contract invariant (CellResult type, prompt_count
+        # floor, summary-statistics presence) on every cell.
+        runner = self._build_runner()
+        results = await runner.execute()
+        assert len(results) == 8
+        seen: set[tuple[str, str]] = set()
+        for result in results:
+            from moaxy.benchmark.harness import CellResult
+
+            assert isinstance(result, CellResult), (
+                f"runner.execute() returned a non-CellResult: "
+                f"{type(result).__name__}"
+            )
+            seen.add((result.model, result.variant.value))
+            # Contract: prompt_count >= 10 (the curated
+            # :data:`PROMPT_SET` has 13; the test pins the
+            # floor so a future edit that drops below 10 is
+            # caught here).
+            assert result.prompt_count >= 10, (
+                f"cell (model={result.model!r}, "
+                f"variant={result.variant.value!r}): "
+                f"prompt_count expected >= 10, got {result.prompt_count}"
+            )
+            # Contract: each CellResult has the four summary
+            # statistics. The values are non-None when at
+            # least one prompt was scored; the hermetic path
+            # always scores every prompt (the runner's
+            # default scorer is the deterministic scorer
+            # for the three deterministic categories and 0.0
+            # for ``explain``).
+            assert result.mean_latency_ms is not None, (
+                f"cell (model={result.model!r}, "
+                f"variant={result.variant.value!r}): "
+                "mean_latency_ms is None; the cell produced no data"
+            )
+            assert result.pass_rate is not None, (
+                f"cell (model={result.model!r}, "
+                f"variant={result.variant.value!r}): "
+                "pass_rate is None; the cell produced no data"
+            )
+            assert result.prompts, (
+                f"cell (model={result.model!r}, "
+                f"variant={result.variant.value!r}): "
+                "prompts list is empty; the cell recorded no per-prompt details"
+            )
+            # Each PromptResult in the cell must be a
+            # PromptResult instance; pin the type so a future
+            # edit that returns a dict or a tuple is caught
+            # here.
+            from moaxy.benchmark.harness import PromptResult
+
+            for prompt_result in result.prompts:
+                assert isinstance(prompt_result, PromptResult), (
+                    f"cell (model={result.model!r}, "
+                    f"variant={result.variant.value!r}): "
+                    f"per-prompt entry is not a PromptResult: "
+                    f"{type(prompt_result).__name__}"
+                )
+        # Every (model, variant) cell must be present in
+        # the result list. Loop over the Cartesian product
+        # and assert the cell was produced.
+        expected_cells = {
+            (model_alias, variant.value)
+            for model_alias in COMPARISON_MODELS
+            for variant in ConfigVariant
+        }
+        missing = expected_cells - seen
+        assert not missing, (
+            f"runner.execute() did not produce cells for: {sorted(missing)!r}; "
+            f"produced cells: {sorted(seen)!r}"
+        )
+        extra = seen - expected_cells
+        assert not extra, (
+            f"runner.execute() produced unexpected cells: {sorted(extra)!r}; "
+            f"expected only: {sorted(expected_cells)!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_every_prompt_has_a_prompt_result(self):
+        # Contract: every prompt the runner was given shows
+        # up as a :class:`PromptResult` on the cell. The test
+        # asserts the cell's ``prompts`` list length equals
+        # ``len(PROMPT_SET)`` so a future edit that drops a
+        # prompt (e.g. on a teardown error) is caught here.
+        runner = self._build_runner()
+        results = await runner.execute()
+        for result in results:
+            assert len(result.prompts) == len(PROMPT_SET), (
+                f"cell (model={result.model!r}, "
+                f"variant={result.variant.value!r}): "
+                f"expected {len(PROMPT_SET)} per-prompt results, "
+                f"got {len(result.prompts)}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_cell_summary_statistics_are_floats(self):
+        # Contract: every summary statistic on the
+        # :class:`CellResult` is a float (or ``None`` when
+        # the cell produced no data). The hermetic path
+        # always produces data, so ``None`` is unexpected
+        # here. Pin the type and the non-``None`` invariant
+        # so a future edit that returns an int or a string
+        # is caught here.
+        runner = self._build_runner()
+        results = await runner.execute()
+        for result in results:
+            for field_name in (
+                "mean_latency_ms",
+                "mean_quality",
+                "mean_tokens",
+                "pass_rate",
+            ):
+                value = getattr(result, field_name)
+                assert value is not None, (
+                    f"cell (model={result.model!r}, "
+                    f"variant={result.variant.value!r}): "
+                    f"{field_name} is None; the cell produced no data"
+                )
+                assert isinstance(value, float), (
+                    f"cell (model={result.model!r}, "
+                    f"variant={result.variant.value!r}): "
+                    f"{field_name} is not a float: {type(value).__name__}"
+                )
+
+    @pytest.mark.asyncio
+    async def test_cell_result_aggregates_match_prompt_results(self):
+        # Contract: the cell's summary statistics are
+        # consistent with the per-prompt details. The test
+        # recomputes mean_latency_ms, mean_quality, and
+        # pass_rate from the per-prompt list and asserts
+        # the cell's summary matches. A future edit that
+        # changes the aggregation logic in lockstep with
+        # the per-prompt list is the only way to keep this
+        # test green; a drift in either side surfaces here
+        # with a clear failure message.
+        import statistics
+
+        runner = self._build_runner()
+        results = await runner.execute()
+        for result in results:
+            assert result.prompts, (
+                f"cell (model={result.model!r}, "
+                f"variant={result.variant.value!r}): "
+                "prompts list is empty"
+            )
+            latencies = [p.latency_ms for p in result.prompts]
+            expected_mean_latency = float(statistics.fmean(latencies))
+            assert (
+                abs(result.mean_latency_ms - expected_mean_latency) < 1e-9
+            ), (
+                f"cell (model={result.model!r}, "
+                f"variant={result.variant.value!r}): "
+                f"mean_latency_ms {result.mean_latency_ms!r} does not "
+                f"match recomputed {expected_mean_latency!r}"
+            )
+            scored = [p for p in result.prompts if p.score is not None]
+            assert scored, (
+                f"cell (model={result.model!r}, "
+                f"variant={result.variant.value!r}): "
+                "no scored prompts; cannot recompute mean_quality"
+            )
+            expected_mean_quality = float(
+                statistics.fmean([p.score for p in scored])
+            )
+            assert (
+                abs(result.mean_quality - expected_mean_quality) < 1e-9
+            ), (
+                f"cell (model={result.model!r}, "
+                f"variant={result.variant.value!r}): "
+                f"mean_quality {result.mean_quality!r} does not "
+                f"match recomputed {expected_mean_quality!r}"
+            )
+            expected_pass_rate = float(
+                sum(1 for p in scored if p.score == 1.0) / len(scored)
+            )
+            assert (
+                abs(result.pass_rate - expected_pass_rate) < 1e-9
+            ), (
+                f"cell (model={result.model!r}, "
+                f"variant={result.variant.value!r}): "
+                f"pass_rate {result.pass_rate!r} does not "
+                f"match recomputed {expected_pass_rate!r}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_runner_does_not_raise(self):
+        # Contract: the runner's ``execute()`` method does
+        # not raise any exception. A future edit that
+        # propagates an internal failure (e.g. a missing
+        # ``OPENROUTER_API_KEY``) is caught here. The
+        # runner's contract pins ``fake_adapter=True`` to
+        # mean "no real key required"; a future edit that
+        # requires the key even in hermetic mode is caught
+        # here.
+        runner = self._build_runner()
+        # The assertion is implicit: the next line must
+        # return without raising. If it raises, pytest
+        # reports the exception and the test fails.
+        results = await runner.execute()
+        assert results, "runner.execute() returned an empty list"
+
+    @pytest.mark.asyncio
+    async def test_runner_uses_fake_adapter_when_configured(self):
+        # Contract: hermetic mode wires an in-process
+        # :class:`httpx.AsyncBaseTransport` for every
+        # cell. The runner exposes the per-cell handler
+        # list at :attr:`BenchmarkRunner.hermetic_handlers`;
+        # the test asserts the list has one entry per
+        # cell (8 entries) so a future edit that drops the
+        # hermetic wiring is caught here.
+        runner = self._build_runner()
+        results = await runner.execute()
+        assert len(results) == 8
+        assert len(runner.hermetic_handlers) == 8, (
+            f"hermetic_handlers expected one entry per cell "
+            f"(8 total), got {len(runner.hermetic_handlers)}"
+        )
+        # Each handler must have a non-empty ``calls`` log
+        # (at least the initial LLM call per prompt). The
+        # exact count is not pinned (the orchestrator's
+        # reflection / advisor steps add more calls per
+        # prompt), but the log must NOT be empty.
+        for idx, handler in enumerate(runner.hermetic_handlers):
+            assert handler.calls, (
+                f"hermetic handler for cell #{idx} recorded no calls; "
+                "the runner's hermetic transport may be misconfigured"
+            )
+
+    @pytest.mark.asyncio
+    async def test_prompt_results_carry_moaxy_headers(self):
+        # Contract: the per-prompt details carry the
+        # ``x-moaxy-*`` response headers the proxy stamped
+        # on the response. The hermetic path drives the
+        # real proxy in-process, so the headers MUST be
+        # populated (the request-id middleware and the
+        # orchestrator's response builder are part of the
+        # path). Pin a few canonical headers so a future
+        # edit that breaks the proxy's header stamping is
+        # caught here.
+        runner = self._build_runner()
+        results = await runner.execute()
+        for result in results:
+            for prompt_result in result.prompts:
+                headers = prompt_result.moaxy_headers
+                # ``x-moaxy-request-id`` is stamped by the
+                # request-id middleware on every response.
+                assert "x-moaxy-request-id" in headers, (
+                    f"prompt {prompt_result.task_id!r} on cell "
+                    f"(model={result.model!r}, "
+                    f"variant={result.variant.value!r}): "
+                    "x-moaxy-request-id header missing"
+                )
+                # ``x-moaxy-alias-resolved`` is stamped by
+                # the proxy's response builder when the
+                # client's model field is an alias. Pin the
+                # header presence and the value (it must
+                # be the OpenRouter id, not the alias).
+                assert "x-moaxy-alias-resolved" in headers, (
+                    f"prompt {prompt_result.task_id!r} on cell "
+                    f"(model={result.model!r}, "
+                    f"variant={result.variant.value!r}): "
+                    "x-moaxy-alias-resolved header missing"
+                )
+                expected_resolved = MODEL_ALIASES[result.model]
+                assert (
+                    headers["x-moaxy-alias-resolved"] == expected_resolved
+                ), (
+                    f"prompt {prompt_result.task_id!r} on cell "
+                    f"(model={result.model!r}, "
+                    f"variant={result.variant.value!r}): "
+                    f"x-moaxy-alias-resolved expected {expected_resolved!r}, "
+                    f"got {headers['x-moaxy-alias-resolved']!r}"
+                )
+
+    @pytest.mark.asyncio
+    async def test_prompt_results_carry_token_usage(self):
+        # Contract: the per-prompt details carry the
+        # response's ``usage`` block (``prompt_tokens``,
+        # ``completion_tokens``, ``total_tokens``). The
+        # orchestrator accumulates usage across every
+        # LLM call in the pipeline (initial + critique +
+        # revision + advisor), so the final ``total_tokens``
+        # depends on the variant. The test pins:
+        #
+        # * the type (``int``) and the non-``None`` invariant
+        #   for all three usage fields on a successful call;
+        # * the ``total_tokens >= max(prompt_tokens,
+        #   completion_tokens)`` invariant the contract
+        #   pins for the OpenAI usage block.
+        #
+        # The exact values are not pinned because the
+        # accumulated total scales with the variant
+        # (``BASELINE`` -> 1 call; ``BOTH`` -> 4 calls).
+        runner = self._build_runner()
+        results = await runner.execute()
+        for result in results:
+            for prompt_result in result.prompts:
+                if not prompt_result.ok:
+                    continue
+                for field_name in (
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "total_tokens",
+                ):
+                    value = getattr(prompt_result, field_name)
+                    assert value is not None, (
+                        f"prompt {prompt_result.task_id!r} on cell "
+                        f"(model={result.model!r}, "
+                        f"variant={result.variant.value!r}): "
+                        f"{field_name} is None on a successful call"
+                    )
+                    assert isinstance(value, int), (
+                        f"prompt {prompt_result.task_id!r} on cell "
+                        f"(model={result.model!r}, "
+                        f"variant={result.variant.value!r}): "
+                        f"{field_name} is not an int: {type(value).__name__}"
+                    )
+                # The orchestrator accumulates usage
+                # across every LLM call; the response's
+                # ``total_tokens`` is at least the max of
+                # ``prompt_tokens`` and ``completion_tokens``.
+                assert (
+                    prompt_result.total_tokens
+                    >= max(
+                        prompt_result.prompt_tokens,
+                        prompt_result.completion_tokens,
+                    )
+                ), (
+                    f"prompt {prompt_result.task_id!r} on cell "
+                    f"(model={result.model!r}, "
+                    f"variant={result.variant.value!r}): "
+                    f"total_tokens {prompt_result.total_tokens!r} < "
+                    f"max(prompt_tokens={prompt_result.prompt_tokens!r}, "
+                    f"completion_tokens={prompt_result.completion_tokens!r})"
+                )
+
+    @pytest.mark.asyncio
+    async def test_runner_handles_uvicorn_lifecycle(self):
+        # The hermetic path drives the app in-process via
+        # :class:`httpx.ASGITransport` and does NOT start
+        # uvicorn. The contract does not require uvicorn
+        # for hermetic runs, but the runner's code path
+        # must not regress to a "must start uvicorn"
+        # branch. Pin the hermetic-handler list so a
+        # future edit that accidentally starts uvicorn in
+        # hermetic mode (and tries to bind a port) is
+        # caught here.
+        runner = self._build_runner()
+        results = await runner.execute()
+        assert len(results) == 8
+        # The hermetic path exposes a handler per cell; if
+        # the runner instead started uvicorn, the handler
+        # list would be empty (the live path does not
+        # populate it).
+        assert len(runner.hermetic_handlers) == 8, (
+            "hermetic path must populate hermetic_handlers; "
+            "if it is empty, the runner is running the live "
+            "(uvicorn) path in fake_adapter=True mode"
+        )
+
+    @pytest.mark.asyncio
+    async def test_single_cell_runner_runs_one_cell(self):
+        # The contract pins the full 2×4 sweep, but the
+        # runner is also useful for sub-sweeps (a
+        # developer who only wants to test one model
+        # against one variant). Pin the sub-sweep
+        # behaviour so the runner is reusable.
+        from moaxy.benchmark.harness import BenchmarkRunner
+
+        runner = BenchmarkRunner(
+            models=["minimax-m3"],
+            config_variants=[ConfigVariant.BASELINE],
+            prompts=PROMPT_SET,
+            fake_adapter=True,
+        )
+        results = await runner.execute()
+        assert len(results) == 1
+        assert results[0].model == "minimax-m3"
+        assert results[0].variant is ConfigVariant.BASELINE
+        assert results[0].prompt_count == len(PROMPT_SET)
+        assert results[0].prompt_count >= 10
+
+    @pytest.mark.asyncio
+    async def test_hermetic_runner_does_not_require_openrouter_api_key(
+        self, monkeypatch
+    ):
+        # Contract: the hermetic path does not require the
+        # ``OPENROUTER_API_KEY`` env var to be set. The
+        # runner sets a placeholder env var only when one
+        # is not already present. The test removes the env
+        # var (when one is set) and confirms the runner
+        # still produces 8 cells. ``monkeypatch.delenv``
+        # reverts the change at teardown so subsequent
+        # tests see the user's actual value.
+        runner = self._build_runner()
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        results = await runner.execute()
+        assert len(results) == 8, (
+            "hermetic runner must run all 8 cells without "
+            "OPENROUTER_API_KEY set in the env"
+        )
+
+    @pytest.mark.asyncio
+    async def test_hermetic_runner_restores_env_var_on_teardown(
+        self, monkeypatch
+    ):
+        # Contract: the runner does NOT leak its
+        # placeholder env var into the surrounding
+        # process. A subsequent test that gates on
+        # ``OPENROUTER_API_KEY`` (e.g. the M6
+        # ``TestOpenRouterAdapterReal`` live tests)
+        # must see the user's value, not the
+        # hermetic placeholder. The test sets a
+        # sentinel value, runs the runner, and
+        # asserts the env var equals the sentinel
+        # after the runner returns.
+        sentinel = "sentinel-key-for-env-restoration-test"
+        monkeypatch.setenv("OPENROUTER_API_KEY", sentinel)
+        runner = self._build_runner()
+        results = await runner.execute()
+        assert len(results) == 8
+        import os
+
+        assert os.environ.get("OPENROUTER_API_KEY") == sentinel, (
+            "BenchmarkRunner leaked its hermetic placeholder "
+            "into the surrounding env; the user's value "
+            f"({sentinel!r}) was overwritten"
+        )
+
+
+def test_package_init_exports_harness_symbols():
+    # The package's ``__init__`` re-exports the public
+    # harness symbols (:class:`BenchmarkRunner`,
+    # :class:`CellResult`, :class:`PromptResult`,
+    # :data:`PromptScorer`) alongside the prompt, config,
+    # and scorer types. Pin the re-exports so a future
+    # refactor of the package facade does not silently
+    # break downstream imports.
+    from moaxy.benchmark import (
+        PROMPT_SET as PROMPT_SET_REEXPORT,
+    )
+    from moaxy.benchmark import (
+        BenchmarkRunner as BenchmarkRunnerReexport,
+    )
+    from moaxy.benchmark import (
+        CellResult as CellResultReexport,
+    )
+    from moaxy.benchmark import (
+        PromptResult as PromptResultReexport,
+    )
+    from moaxy.benchmark import (
+        PromptScorer as PromptScorerReexport,
+    )
+    from moaxy.benchmark import harness as harness_module
+
+    assert BenchmarkRunnerReexport is harness_module.BenchmarkRunner
+    assert CellResultReexport is harness_module.CellResult
+    assert PromptResultReexport is harness_module.PromptResult
+    assert PromptScorerReexport is harness_module.PromptScorer
+    # Sanity: the re-exported runner and the curated prompt
+    # set are both usable from the package facade (the
+    # contract only requires the runner to be importable
+    # from the facade, not the prompt set; this is a
+    # belt-and-braces assertion).
+    assert PROMPT_SET_REEXPORT is PROMPT_SET

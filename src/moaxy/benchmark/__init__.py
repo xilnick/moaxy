@@ -19,6 +19,12 @@ from moaxy.benchmark.configs import (
     ConfigVariant,
     make_config,
 )
+from moaxy.benchmark.harness import (
+    BenchmarkRunner,
+    CellResult,
+    PromptResult,
+    PromptScorer,
+)
 from moaxy.benchmark.prompts import (
     PROMPT_SET,
     BugFixPrompt,
@@ -39,11 +45,15 @@ from moaxy.benchmark.scoring import (
 )
 
 __all__ = [
+    "BenchmarkRunner",
     "COMPARISON_MODELS",
+    "CellResult",
     "DEFAULT_FALLBACK_SCORE",
     "DEFAULT_JUDGE_MODEL",
     "LLMJudgeScorer",
     "MODEL_ALIASES",
+    "PromptResult",
+    "PromptScorer",
     "BugFixPrompt",
     "CodingPrompt",
     "ConfigVariant",
