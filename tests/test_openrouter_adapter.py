@@ -1759,7 +1759,14 @@ class TestOpenRouterAdapterReal:
     """
 
     @pytest.mark.asyncio
-    async def test_real_chat_returns_well_formed_response(self):
+    async def test_chat_completion_live(self):
+        """VAL-OR-016: live OpenRouter chat returns 200 with non-empty content.
+
+        Sends a 2-message conversation to ``anthropic/claude-3-haiku`` and
+        asserts a 200 response with non-empty
+        ``choices[0].message.content`` and non-zero ``usage.total_tokens``.
+        Uses an :class:`httpx.AsyncClient` with a 30 second timeout.
+        """
         api_key = os.environ[API_KEY_ENV_VAR]
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
@@ -1771,23 +1778,35 @@ class TestOpenRouterAdapterReal:
                 json={
                     "model": "anthropic/claude-3-haiku",
                     "messages": [
-                        {"role": "user", "content": "Reply with the single word: ok."}
+                        {"role": "user", "content": "Reply with the single word: ok."},
+                        {"role": "assistant", "content": "ok"},
+                        {"role": "user", "content": "Good. Now say hi in one short sentence."},
                     ],
-                    "max_tokens": 20,
+                    "max_tokens": 64,
                 },
             )
         assert response.status_code == 200, response.text
         data = response.json()
         assert data["choices"], "OpenRouter returned no choices"
         content = data["choices"][0]["message"]["content"]
-        # Cloud reasoning models may emit empty content with small
-        # max_tokens; the response shape is the assertion.
+        # VAL-OR-016: content is a non-empty string.
         assert isinstance(content, str)
-        assert data["usage"]["total_tokens"] >= 0
+        assert len(content) > 0, f"expected non-empty content, got {content!r}"
+        # VAL-OR-016: usage.total_tokens is non-zero.
+        assert int(data["usage"]["total_tokens"]) > 0, (
+            f"expected non-zero usage.total_tokens, got {data['usage']!r}"
+        )
 
     @pytest.mark.asyncio
-    async def test_real_stream_returns_chunks(self):
+    async def test_streaming_live(self):
+        """VAL-OR-017: live OpenRouter streaming yields at least one chunk.
+
+        Streams with ``stream: true`` and asserts the SSE chunks form a
+        non-empty concatenation. Uses an :class:`httpx.AsyncClient` with a
+        30 second timeout.
+        """
         api_key = os.environ[API_KEY_ENV_VAR]
+        body_chunks: list[str] = []
         async with httpx.AsyncClient(timeout=30.0) as client:
             async with client.stream(
                 "POST",
@@ -1799,14 +1818,15 @@ class TestOpenRouterAdapterReal:
                 json={
                     "model": "anthropic/claude-3-haiku",
                     "messages": [
-                        {"role": "user", "content": "Say hi."}
+                        {"role": "user", "content": "Say hi in two short words."},
+                        {"role": "assistant", "content": "Hello there."},
+                        {"role": "user", "content": "Great. Now count to 3."},
                     ],
-                    "max_tokens": 10,
+                    "max_tokens": 32,
                     "stream": True,
                 },
             ) as response:
-                assert response.status_code == 200
-                body_chunks: list[str] = []
+                assert response.status_code == 200, await response.aread()
                 async for line in response.aiter_lines():
                     if not line:
                         continue
@@ -1827,5 +1847,12 @@ class TestOpenRouterAdapterReal:
                     content = delta.get("content")
                     if content:
                         body_chunks.append(content)
-        # At least one content delta (or the model gave up early).
-        assert isinstance(body_chunks, list)
+        # VAL-OR-017: at least one content chunk.
+        assert len(body_chunks) >= 1, (
+            f"expected at least one streamed chunk, got {body_chunks!r}"
+        )
+        # VAL-OR-017: concatenated chunks form a non-empty string.
+        concatenated = "".join(body_chunks)
+        assert len(concatenated) > 0, (
+            f"expected non-empty streamed text, got {concatenated!r}"
+        )
