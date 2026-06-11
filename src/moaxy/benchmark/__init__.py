@@ -13,6 +13,12 @@ benchmark run output is committed under ``.benchmarks/results/`` and
 the API key is NEVER committed.
 """
 
+from moaxy.benchmark.configs import (
+    COMPARISON_MODELS,
+    MODEL_ALIASES,
+    ConfigVariant,
+    make_config,
+)
 from moaxy.benchmark.prompts import (
     PROMPT_SET,
     BugFixPrompt,
@@ -23,10 +29,14 @@ from moaxy.benchmark.prompts import (
 )
 
 __all__ = [
+    "COMPARISON_MODELS",
+    "MODEL_ALIASES",
     "BugFixPrompt",
     "CodingPrompt",
+    "ConfigVariant",
     "ExplainPrompt",
     "FunctionFromDocstringPrompt",
     "PROMPT_SET",
     "RefactorPrompt",
+    "make_config",
 ]

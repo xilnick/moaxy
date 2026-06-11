@@ -31,6 +31,12 @@ from __future__ import annotations
 import pytest
 
 from moaxy.benchmark import prompts as prompts_module
+from moaxy.benchmark.configs import (
+    COMPARISON_MODELS,
+    MODEL_ALIASES,
+    ConfigVariant,
+    make_config,
+)
 from moaxy.benchmark.prompts import (
     BUG_FIX_PROMPTS,
     FUNCTION_PROMPTS,
@@ -40,6 +46,7 @@ from moaxy.benchmark.prompts import (
     FunctionFromDocstringPrompt,
     RefactorPrompt,
 )
+from moaxy.models.config import MoaxyConfig
 
 # The four allowed category values, pinned by the contract. Tests
 # reference this constant so a future category addition is
@@ -393,3 +400,421 @@ def test_package_init_exports_prompt_symbols():
     assert BugFixPromptReexport is prompts_module.BugFixPrompt
     assert RefactorPromptReexport is prompts_module.RefactorPrompt
     assert ExplainPromptReexport is prompts_module.ExplainPrompt
+
+
+# ────────────────────────────────────────────────────────────────────
+# Config variants
+# ────────────────────────────────────────────────────────────────────
+#
+# M7 feature m7-config-variants: the
+# :mod:`moaxy.benchmark.configs` module exports a
+# :class:`ConfigVariant` enum with exactly four members
+# (BASELINE, REFLECTION_ONLY, ADVISOR_ONLY, BOTH) and a
+# :func:`make_config` factory that returns a fully-validated
+# :class:`moaxy.models.config.MoaxyConfig` for every
+# (variant, model) cell. The contract (VAL-BENCH-002) asserts:
+#
+# * 4 variants exist.
+# * All 8 configs (4 variants x 2 models) parse cleanly through
+#   :meth:`moaxy.models.config.MoaxyConfig.model_validate`.
+# * The advisor model for ADVISOR_ONLY and BOTH is the OTHER
+#   comparison model (cross-advise).
+#
+# The :class:`TestConfigVariantsContract` class below enforces every
+# contract invariant with a focused test, plus a single
+# table-driven test that catches any regression in one place.
+
+
+# The four required variant names, pinned by the contract. The
+# literal values match the string values declared on the
+# :class:`ConfigVariant` enum. The test class references this
+# constant so a future variant rename is surfaced as a test edit
+# (not a silent regression).
+REQUIRED_VARIANTS: tuple[ConfigVariant, ...] = (
+    ConfigVariant.BASELINE,
+    ConfigVariant.REFLECTION_ONLY,
+    ConfigVariant.ADVISOR_ONLY,
+    ConfigVariant.BOTH,
+)
+
+
+# The cross-advise rule expressed as a data table. The
+# ``make_config`` factory must produce a
+# :class:`moaxy.models.config.MoaxyConfig` whose
+# :attr:`~moaxy.models.config.AdvisorConfig.model` is the OTHER
+# model in :data:`COMPARISON_MODELS`. The expected advisor model
+# is the full OpenRouter id (the value of the alias in
+# :data:`MODEL_ALIASES`), not the client-facing alias.
+def _expected_advisor_model(model_alias: str) -> str:
+    """Return the OpenRouter id of the OTHER comparison model.
+
+    Mirrors :func:`moaxy.benchmark.configs._cross_advise_model`
+    so the test's expected value does not depend on a private
+    helper. The function is intentionally duplicated here so
+    the test pins the cross-advise rule by computing the
+    expected value from the public :data:`COMPARISON_MODELS`
+    and :data:`MODEL_ALIASES` tables, not by reading the
+    factory's internal helper.
+    """
+    other = [m for m in COMPARISON_MODELS if m != model_alias]
+    assert len(other) == 1, (
+        f"cross-advise lookup for {model_alias!r} expected exactly one "
+        f"OTHER model in {COMPARISON_MODELS!r}, got {other!r}"
+    )
+    return MODEL_ALIASES[other[0]]
+
+
+class TestConfigVariantsContract:
+    """VAL-BENCH-002: the 4 config variants parse cleanly.
+
+    Each test method below targets a single contract invariant.
+    The tests are deliberately small and focused so a failure
+    message points directly at the broken invariant.
+    """
+
+    def test_four_variants_exist(self):
+        # Contract: the :class:`ConfigVariant` enum has exactly
+        # four members. The expected set is pinned by
+        # :data:`REQUIRED_VARIANTS`; this test asserts both the
+        # exact set and the cardinality.
+        actual = set(ConfigVariant)
+        expected = set(REQUIRED_VARIANTS)
+        assert actual == expected, (
+            f"ConfigVariant mismatch: expected {sorted(v.name for v in expected)}, "
+            f"got {sorted(v.name for v in actual)}"
+        )
+        assert len(ConfigVariant) == 4, (
+            f"ConfigVariant must have exactly 4 members, got {len(ConfigVariant)}"
+        )
+
+    def test_required_variant_names(self):
+        # Contract: the four variant names are BASELINE,
+        # REFLECTION_ONLY, ADVISOR_ONLY, BOTH. Pin the
+        # ``.name`` attribute (Python identifier form) so a
+        # future rename of one of the values is caught here
+        # with a clear failure message.
+        names = {v.name for v in ConfigVariant}
+        assert names == {
+            "BASELINE",
+            "REFLECTION_ONLY",
+            "ADVISOR_ONLY",
+            "BOTH",
+        }, f"unexpected ConfigVariant name set: {names}"
+
+    def test_all_eight_configs_parse_cleanly(self):
+        # Contract: all 8 configs (4 variants x 2 models) parse
+        # cleanly through ``MoaxyConfig.model_validate``. Loop
+        # over the Cartesian product and assert each one
+        # round-trips. ``make_config`` returns an instance of
+        # :class:`MoaxyConfig` (which is already Pydantic-
+        # validated at construction), but the contract is
+        # explicit that the test must call ``model_validate``
+        # so a future refactor that swaps the constructor for
+        # a plain ``BaseModel`` is caught here.
+        for variant in REQUIRED_VARIANTS:
+            for model_alias in COMPARISON_MODELS:
+                config = make_config(model_alias, variant)
+                # ``model_validate`` accepts a Pydantic model
+                # (round-trip) or a dict. Passing the
+                # ``model_dump()`` form exercises the dict
+                # parsing path, which is the production
+                # loader's path.
+                round_tripped = MoaxyConfig.model_validate(config.model_dump())
+                assert isinstance(round_tripped, MoaxyConfig)
+                # The round-trip must preserve the
+                # variant-critical fields.
+                assert (
+                    round_tripped.routes[0].reflection.turns
+                    == config.routes[0].reflection.turns
+                )
+                assert (
+                    round_tripped.routes[0].advisor.turns
+                    == config.routes[0].advisor.turns
+                )
+                assert (
+                    round_tripped.routes[0].advisor.model
+                    == config.routes[0].advisor.model
+                )
+
+    def test_baseline_reflection_and_advisor_disabled(self):
+        # Contract: ``make_config(model, BASELINE)`` returns a
+        # config with ``reflection.turns == 0`` and
+        # ``advisor.turns == 0``. The advisor ``model`` is
+        # ``None`` (no advisor call is made) but the contract
+        # does not require that field to be ``None``; we
+        # assert it as a sanity check.
+        for model_alias in COMPARISON_MODELS:
+            config = make_config(model_alias, ConfigVariant.BASELINE)
+            assert len(config.routes) == 1
+            route = config.routes[0]
+            assert route.reflection.turns == 0, (
+                f"BASELINE for {model_alias!r} expected "
+                f"reflection.turns=0, got {route.reflection.turns}"
+            )
+            assert route.advisor.turns == 0, (
+                f"BASELINE for {model_alias!r} expected "
+                f"advisor.turns=0, got {route.advisor.turns}"
+            )
+            assert route.advisor.model is None, (
+                f"BASELINE for {model_alias!r} expected "
+                f"advisor.model=None, got {route.advisor.model!r}"
+            )
+
+    def test_reflection_only_runs_one_reflection_turn(self):
+        # Contract: ``make_config(model, REFLECTION_ONLY)``
+        # returns a config with ``reflection.turns == 1`` and
+        # ``advisor.turns == 0``.
+        for model_alias in COMPARISON_MODELS:
+            config = make_config(model_alias, ConfigVariant.REFLECTION_ONLY)
+            route = config.routes[0]
+            assert route.reflection.turns == 1, (
+                f"REFLECTION_ONLY for {model_alias!r} expected "
+                f"reflection.turns=1, got {route.reflection.turns}"
+            )
+            assert route.advisor.turns == 0, (
+                f"REFLECTION_ONLY for {model_alias!r} expected "
+                f"advisor.turns=0, got {route.advisor.turns}"
+            )
+            assert route.advisor.model is None, (
+                f"REFLECTION_ONLY for {model_alias!r} expected "
+                f"advisor.model=None, got {route.advisor.model!r}"
+            )
+
+    def test_advisor_only_uses_cross_advise_model(self):
+        # Contract: ``make_config(model, ADVISOR_ONLY)`` returns
+        # a config with ``reflection.turns == 0``,
+        # ``advisor.turns == 1``, and
+        # ``advisor.model == <OTHER comparison model's
+        # OpenRouter id>``.
+        for model_alias in COMPARISON_MODELS:
+            config = make_config(model_alias, ConfigVariant.ADVISOR_ONLY)
+            route = config.routes[0]
+            assert route.reflection.turns == 0, (
+                f"ADVISOR_ONLY for {model_alias!r} expected "
+                f"reflection.turns=0, got {route.reflection.turns}"
+            )
+            assert route.advisor.turns == 1, (
+                f"ADVISOR_ONLY for {model_alias!r} expected "
+                f"advisor.turns=1, got {route.advisor.turns}"
+            )
+            expected = _expected_advisor_model(model_alias)
+            assert route.advisor.model == expected, (
+                f"ADVISOR_ONLY for {model_alias!r} expected "
+                f"advisor.model={expected!r} (cross-advise), "
+                f"got {route.advisor.model!r}"
+            )
+
+    def test_both_runs_reflection_and_advisor_with_cross_advise(self):
+        # Contract: ``make_config(model, BOTH)`` returns a
+        # config with ``reflection.turns == 1``,
+        # ``advisor.turns == 1``, and ``advisor.model == the
+        # OTHER comparison model's OpenRouter id``.
+        for model_alias in COMPARISON_MODELS:
+            config = make_config(model_alias, ConfigVariant.BOTH)
+            route = config.routes[0]
+            assert route.reflection.turns == 1, (
+                f"BOTH for {model_alias!r} expected "
+                f"reflection.turns=1, got {route.reflection.turns}"
+            )
+            assert route.advisor.turns == 1, (
+                f"BOTH for {model_alias!r} expected "
+                f"advisor.turns=1, got {route.advisor.turns}"
+            )
+            expected = _expected_advisor_model(model_alias)
+            assert route.advisor.model == expected, (
+                f"BOTH for {model_alias!r} expected "
+                f"advisor.model={expected!r} (cross-advise), "
+                f"got {route.advisor.model!r}"
+            )
+
+    def test_cross_advise_is_symmetric(self):
+        # The cross-advise rule is symmetric: the advisor for
+        # ``minimax-m3`` is the OpenRouter id of
+        # ``mimo-v2.5-pro``, and the advisor for
+        # ``mimo-v2.5-pro`` is the OpenRouter id of
+        # ``minimax-m3``. Pin the symmetry so a future edit
+        # that flips the rule to a one-sided mapping is caught
+        # here.
+        config_a = make_config("minimax-m3", ConfigVariant.ADVISOR_ONLY)
+        config_b = make_config("mimo-v2.5-pro", ConfigVariant.ADVISOR_ONLY)
+        assert (
+            config_a.routes[0].advisor.model
+            == MODEL_ALIASES["mimo-v2.5-pro"]
+        )
+        assert (
+            config_b.routes[0].advisor.model
+            == MODEL_ALIASES["minimax-m3"]
+        )
+
+    def test_eight_cell_table(self):
+        # Single table-driven test that pins the full
+        # (variant, model) → expected settings mapping in one
+        # place. A regression in any cell shows up with a
+        # clear pointer to the cell that failed.
+        expected_table: dict[
+            tuple[ConfigVariant, str], dict[str, int | str | None]
+        ] = {
+            (ConfigVariant.BASELINE, "minimax-m3"): {
+                "reflection_turns": 0,
+                "advisor_turns": 0,
+                "advisor_model": None,
+            },
+            (ConfigVariant.BASELINE, "mimo-v2.5-pro"): {
+                "reflection_turns": 0,
+                "advisor_turns": 0,
+                "advisor_model": None,
+            },
+            (ConfigVariant.REFLECTION_ONLY, "minimax-m3"): {
+                "reflection_turns": 1,
+                "advisor_turns": 0,
+                "advisor_model": None,
+            },
+            (ConfigVariant.REFLECTION_ONLY, "mimo-v2.5-pro"): {
+                "reflection_turns": 1,
+                "advisor_turns": 0,
+                "advisor_model": None,
+            },
+            (ConfigVariant.ADVISOR_ONLY, "minimax-m3"): {
+                "reflection_turns": 0,
+                "advisor_turns": 1,
+                "advisor_model": MODEL_ALIASES["mimo-v2.5-pro"],
+            },
+            (ConfigVariant.ADVISOR_ONLY, "mimo-v2.5-pro"): {
+                "reflection_turns": 0,
+                "advisor_turns": 1,
+                "advisor_model": MODEL_ALIASES["minimax-m3"],
+            },
+            (ConfigVariant.BOTH, "minimax-m3"): {
+                "reflection_turns": 1,
+                "advisor_turns": 1,
+                "advisor_model": MODEL_ALIASES["mimo-v2.5-pro"],
+            },
+            (ConfigVariant.BOTH, "mimo-v2.5-pro"): {
+                "reflection_turns": 1,
+                "advisor_turns": 1,
+                "advisor_model": MODEL_ALIASES["minimax-m3"],
+            },
+        }
+        assert len(expected_table) == 8, (
+            f"expected table must have 8 cells, got {len(expected_table)}"
+        )
+        for (variant, model_alias), expected in expected_table.items():
+            config = make_config(model_alias, variant)
+            route = config.routes[0]
+            assert route.reflection.turns == expected["reflection_turns"], (
+                f"cell (variant={variant.name!r}, model={model_alias!r}): "
+                f"reflection.turns expected {expected['reflection_turns']}, "
+                f"got {route.reflection.turns}"
+            )
+            assert route.advisor.turns == expected["advisor_turns"], (
+                f"cell (variant={variant.name!r}, model={model_alias!r}): "
+                f"advisor.turns expected {expected['advisor_turns']}, "
+                f"got {route.advisor.turns}"
+            )
+            assert route.advisor.model == expected["advisor_model"], (
+                f"cell (variant={variant.name!r}, model={model_alias!r}): "
+                f"advisor.model expected {expected['advisor_model']!r}, "
+                f"got {route.advisor.model!r}"
+            )
+
+    def test_every_config_has_openrouter_backend(self):
+        # Contract: every variant routes the model to the
+        # openrouter backend. Pin the backend's ``adapter``
+        # field (``"openrouter"``) and its ``base_url``
+        # (OpenRouter's canonical default) so a future edit
+        # that swaps the backend to ``"ollama"`` or
+        # ``"openai"`` is caught here.
+        for variant in REQUIRED_VARIANTS:
+            for model_alias in COMPARISON_MODELS:
+                config = make_config(model_alias, variant)
+                assert len(config.backends) == 1, (
+                    f"cell (variant={variant.name!r}, model={model_alias!r}): "
+                    f"expected 1 backend, got {len(config.backends)}"
+                )
+                backend = config.backends[0]
+                assert backend.adapter == "openrouter", (
+                    f"cell (variant={variant.name!r}, model={model_alias!r}): "
+                    f"backend.adapter expected 'openrouter', "
+                    f"got {backend.adapter!r}"
+                )
+                assert backend.base_url == "https://openrouter.ai/api/v1", (
+                    f"cell (variant={variant.name!r}, model={model_alias!r}): "
+                    f"backend.base_url expected "
+                    f"'https://openrouter.ai/api/v1', got {backend.base_url!r}"
+                )
+                # The route's ``backend`` field must reference
+                # the configured backend by name.
+                assert config.routes[0].backend == backend.name, (
+                    f"cell (variant={variant.name!r}, model={model_alias!r}): "
+                    f"route.backend expected {backend.name!r}, "
+                    f"got {config.routes[0].backend!r}"
+                )
+
+    def test_every_config_aliases_alias_to_openrouter_id(self):
+        # Contract: each config has a single route that maps
+        # the model alias to the full OpenRouter model id.
+        # Pin the alias table on every cell so a future edit
+        # that drops the alias (or rewrites it to the
+        # already-resolved name) is caught here.
+        for variant in REQUIRED_VARIANTS:
+            for model_alias in COMPARISON_MODELS:
+                config = make_config(model_alias, variant)
+                route = config.routes[0]
+                expected_id = MODEL_ALIASES[model_alias]
+                assert route.aliases == {model_alias: expected_id}, (
+                    f"cell (variant={variant.name!r}, model={model_alias!r}): "
+                    f"route.aliases expected {model_alias!r} → "
+                    f"{expected_id!r}, got {route.aliases!r}"
+                )
+                # The route's ``match.model`` is the alias (the
+                # client sends the alias; the matcher rewrites
+                # it via the alias table). Pin the match glob
+                # to catch a future edit that points the
+                # matcher at the OpenRouter id directly.
+                assert route.match.model == model_alias, (
+                    f"cell (variant={variant.name!r}, model={model_alias!r}): "
+                    f"route.match.model expected {model_alias!r}, "
+                    f"got {route.match.model!r}"
+                )
+                assert route.match.path == "/v1/chat/completions", (
+                    f"cell (variant={variant.name!r}, model={model_alias!r}): "
+                    f"route.match.path expected '/v1/chat/completions', "
+                    f"got {route.match.path!r}"
+                )
+
+    def test_make_config_rejects_unknown_model(self):
+        # Sanity: passing a model that is not in
+        # :data:`COMPARISON_MODELS` raises :class:`ValueError`
+        # rather than silently producing a config with no
+        # alias match. The benchmark sweep is restricted to
+        # the canonical two-model set; an unknown alias is a
+        # programmer error.
+        with pytest.raises(ValueError):
+            make_config("not-a-comparison-model", ConfigVariant.BASELINE)
+
+
+def test_package_init_exports_config_symbols():
+    # The package's ``__init__`` re-exports the public config
+    # symbols (``ConfigVariant``, ``make_config``,
+    # ``COMPARISON_MODELS``, ``MODEL_ALIASES``) alongside the
+    # prompt types. Pin the re-exports so a future refactor of
+    # the package facade does not silently break downstream
+    # imports.
+    from moaxy.benchmark import (
+        COMPARISON_MODELS as COMPARISON_MODELS_REEXPORT,
+    )
+    from moaxy.benchmark import (
+        MODEL_ALIASES as MODEL_ALIASES_REEXPORT,
+    )
+    from moaxy.benchmark import (
+        ConfigVariant as ConfigVariantReexport,
+    )
+    from moaxy.benchmark import configs as configs_module
+    from moaxy.benchmark import (
+        make_config as make_config_reexport,
+    )
+
+    assert ConfigVariantReexport is configs_module.ConfigVariant
+    assert make_config_reexport is configs_module.make_config
+    assert COMPARISON_MODELS_REEXPORT is configs_module.COMPARISON_MODELS
+    assert MODEL_ALIASES_REEXPORT is configs_module.MODEL_ALIASES
