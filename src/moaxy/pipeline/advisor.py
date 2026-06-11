@@ -14,15 +14,23 @@ Algorithm
    :func:`moaxy.pipeline.message_builders.build_advisor_messages`.
 2. Call the configured adapter with the requested advisor model.
 3. Parse the assistant content with :func:`parse_advisor_response`:
-   the parser returns a ``(decision, text)`` tuple where
-   ``decision`` is one of ``"approve"`` or ``"revise"`` and ``text``
-   is the revised answer (or ``None`` on approve).
-4. Parse the cross-critique markers additively:
-   :func:`parse_advisor_score` extracts the integer from the last
-   ``ADVISOR_SCORE:`` line; :func:`parse_advisor_issues` extracts
-   the bulleted issue list from the ``ADVISOR_ISSUES:`` block. Both
-   helpers are pure and independent of the legacy
+   the parser returns a ``(decision, revised_text, score, issues)``
+   4-tuple. ``decision`` is one of ``"approve"`` or ``"revise"``;
+   ``revised_text`` is the revised answer (or ``None`` on
+   approve); ``score`` is the parsed integer from the last
+   ``ADVISOR_SCORE: <int>`` line (``None`` when missing); and
+   ``issues`` is the bulleted list extracted from the
+   ``ADVISOR_ISSUES:`` block (``[]`` when missing).
+4. The cross-critique fields (decision / score / issues) are
+   extracted additively on top of the legacy
    ``ADVISOR_APPROVE`` / ``ADVISOR_REVISE:`` substring parsers.
+   When the new ``ADVISOR_DECISION: APPROVE|REVISE`` line is
+   present it takes precedence over the legacy
+   ``ADVISOR_APPROVE`` substring; otherwise the legacy parser
+   continues to be the source of truth for the decision. The
+   score and issues are always extracted (independent of the
+   decision path) so callers see the full cross-critique
+   context regardless of which decision marker the model used.
 5. Run the configured :class:`moaxy.plugins.types.PluginType.ADVISOR`
    plugins via :meth:`moaxy.plugins.manager.PluginManager.run`. The
    plugin context receives ``advisor_decision`` and
@@ -74,50 +82,129 @@ _ADVISOR_ISSUES_HEADER_RE: re.Pattern[str] = re.compile(
     re.MULTILINE,
 )
 
+# Anchored regex that captures the cross-critique decision line
+# ``ADVISOR_DECISION: APPROVE`` or ``ADVISOR_DECISION: REVISE``
+# (case-sensitive, anchored per line, MULTILINE). The captured
+# group is the decision keyword, trimmed and uppercased. When
+# the line is missing the regex returns ``None`` and the parser
+# falls back to the legacy ``ADVISOR_APPROVE`` / ``ADVISOR_REVISE:``
+# substring parsers for the decision.
+_ADVISOR_DECISION_RE: re.Pattern[str] = re.compile(
+    r"^ADVISOR_DECISION:\s*(APPROVE|REVISE)\s*$",
+    re.MULTILINE,
+)
 
-def parse_advisor_response(text: str | None) -> tuple[str, str | None]:
-    """Return ``(decision, revised_text)`` for the advisor's reply.
 
-    The helper inspects the assistant content returned by the advisor
-    LLM call. It supports two markers:
+def parse_advisor_response(
+    text: str | None,
+) -> tuple[str, str | None, int | None, list[str]]:
+    """Return ``(decision, revised_text, score, issues)`` for the advisor's reply.
 
-    * ``ADVISOR_APPROVE`` — anywhere in the text. The decision is
-      ``"approve"`` and ``revised_text`` is ``None``. Extra text
-      alongside the marker is ignored.
-    * ``ADVISOR_REVISE: <text>`` — the marker followed by the revised
-      answer. The decision is ``"revise"`` and ``revised_text`` is
-      the trimmed text after the marker.
+    The helper inspects the assistant content returned by the
+    advisor LLM call and returns a 4-tuple covering the legacy
+    decision path AND the cross-critique fields. The four
+    elements are:
 
-    When neither marker is present, the helper defaults to
-    ``("revise", text)`` so the orchestrator treats the entire
-    reply as the revised answer. This is the conservative
-    fallback: a model that "intended" to revise but forgot the
-    prefix still feeds a revision to the primary model.
+    * ``decision`` — the string ``"approve"`` or ``"revise"``.
+    * ``revised_text`` — ``None`` on approve; the trimmed
+      revised text on revise; or the entire input ``text`` when
+      no marker is present (the conservative fallback for a
+      model that intended to revise but forgot the prefix).
+    * ``score`` — the integer parsed from the last
+      ``ADVISOR_SCORE: <int>`` line, or ``None`` when the line
+      is missing / malformed.
+    * ``issues`` — the bulleted list extracted from the
+      ``ADVISOR_ISSUES:`` block, or ``[]`` when the block is
+      missing or empty.
+
+    Decision resolution
+    -------------------
+
+    The parser applies a small precedence ladder so a model can
+    emit either the legacy substring markers or the new
+    ``ADVISOR_DECISION:`` line (or both) without ambiguity:
+
+    1. When the ``ADVISOR_DECISION: APPROVE|REVISE`` line is
+       present, the captured value decides ``decision`` and
+       ``ADVISOR_REVISE: <text>`` (if present) supplies
+       ``revised_text``; otherwise the whole text is the
+       revised text.
+    2. When no ``ADVISOR_DECISION:`` line is present but
+       ``ADVISOR_APPROVE`` is a substring, the decision is
+       ``"approve"`` and ``revised_text`` is ``None`` (matches
+       the v1-v4 contract; substring matching is preserved for
+       backward compatibility).
+    3. When ``ADVISOR_REVISE: <text>`` is present (and step 1/2
+       did not match), the decision is ``"revise"`` and
+       ``revised_text`` is the trimmed text after the marker.
+    4. Otherwise the decision is ``"revise"`` (conservative
+       fallback) and ``revised_text`` is the trimmed input.
+
+    Score and issues are always parsed from the input via
+    :func:`parse_advisor_score` and :func:`parse_advisor_issues`
+    regardless of which decision path was taken, so a model
+    that emits the cross-critique fields alongside a legacy
+    decision marker (e.g. ``ADVISOR_APPROVE\nADVISOR_SCORE: 8``)
+    still gets the score surfaced.
 
     Args:
         text: The assistant content returned by the advisor. May
             be ``None`` or a non-string; in that case the helper
-            returns ``("revise", "")`` rather than raising.
+            returns ``("revise", "", None, [])`` rather than
+            raising.
 
     Returns:
-        A ``(decision, revised_text)`` tuple. ``decision`` is the
-        string ``"approve"`` or ``"revise"``; ``revised_text`` is
-        ``None`` on approve, the trimmed revised text on revise,
-        or the original ``text`` when no marker is present.
+        A 4-tuple ``(decision, revised_text, score, issues)``.
+        ``decision`` is one of ``"approve"`` / ``"revise"``;
+        ``revised_text`` is ``None`` on approve or the trimmed
+        revised text on revise; ``score`` is the integer
+        ``ADVISOR_SCORE:`` value or ``None``; ``issues`` is the
+        parsed bullet list (``[]`` when missing).
     """
     if not isinstance(text, str) or not text:
-        return "revise", text if isinstance(text, str) else ""
+        return (
+            "revise",
+            text if isinstance(text, str) else "",
+            None,
+            [],
+        )
 
+    # Cross-critique fields: always extracted (additive to the
+    # decision). The helpers are pure and tolerant of missing /
+    # malformed input — see :func:`parse_advisor_score` and
+    # :func:`parse_advisor_issues` for the exact semantics.
+    score = parse_advisor_score(text)
+    issues = parse_advisor_issues(text)
+
+    # Step 1: ``ADVISOR_DECISION:`` line takes precedence.
+    decision_match = _ADVISOR_DECISION_RE.search(text)
+    if decision_match is not None:
+        decision_value = decision_match.group(1).upper()
+        if decision_value == "APPROVE":
+            return "approve", None, score, issues
+        # ``REVISE``: prefer the ``ADVISOR_REVISE: <text>`` marker
+        # for the revised text; fall back to the whole input when
+        # the marker is absent (mirrors the v1-v4 conservative
+        # fallback for missing marker).
+        revise_idx = text.find(_REVISE_MARKER)
+        if revise_idx >= 0:
+            after = text[revise_idx + len(_REVISE_MARKER):]
+            return "revise", after.strip(), score, issues
+        return "revise", text.strip(), score, issues
+
+    # Step 2: legacy ``ADVISOR_APPROVE`` substring.
     approve_idx = text.find(_APPROVE_MARKER)
     if approve_idx >= 0:
-        return "approve", None
+        return "approve", None, score, issues
 
+    # Step 3: legacy ``ADVISOR_REVISE: <text>`` marker.
     revise_idx = text.find(_REVISE_MARKER)
     if revise_idx >= 0:
         after = text[revise_idx + len(_REVISE_MARKER):]
-        return "revise", after.strip()
+        return "revise", after.strip(), score, issues
 
-    return "revise", text.strip()
+    # Step 4: conservative fallback — treat the whole input as a revise.
+    return "revise", text.strip(), score, issues
 
 
 def parse_advisor_score(text: str | None) -> int | None:
@@ -272,7 +359,9 @@ async def advisor_turn(
     manager is present in the context). The plugin context receives
     ``advisor_decision`` (``"approve"`` or ``"revise"``) and
     ``advisor_text`` (the full assistant content) so plugins can
-    inspect the advisor's verdict.
+    inspect the advisor's verdict. The M5 cross-critique fields
+    (``advisor_score`` and ``advisor_issues``) are also seeded on
+    the context so plugins and observers can read them.
 
     Args:
         ctx: A dict carrying the per-request state. The advisor reads
@@ -299,12 +388,19 @@ async def advisor_turn(
             :data:`moaxy.pipeline.prompts.DEFAULT_ADVISOR_PROMPT`.
 
     Returns:
-        A ``(decision, revised_text)`` tuple. ``decision`` is the
-        string ``"approve"`` or ``"revise"``. ``revised_text`` is
-        ``None`` on approve; on revise it is the trimmed text
+        A ``(decision, revised_text)`` 2-tuple. ``decision`` is
+        the string ``"approve"`` or ``"revise"``. ``revised_text``
+        is ``None`` on approve; on revise it is the trimmed text
         returned by :func:`parse_advisor_response` (the entire
         assistant content when the ``ADVISOR_REVISE:`` marker is
-        missing).
+        missing). The function does NOT return the score or the
+        issues; those are surfaced on the context dict
+        (``ctx["advisor_score"]`` and ``ctx["advisor_issues"]``)
+        so plugins and orchestrator observers can read them
+        without the function signature carrying four elements
+        (the orchestrator's caller unpacks the 2-tuple). The
+        full cross-critique fields remain available via
+        :func:`parse_advisor_response`'s 4-tuple return.
 
     Raises:
         KeyError: ``ctx`` does not contain an ``"adapter"`` key.
@@ -323,12 +419,16 @@ async def advisor_turn(
     )
     response = await adapter.chat(model=advisor_model, messages=messages)
     text = response.message.content
-    decision, revised_text = parse_advisor_response(text)
+    decision, revised_text, advisor_score, advisor_issues = (
+        parse_advisor_response(text)
+    )
 
     logger.debug(
-        "advisor_turn: model=%s decision=%s len(text)=%d",
+        "advisor_turn: model=%s decision=%s score=%s issues=%d len(text)=%d",
         advisor_model,
         decision,
+        advisor_score,
+        len(advisor_issues),
         len(text),
     )
 
@@ -338,6 +438,12 @@ async def advisor_turn(
     ctx["advisor_revised_text"] = revised_text
     ctx["advisor_model"] = advisor_model
     ctx["advisor_response"] = response
+    # M5 cross-critique fields: ``advisor_score`` and ``advisor_issues``
+    # are surfaced on the context so plugins and orchestrator
+    # observers can read them. The values come straight from the
+    # 4-tuple return of :func:`parse_advisor_response`.
+    ctx["advisor_score"] = advisor_score
+    ctx["advisor_issues"] = advisor_issues
 
     if plugin_manager is not None:
         await plugin_manager.run(ctx, plugin_types=[PluginType.ADVISOR])

@@ -1081,8 +1081,16 @@ class Orchestrator:
         # Pre-seed the parsed verdict so plugins can read it; the helper
         # re-parses the text to derive these values, so this is a no-op
         # when the helper's parser agrees (which it always does for the
-        # well-defined ADVISOR_* markers).
-        decision, revised_text = parse_advisor_response(text)
+        # well-defined ADVISOR_* markers). The M5 cross-critique
+        # fields (score, issues) are extracted by the parser; we
+        # surface them on the plugin context so ADVISOR plugins can
+        # inspect them. The 4-tuple return is unpacked here; the
+        # extra fields are ignored by the orchestrator's flow but
+        # the runtime attributes are set on the pipeline context
+        # later (see the build_response_headers DELTA 6 block).
+        decision, revised_text, _advisor_score, _advisor_issues = (
+            parse_advisor_response(text)
+        )
         plugin_ctx["advisor_decision"] = decision
         plugin_ctx["advisor_text"] = text
         plugin_ctx["advisor_revised_text"] = revised_text

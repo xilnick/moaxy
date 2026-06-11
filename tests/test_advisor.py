@@ -186,19 +186,19 @@ class TestParseAdvisorApprove:
     """The parser recognises ``ADVISOR_APPROVE`` (optionally with extra text)."""
 
     def test_plain_approve(self):
-        decision, text = parse_advisor_response("ADVISOR_APPROVE")
+        decision, text, _score, _issues = parse_advisor_response("ADVISOR_APPROVE")
         assert decision == "approve"
         assert text is None
 
     def test_approve_with_trailing_whitespace(self):
-        decision, text = parse_advisor_response("ADVISOR_APPROVE   \n")
+        decision, text, _score, _issues = parse_advisor_response("ADVISOR_APPROVE   \n")
         assert decision == "approve"
         assert text is None
 
     def test_approve_with_explanatory_text(self):
         # The advisor may include explanation; any text alongside the
         # marker is treated as approval.
-        decision, text = parse_advisor_response(
+        decision, text, _score, _issues = parse_advisor_response(
             "The previous answer is good.\nADVISOR_APPROVE"
         )
         assert decision == "approve"
@@ -206,34 +206,34 @@ class TestParseAdvisorApprove:
 
     def test_approve_uppercase_only(self):
         # The marker is case-sensitive; lowercase variants are not approve.
-        assert parse_advisor_response("advisor_approve") == ("revise", "advisor_approve")
-        assert parse_advisor_response("Advisor_Approve") == ("revise", "Advisor_Approve")
+        assert parse_advisor_response("advisor_approve") == ("revise", "advisor_approve", None, [])
+        assert parse_advisor_response("Advisor_Approve") == ("revise", "Advisor_Approve", None, [])
 
     def test_approve_substring_is_treated_as_approve(self):
         # Substring matching is the historical contract (the parser uses
         # ``ADVISOR_APPROVE in text``). A substring occurrence anywhere
         # in the text is treated as approval. This matches the existing
         # orchestrator behaviour for backwards compatibility.
-        assert parse_advisor_response("XADVISOR_APPROVE") == ("approve", None)
+        assert parse_advisor_response("XADVISOR_APPROVE") == ("approve", None, None, [])
 
 
 class TestParseAdvisorRevise:
     """The parser returns the text after ``ADVISOR_REVISE:`` on a revise."""
 
     def test_revise_with_text(self):
-        decision, text = parse_advisor_response("ADVISOR_REVISE: better answer")
+        decision, text, _score, _issues = parse_advisor_response("ADVISOR_REVISE: better answer")
         assert decision == "revise"
         assert text == "better answer"
 
     def test_revise_with_leading_newline(self):
-        decision, text = parse_advisor_response(
+        decision, text, _score, _issues = parse_advisor_response(
             "ADVISOR_REVISE:\nthis is the new answer"
         )
         assert decision == "revise"
         assert text == "this is the new answer"
 
     def test_revise_with_multiline_text(self):
-        decision, text = parse_advisor_response(
+        decision, text, _score, _issues = parse_advisor_response(
             "ADVISOR_REVISE: line1\nline2\nline3"
         )
         assert decision == "revise"
@@ -242,7 +242,7 @@ class TestParseAdvisorRevise:
     def test_revise_with_explanatory_text_before_marker(self):
         # The advisor may explain its reasoning before the marker; only
         # the text after the marker is treated as the revised answer.
-        decision, text = parse_advisor_response(
+        decision, text, _score, _issues = parse_advisor_response(
             "Here is my critique of the previous answer.\n"
             "ADVISOR_REVISE: the final improved answer"
         )
@@ -251,14 +251,14 @@ class TestParseAdvisorRevise:
 
     def test_revise_text_is_stripped(self):
         # Leading and trailing whitespace on the revised text is removed.
-        decision, text = parse_advisor_response("ADVISOR_REVISE:    \n answer \n  ")
+        decision, text, _score, _issues = parse_advisor_response("ADVISOR_REVISE:    \n answer \n  ")
         assert decision == "revise"
         assert text == "answer"
 
     def test_revise_with_empty_text_after_marker(self):
         # The marker may be present but the text is empty; the decision
         # is still "revise" and the text is an empty string.
-        decision, text = parse_advisor_response("ADVISOR_REVISE:")
+        decision, text, _score, _issues = parse_advisor_response("ADVISOR_REVISE:")
         assert decision == "revise"
         assert text == ""
 
@@ -267,52 +267,70 @@ class TestParseAdvisorMissing:
     """When neither marker is present, the helper treats the text as a revise."""
 
     def test_plain_text_treated_as_revise(self):
-        decision, text = parse_advisor_response("just a plain response")
+        decision, text, _score, _issues = parse_advisor_response("just a plain response")
         assert decision == "revise"
         assert text == "just a plain response"
 
     def test_empty_string_treated_as_revise(self):
-        decision, text = parse_advisor_response("")
+        decision, text, _score, _issues = parse_advisor_response("")
         assert decision == "revise"
         assert text == ""
 
     def test_only_whitespace_treated_as_revise(self):
-        decision, text = parse_advisor_response("   \n\n  ")
+        decision, text, _score, _issues = parse_advisor_response("   \n\n  ")
         assert decision == "revise"
         assert text == ""
 
     def test_non_string_input_treated_as_revise(self):
         # The helper is defensive against non-string input.
-        decision, text = parse_advisor_response(None)  # type: ignore[arg-type]
+        decision, text, _score, _issues = parse_advisor_response(None)  # type: ignore[arg-type]
         assert decision == "revise"
         assert text is None or text == ""
 
 
 class TestParseAdvisorReturnsTuple:
-    """The helper always returns a 2-tuple ``(decision, text)``."""
+    """The helper always returns a 4-tuple ``(decision, text, score, issues)``."""
 
     def test_returns_tuple_of_str_and_optional(self):
         result = parse_advisor_response("ADVISOR_APPROVE")
         assert isinstance(result, tuple)
-        assert len(result) == 2
-        decision, text = result
+        assert len(result) == 4
+        decision, text, score, issues = result
         assert isinstance(decision, str)
         assert decision in {"approve", "revise"}
 
     def test_approve_text_is_none(self):
-        _decision, text = parse_advisor_response("ADVISOR_APPROVE")
+        _decision, text, _score, _issues = parse_advisor_response("ADVISOR_APPROVE")
         assert text is None
 
     def test_revise_text_is_string(self):
-        _decision, text = parse_advisor_response("ADVISOR_REVISE: x")
+        _decision, text, _score, _issues = parse_advisor_response("ADVISOR_REVISE: x")
         assert isinstance(text, str)
+
+    def test_legacy_approve_score_is_none(self):
+        # The cross-critique fields default to ``None`` / ``[]`` when
+        # the model emits only the legacy ``ADVISOR_APPROVE`` marker.
+        _decision, _text, score, issues = parse_advisor_response(
+            "ADVISOR_APPROVE"
+        )
+        assert score is None
+        assert issues == []
+
+    def test_legacy_revise_score_is_none(self):
+        # The cross-critique fields default to ``None`` / ``[]`` when
+        # the model emits only the legacy ``ADVISOR_REVISE:`` marker.
+        _decision, _text, score, issues = parse_advisor_response(
+            "ADVISOR_REVISE: better answer"
+        )
+        assert score is None
+        assert issues == []
 
 
 class TestParseAdvisorPrecedence:
     """When both markers appear, the parser picks the first one in the text."""
 
     def test_approve_first_wins(self):
-        decision, text = parse_advisor_response(
+        decision, text, _score, _issues = parse_advisor_response(
             "ADVISOR_APPROVE\nADVISOR_REVISE: ignored"
         )
         assert decision == "approve"
@@ -323,11 +341,355 @@ class TestParseAdvisorPrecedence:
         # decision is revise. (The reverse case ``revise then approve``
         # resolves to approve because the parser checks the approve
         # marker first; that's the documented order.)
-        decision, text = parse_advisor_response(
+        decision, text, _score, _issues = parse_advisor_response(
             "ADVISOR_REVISE: this one"
         )
         assert decision == "revise"
         assert text == "this one"
+
+
+# ────────────────────────────────────────────────────────────────────
+# Cross-critique parser (DELTA 2 / VAL-PIPE-EXTRA-004, 005, 006)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestParseAdvisorCrossCritiqueDecision:
+    """The ``ADVISOR_DECISION:`` line drives the decision when present.
+
+    The cross-critique prompt format uses
+    ``ADVISOR_DECISION: APPROVE|REVISE`` alongside the legacy
+    ``ADVISOR_APPROVE`` / ``ADVISOR_REVISE:`` markers. When the
+    new line is present, the captured value wins for the
+    decision. The legacy ``ADVISOR_REVISE: <text>`` marker (when
+    also present) supplies the revised text.
+    """
+
+    def test_decision_revise_with_score_and_revise_marker(self):
+        # The expected-behavior case from the feature description.
+        text = (
+            "ADVISOR_DECISION: REVISE\n"
+            "ADVISOR_SCORE: 7\n"
+            "ADVISOR_REVISE: new answer"
+        )
+        assert parse_advisor_response(text) == (
+            "revise",
+            "new answer",
+            7,
+            [],
+        )
+
+    def test_decision_approve_with_legacy_substring_ignored(self):
+        # ``ADVISOR_DECISION: APPROVE`` wins; the legacy
+        # ``ADVISOR_APPROVE`` substring (also present) is
+        # consistent, not contradictory.
+        text = "ADVISOR_DECISION: APPROVE\nADVISOR_APPROVE"
+        assert parse_advisor_response(text) == (
+            "approve",
+            None,
+            None,
+            [],
+        )
+
+    def test_decision_approve_legacy_substring_only(self):
+        # The legacy path (no ``ADVISOR_DECISION:`` line) returns
+        # ``("approve", None, None, [])`` — the contract case from
+        # VAL-PIPE-EXTRA-005.
+        assert parse_advisor_response("ADVISOR_APPROVE") == (
+            "approve",
+            None,
+            None,
+            [],
+        )
+
+    def test_decision_revise_with_issues(self):
+        # The expected-behavior case from the feature description:
+        # ``ADVISOR_ISSUES:`` block supplies the bullet list;
+        # ``ADVISOR_REVISE:`` supplies the revised text; no
+        # ``ADVISOR_SCORE:`` line is emitted, so the score is
+        # ``None``.
+        text = (
+            "ADVISOR_DECISION: REVISE\n"
+            "ADVISOR_ISSUES:\n"
+            "- issue 1\n"
+            "- issue 2\n"
+            "ADVISOR_REVISE: improved"
+        )
+        assert parse_advisor_response(text) == (
+            "revise",
+            "improved",
+            None,
+            ["issue 1", "issue 2"],
+        )
+
+    def test_decision_revise_with_asterisk_bullets(self):
+        # ``*`` bullet markers are accepted (mirrors the
+        # ``parse_advisor_issues`` behaviour).
+        text = (
+            "ADVISOR_DECISION: REVISE\n"
+            "ADVISOR_ISSUES:\n"
+            "* bullet one\n"
+            "* bullet two\n"
+            "ADVISOR_REVISE: new"
+        )
+        assert parse_advisor_response(text) == (
+            "revise",
+            "new",
+            None,
+            ["bullet one", "bullet two"],
+        )
+
+    def test_decision_revise_with_score_and_issues(self):
+        # All three cross-critique fields flow through in one call.
+        text = (
+            "ADVISOR_DECISION: REVISE\n"
+            "ADVISOR_SCORE: 9\n"
+            "ADVISOR_ISSUES:\n"
+            "- a\n"
+            "- b\n"
+            "- c\n"
+            "ADVISOR_REVISE: final"
+        )
+        assert parse_advisor_response(text) == (
+            "revise",
+            "final",
+            9,
+            ["a", "b", "c"],
+        )
+
+    def test_decision_approve_with_score_only(self):
+        # ``ADVISOR_DECISION: APPROVE`` with a non-revise path
+        # still surfaces the score on the 4-tuple (the cross-
+        # critique fields are extracted regardless of decision).
+        text = "ADVISOR_DECISION: APPROVE\nADVISOR_SCORE: 8"
+        assert parse_advisor_response(text) == (
+            "approve",
+            None,
+            8,
+            [],
+        )
+
+    def test_decision_revise_without_revise_marker(self):
+        # When ``ADVISOR_DECISION: REVISE`` is present but no
+        # ``ADVISOR_REVISE:`` marker, the whole text is the
+        # revised text (conservative fallback for missing marker).
+        text = "ADVISOR_DECISION: REVISE\nADVISOR_SCORE: 5"
+        assert parse_advisor_response(text) == (
+            "revise",
+            "ADVISOR_DECISION: REVISE\nADVISOR_SCORE: 5",
+            5,
+            [],
+        )
+
+    def test_decision_approve_without_approve_marker(self):
+        # When ``ADVISOR_DECISION: APPROVE`` is present and the
+        # legacy ``ADVISOR_APPROVE`` substring is absent, the
+        # decision is still approve. The ``ADVISOR_REVISE:``
+        # substring (if any) is ignored because the
+        # ``ADVISOR_DECISION:`` line won the decision.
+        text = (
+            "Looks fine.\n"
+            "ADVISOR_DECISION: APPROVE\n"
+            "ADVISOR_REVISE: should be ignored"
+        )
+        assert parse_advisor_response(text) == (
+            "approve",
+            None,
+            None,
+            [],
+        )
+
+    def test_decision_is_case_sensitive(self):
+        # The decision keyword is uppercase-only (matches the
+        # cross-critique spec). Lowercase variants are NOT
+        # parsed as the new marker; the legacy substring path
+        # is the fallback (the input here has no legacy
+        # markers, so the whole text is a revise).
+        text = "advisor_decision: revise\nadvisor_score: 5"
+        decision, _text, score, _issues = parse_advisor_response(text)
+        assert decision == "revise"
+        # The lowercase ``advisor_score:`` line is NOT the
+        # ``ADVISOR_SCORE:`` marker, so the parsed score is
+        # ``None``.
+        assert score is None
+
+    def test_decision_revise_lowercase_value_falls_through(self):
+        # ``ADVISOR_DECISION:`` line present but with a
+        # non-APPROVE/REVISE value: the regex does not match
+        # (only APPROVE|REVISE are captured). The parser
+        # falls through to the legacy substring parsers. No
+        # legacy marker is present, so the decision is
+        # ``revise`` with the whole text as the revised
+        # answer. Score and issues are still extracted
+        # additively.
+        text = (
+            "ADVISOR_DECISION: MAYBE\n"
+            "ADVISOR_SCORE: 6\n"
+            "ADVISOR_ISSUES:\n"
+            "- a\n"
+            "ADVISOR_REVISE: ignored-because-no-decision"
+        )
+        # Decision resolves to revise via the legacy fallback
+        # (no ADVISOR_APPROVE substring, no ADVISOR_REVISE:
+        # substring because the regex never matched the
+        # ``ADVISOR_DECISION:`` line, but the
+        # ``ADVISOR_REVISE:`` substring IS present in the
+        # text — so the legacy revise path wins and
+        # ``revised_text`` is the text after the marker).
+        decision, _text, score, issues = parse_advisor_response(text)
+        assert decision == "revise"
+        # The legacy ``ADVISOR_REVISE:`` substring IS present
+        # in the input, so the legacy revise path picks it
+        # up and ``revised_text`` is the text after the
+        # marker.
+        assert "ignored-because-no-decision" in _text
+        assert score == 6
+        assert issues == ["a"]
+
+
+class TestParseAdvisorCrossCritiqueBackwardCompat:
+    """The cross-critique extension is backward compatible with v1-v4.
+
+    Models that emit ONLY the legacy ``ADVISOR_APPROVE`` /
+    ``ADVISOR_REVISE:`` markers still parse correctly: the
+    decision is ``"approve"`` or ``"revise"``; the score is
+    ``None``; the issues list is ``[]``. The v1-v4 behaviour
+    is unchanged.
+    """
+
+    def test_legacy_approve_score_none_issues_empty(self):
+        # ``ADVISOR_APPROVE`` only.
+        _decision, _text, score, issues = parse_advisor_response(
+            "ADVISOR_APPROVE"
+        )
+        assert score is None
+        assert issues == []
+
+    def test_legacy_revise_score_none_issues_empty(self):
+        # ``ADVISOR_REVISE: <text>`` only.
+        _decision, _text, score, issues = parse_advisor_response(
+            "ADVISOR_REVISE: better answer"
+        )
+        assert score is None
+        assert issues == []
+
+    def test_legacy_approve_with_explanation(self):
+        # ``ADVISOR_APPROVE`` with surrounding text. Score
+        # and issues are still ``None`` / ``[]`` (no cross-
+        # critique fields were emitted).
+        _decision, _text, score, issues = parse_advisor_response(
+            "Looks fine to me.\nADVISOR_APPROVE"
+        )
+        assert score is None
+        assert issues == []
+
+    def test_legacy_revise_with_explanation(self):
+        # ``ADVISOR_REVISE:`` with explanation before the
+        # marker.
+        _decision, _text, score, issues = parse_advisor_response(
+            "My critique:\nADVISOR_REVISE: improved answer"
+        )
+        assert score is None
+        assert issues == []
+
+
+class TestParseAdvisorCrossCritiqueScoreAndIssues:
+    """Score and issues are extracted regardless of the decision path.
+
+    The M5 cross-critique fields (score, issues) are
+    additive to the decision; they are extracted from the
+    full input text on every call. The examples below pin
+    the order in which the helpers are called (score first,
+    issues second) and confirm the cross-critique fields
+    flow through on each decision path.
+    """
+
+    def test_score_extracted_on_legacy_approve(self):
+        # A model that emits the legacy approve marker AND a
+        # cross-critique score line gets both: the decision
+        # is approve, the score is parsed.
+        text = "The answer is correct.\nADVISOR_APPROVE\nADVISOR_SCORE: 9"
+        assert parse_advisor_response(text) == (
+            "approve",
+            None,
+            9,
+            [],
+        )
+
+    def test_score_extracted_on_legacy_revise(self):
+        # Same pattern on the revise path. The legacy
+        # ``ADVISOR_REVISE:`` marker takes the post-marker
+        # text verbatim as the revised answer; the
+        # ``ADVISOR_SCORE:`` line in the post-marker text is
+        # part of the revised answer in the v1-v4 contract.
+        # The score is still extracted additively (via the
+        # cross-critique helper), so a model that interleaves
+        # the markers still surfaces the score on the
+        # 4-tuple.
+        text = (
+            "Critique here.\n"
+            "ADVISOR_REVISE: improved\n"
+            "ADVISOR_SCORE: 4"
+        )
+        decision, revised, score, issues = parse_advisor_response(text)
+        assert decision == "revise"
+        assert revised.startswith("improved")
+        assert "ADVISOR_SCORE: 4" in revised
+        assert score == 4
+        assert issues == []
+
+    def test_issues_extracted_on_legacy_approve(self):
+        # A model that emits the legacy approve marker AND a
+        # cross-critique issues block gets both: the decision
+        # is approve, the issues list is parsed.
+        text = (
+            "ADVISOR_APPROVE\n"
+            "ADVISOR_ISSUES:\n"
+            "- minor nit\n"
+            "- second nit"
+        )
+        assert parse_advisor_response(text) == (
+            "approve",
+            None,
+            None,
+            ["minor nit", "second nit"],
+        )
+
+    def test_last_score_wins(self):
+        # When the model emits two ``ADVISOR_SCORE:`` lines,
+        # the last one wins (mirrors the existing
+        # ``parse_advisor_score`` behaviour).
+        text = (
+            "ADVISOR_DECISION: REVISE\n"
+            "ADVISOR_SCORE: 4\n"
+            "ADVISOR_SCORE: 8\n"
+            "ADVISOR_REVISE: final"
+        )
+        assert parse_advisor_response(text) == (
+            "revise",
+            "final",
+            8,
+            [],
+        )
+
+    def test_last_issues_block_wins(self):
+        # When the model emits two ``ADVISOR_ISSUES:``
+        # blocks, the last one wins (mirrors the existing
+        # ``parse_advisor_issues`` behaviour).
+        text = (
+            "ADVISOR_DECISION: REVISE\n"
+            "ADVISOR_ISSUES:\n"
+            "- first\n"
+            "ADVISOR_ISSUES:\n"
+            "- second\n"
+            "- third\n"
+            "ADVISOR_REVISE: final"
+        )
+        assert parse_advisor_response(text) == (
+            "revise",
+            "final",
+            None,
+            ["second", "third"],
+        )
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -534,6 +896,95 @@ class TestAdvisorTurnReturnsDecision:
         decision, text = result
         assert isinstance(decision, str)
         assert decision in {"approve", "revise"}
+
+
+class TestAdvisorTurnCrossCritiqueContext:
+    """``advisor_turn`` surfaces the cross-critique fields on the context.
+
+    The M5 cross-critique format extends ``advisor_turn`` to
+    expose ``ctx["advisor_score"]`` (the parsed
+    ``ADVISOR_SCORE:`` value) and ``ctx["advisor_issues"]``
+    (the parsed ``ADVISOR_ISSUES:`` bullet list) in addition
+    to the existing ``ctx["advisor_decision"]`` and
+    ``ctx["advisor_revised_text"]`` keys. ADVISOR plugins and
+    orchestrator observers read these keys to get the full
+    cross-critique context.
+    """
+
+    @pytest.mark.asyncio
+    async def test_score_surfaced_on_context(self):
+        adapter = ScriptedAdapter([
+            _advisor_response(
+                "ADVISOR_DECISION: REVISE\n"
+                "ADVISOR_SCORE: 7\n"
+                "ADVISOR_REVISE: new answer"
+            )
+        ])
+        ctx: dict[str, Any] = {"adapter": adapter}
+        await advisor_turn(
+            ctx,
+            advisor_model="m",
+            history=[],
+            current_answer="x",
+        )
+        assert ctx["advisor_score"] == 7
+
+    @pytest.mark.asyncio
+    async def test_issues_surfaced_on_context(self):
+        adapter = ScriptedAdapter([
+            _advisor_response(
+                "ADVISOR_DECISION: REVISE\n"
+                "ADVISOR_ISSUES:\n"
+                "- issue 1\n"
+                "- issue 2\n"
+                "ADVISOR_REVISE: improved"
+            )
+        ])
+        ctx: dict[str, Any] = {"adapter": adapter}
+        await advisor_turn(
+            ctx,
+            advisor_model="m",
+            history=[],
+            current_answer="x",
+        )
+        assert ctx["advisor_issues"] == ["issue 1", "issue 2"]
+
+    @pytest.mark.asyncio
+    async def test_score_and_issues_surfaced_on_legacy_approve(self):
+        # The cross-critique fields are surfaced even on a
+        # legacy ``ADVISOR_APPROVE`` path (the helpers are
+        # additive).
+        adapter = ScriptedAdapter([
+            _advisor_response(
+                "The answer is correct.\n"
+                "ADVISOR_APPROVE\n"
+                "ADVISOR_SCORE: 9\n"
+                "ADVISOR_ISSUES:\n"
+                "- nit"
+            )
+        ])
+        ctx: dict[str, Any] = {"adapter": adapter}
+        await advisor_turn(
+            ctx,
+            advisor_model="m",
+            history=[],
+            current_answer="x",
+        )
+        assert ctx["advisor_score"] == 9
+        assert ctx["advisor_issues"] == ["nit"]
+
+    @pytest.mark.asyncio
+    async def test_score_none_when_missing(self):
+        adapter = ScriptedAdapter([_advisor_response("ADVISOR_APPROVE")])
+        ctx: dict[str, Any] = {"adapter": adapter}
+        await advisor_turn(
+            ctx,
+            advisor_model="m",
+            history=[],
+            current_answer="x",
+        )
+        assert ctx["advisor_score"] is None
+        assert ctx["advisor_issues"] == []
 
 
 class TestAdvisorTurnErrorPropagation:
