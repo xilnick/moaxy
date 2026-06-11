@@ -1213,6 +1213,478 @@ class TestResponseHeaders:
 
 
 # ────────────────────────────────────────────────────────────────────
+# M5 DELTA 1 / DELTA 6 — response header set
+# (VAL-PIPE-EXTRA-003, VAL-PIPE-EXTRA-020, VAL-PIPE-EXTRA-021, VAL-PIPE-EXTRA-022)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestM5DeltaResponseHeaders:
+    """``build_response_headers`` exposes the M5 advisory / score headers.
+
+    The M5 contract adds three new response headers on top of the
+    v1-v4 set:
+
+    * ``x-moaxy-advisor-skipped`` — always present. Value is
+      ``1/confidence=<x>`` when the advisor was skipped (DELTA 1
+      conditional skip fired) and ``0/no`` otherwise.
+    * ``x-moaxy-reflect-score`` — present when at least one
+      reflection turn ran. Value is the last parsed ``SCORE:``
+      (the runtime attribute ``ctx.__dict__["last_score"]``),
+      stringified, or ``"0"`` when no score was parsed.
+    * ``x-moaxy-advisor-score`` — present when an advisor pass
+      ran. Value is the parsed ``ADVISOR_SCORE:`` (the runtime
+      attribute ``ctx.__dict__["advisor_score"]``), stringified,
+      or ``"0"`` when no score was parsed.
+
+    The class below uses direct ``build_response_headers`` calls
+    with manually-constructed contexts so the test pins the
+    helper in isolation from the orchestrator's runtime state.
+    """
+
+    def test_x_moaxy_advisor_skipped_zero_no_when_advisor_ran(self):
+        """When the advisor ran, the header is always ``0/no``."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    model="deepseek-v4-pro:cloud",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        # Use a synchronous helper to drive the orchestrator, then
+        # call build_response_headers directly to pin the headers.
+        import asyncio
+
+        asyncio.run(Orchestrator(adapter).run(ctx))
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+        # The advisor_skipped runtime attribute is unset.
+        assert not ctx.__dict__.get("advisor_skipped")
+
+    def test_x_moaxy_advisor_skipped_one_confidence_when_skipped(self):
+        """When the orchestrator skipped the advisor, the header is
+        ``1/confidence=<x>`` where ``<x>`` is the parsed confidence.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.92",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        import asyncio
+
+        asyncio.run(Orchestrator(adapter).run(ctx))
+        # The orchestrator should have skipped the advisor and
+        # stamped the runtime attributes.
+        assert ctx.__dict__.get("advisor_skipped") is True
+        assert ctx.__dict__.get("advisor_skip_confidence") == 0.92
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert (
+            headers["x-moaxy-advisor-skipped"] == "1/confidence=0.92"
+        )
+
+    def test_x_moaxy_advisor_skipped_zero_no_when_advisor_disabled(self):
+        """When advisor.turns=0, the skip never fires; header is ``0/no``."""
+        adapter = ScriptedAdapter([_response("x", prompt_tokens=1, completion_tokens=1)])
+        route = _build_route(reflection_turns=0, advisor_turns=0)
+        ctx = _build_context(route)
+        import asyncio
+
+        asyncio.run(Orchestrator(adapter).run(ctx))
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The header is ALWAYS present.
+        assert "x-moaxy-advisor-skipped" in headers
+        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+
+    def test_x_moaxy_reflect_score_zero_when_no_reflection(self):
+        """With reflection disabled, the header is absent."""
+        adapter = ScriptedAdapter([_response("x", prompt_tokens=1, completion_tokens=1)])
+        route = _build_route(reflection_turns=0, advisor_turns=0)
+        ctx = _build_context(route)
+        import asyncio
+
+        asyncio.run(Orchestrator(adapter).run(ctx))
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # No reflection → no reflect-score header.
+        assert "x-moaxy-reflect-score" not in headers
+
+    def test_x_moaxy_reflect_score_present_when_reflection_ran(self):
+        """When reflection ran, the header reads ``ctx.__dict__["last_score"]``."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5\nSCORE: 7",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+        )
+        ctx = _build_context(route)
+        import asyncio
+
+        asyncio.run(Orchestrator(adapter).run(ctx))
+        # The orchestrator stamps last_score when a SCORE: line parses.
+        assert ctx.__dict__.get("last_score") == 7
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-reflect-score"] == "7"
+
+    def test_x_moaxy_reflect_score_zero_when_no_score_parsed(self):
+        """When reflection ran but no SCORE: was parsed, the value is ``0``."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",  # no SCORE: line
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+        )
+        ctx = _build_context(route)
+        import asyncio
+
+        asyncio.run(Orchestrator(adapter).run(ctx))
+        # last_score is None when SCORE: was not parsed.
+        assert ctx.__dict__.get("last_score") is None
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-reflect-score"] == "0"
+
+    def test_x_moaxy_reflect_score_reflects_last_turn(self):
+        """Header reflects the LAST parsed score across multiple turns."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c1\nREFLECT_CONFIDENCE: 0.5\nSCORE: 4",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("rev1", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "c2\nREFLECT_CONFIDENCE: 0.5\nSCORE: 9",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("rev2", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=2,
+            early_exit=False,
+            threshold=0.85,
+        )
+        ctx = _build_context(route)
+        import asyncio
+
+        asyncio.run(Orchestrator(adapter).run(ctx))
+        # The LAST parsed score wins.
+        assert ctx.__dict__.get("last_score") == 9
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-reflect-score"] == "9"
+
+    def test_x_moaxy_advisor_score_absent_when_no_advisor_pass(self):
+        """When advisor is disabled, the header is absent."""
+        adapter = ScriptedAdapter([_response("x", prompt_tokens=1, completion_tokens=1)])
+        route = _build_route(reflection_turns=0, advisor_turns=0)
+        ctx = _build_context(route)
+        import asyncio
+
+        asyncio.run(Orchestrator(adapter).run(ctx))
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # No advisor pass → no advisor-score header.
+        assert "x-moaxy-advisor-score" not in headers
+
+    def test_x_moaxy_advisor_score_zero_when_advisor_ran_no_score(self):
+        """When advisor ran but the response lacked ADVISOR_SCORE:, the value is ``0``."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    model="deepseek-v4-pro:cloud",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        import asyncio
+
+        asyncio.run(Orchestrator(adapter).run(ctx))
+        # advisor_score is not set (the orchestrator has not yet
+        # implemented parsing it; the build_response_headers helper
+        # falls back to 0).
+        assert ctx.__dict__.get("advisor_score", 0) == 0
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-score"] == "0"
+
+    def test_x_moaxy_advisor_score_reads_ctx_attribute(self):
+        """When ``ctx.__dict__["advisor_score"]`` is set, the header reflects it.
+
+        The M5 orchestrator is expected to stamp
+        ``ctx.__dict__["advisor_score"]`` (added by
+        ``m5-delta-orchestrator-weighted-exit``). This test
+        manually stamps the attribute to pin the helper's read
+        path independently of the orchestrator's parse logic.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    model="deepseek-v4-pro:cloud",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        import asyncio
+
+        asyncio.run(Orchestrator(adapter).run(ctx))
+        # Manually stamp advisor_score to pin the header read path.
+        ctx.__dict__["advisor_score"] = 8
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-score"] == "8"
+
+    def test_x_moaxy_advisor_score_handles_zero_value(self):
+        """A parsed-but-zero score (e.g. ``ADVISOR_SCORE: 0``) is distinct from missing.
+
+        The header value is the parsed integer (``0``), not the
+        string ``"0"`` placeholder for the missing case.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    model="deepseek-v4-pro:cloud",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        import asyncio
+
+        asyncio.run(Orchestrator(adapter).run(ctx))
+        # A literal zero value must be stringified as "0" (not "None").
+        ctx.__dict__["advisor_score"] = 0
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-score"] == "0"
+
+    def test_x_moaxy_advisor_score_handles_none_value(self):
+        """A missing score (``None``) renders as ``"0"`` (the M5 fallback)."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    model="deepseek-v4-pro:cloud",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        import asyncio
+
+        asyncio.run(Orchestrator(adapter).run(ctx))
+        # Explicitly set advisor_score = None to verify the
+        # ``or 0`` fallback in build_response_headers.
+        ctx.__dict__["advisor_score"] = None
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-advisor-score"] == "0"
+
+    def test_full_header_set_on_reflective_advisor_route(self):
+        """VAL-PIPE-EXTRA-022: a complete reflective+advisor response carries
+        all 9 ``x-moaxy-*`` headers.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5\nSCORE: 7",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    model="deepseek-v4-pro:cloud",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        import asyncio
+
+        asyncio.run(Orchestrator(adapter).run(ctx))
+        # Stamp the advisor score (the orchestrator does not yet
+        # parse it; this is added by m5-delta-orchestrator-weighted-exit).
+        ctx.__dict__["advisor_score"] = 8
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # All nine headers must be present and non-empty.
+        expected = {
+            "x-moaxy-request-id",
+            "x-moaxy-alias-resolved",
+            "x-moaxy-fallbacks-used",
+            "x-moaxy-reflect-turns",
+            "x-moaxy-reflect-confidence",
+            "x-moaxy-reflect-score",
+            "x-moaxy-advisor-model",
+            "x-moaxy-advisor-score",
+            "x-moaxy-advisor-skipped",
+        }
+        assert expected <= set(headers.keys())
+        for key in expected:
+            assert headers[key], f"{key} must be non-empty"
+
+    def test_existing_v1_v4_headers_unchanged(self):
+        """The v1-v4 header set is preserved when reflection and advisor are configured."""
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    model="deepseek-v4-pro:cloud",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+            original_model="coder-pro",
+            resolved_model="minimax-m3:cloud",
+        )
+        ctx = _build_context(route)
+        import asyncio
+
+        asyncio.run(Orchestrator(adapter).run(ctx))
+        headers = build_response_headers(ctx, request_id="req-1")
+        # Existing v1-v4 headers: their presence and values are unchanged.
+        assert headers["x-moaxy-request-id"] == "req-1"
+        assert headers["x-moaxy-alias-resolved"] == "minimax-m3:cloud"
+        assert headers["x-moaxy-fallbacks-used"] == "0"
+        assert headers["x-moaxy-reflect-turns"] == "1"
+        assert headers["x-moaxy-reflect-confidence"] == "0.5"
+        assert headers["x-moaxy-advisor-model"] == "deepseek-v4-pro:cloud"
+
+
+# ────────────────────────────────────────────────────────────────────
 # Self-advise and cross-advise
 # ────────────────────────────────────────────────────────────────────
 

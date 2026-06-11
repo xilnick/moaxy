@@ -2113,8 +2113,16 @@ def build_response_headers(ctx: PipelineContext, *, request_id: str) -> dict[str
         equals the alias-resolved real model name). Contains
         ``x-moaxy-fallbacks-used`` reflecting the aggregated list of
         fallback models the walker actually used. Contains
-        ``x-moaxy-reflect-turns``, ``x-moaxy-reflect-confidence``, and
+        ``x-moaxy-reflect-turns``, ``x-moaxy-reflect-confidence``,
         ``x-moaxy-advisor-model`` when reflection and/or advisor ran.
+        Always contains ``x-moaxy-advisor-skipped`` (``1/confidence=<x>``
+        when the advisor was skipped, ``0/no`` otherwise). Contains
+        ``x-moaxy-reflect-score`` when at least one reflection turn
+        ran (value is the last parsed ``SCORE:`` as a string, or
+        ``0`` when no score was parsed). Contains
+        ``x-moaxy-advisor-score`` when an advisor pass ran (value is
+        the parsed ``ADVISOR_SCORE:`` as a string, or ``0`` when
+        none was parsed).
     """
     headers: dict[str, str] = {"x-moaxy-request-id": request_id}
 
@@ -2136,6 +2144,16 @@ def build_response_headers(ctx: PipelineContext, *, request_id: str) -> dict[str
     last_confidence = ctx.__dict__.get("last_confidence", 0.0) or 0.0
     headers["x-moaxy-reflect-confidence"] = f"{last_confidence:g}"
 
+    # DELTA 6: emit ``x-moaxy-reflect-score`` whenever at least one
+    # reflection turn ran. The value is the last parsed ``SCORE:``
+    # from a reflection critique (``ctx.__dict__["last_score"]``),
+    # stringified. When the model did not emit a ``SCORE:`` line the
+    # value falls back to ``"0"`` per the M5 contract.
+    if reflect_turns > 0:
+        headers["x-moaxy-reflect-score"] = str(
+            ctx.__dict__.get("last_score", 0) or 0
+        )
+
     advisor_model = None
     for event in ctx.events:
         if event.type in ("advisor", "advisor_approve", "advisor_revised"):
@@ -2143,6 +2161,19 @@ def build_response_headers(ctx: PipelineContext, *, request_id: str) -> dict[str
                 advisor_model = event.model
     if advisor_model:
         headers["x-moaxy-advisor-model"] = advisor_model
+
+    # DELTA 6: emit ``x-moaxy-advisor-score`` whenever an advisor
+    # pass ran. The value is the parsed ``ADVISOR_SCORE:`` from the
+    # advisor's response (``ctx.__dict__["advisor_score"]``),
+    # stringified. When the model did not emit an ``ADVISOR_SCORE:``
+    # line the value falls back to ``"0"`` per the M5 contract.
+    if any(
+        e.type in ("advisor", "advisor_approve", "advisor_revised")
+        for e in ctx.events
+    ):
+        headers["x-moaxy-advisor-score"] = str(
+            ctx.__dict__.get("advisor_score", 0) or 0
+        )
 
     # DELTA 1: the ``x-moaxy-advisor-skipped`` header is ALWAYS
     # present (consistent observability). The value is
