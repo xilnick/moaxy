@@ -1684,6 +1684,414 @@ class TestOpenRouterAdapterModuleConstants:
 
 
 # ────────────────────────────────────────────────────────────────────
+# m6-openrouter-auth-and-headers
+#
+# The M6 auth-and-headers feature pins the secrets-handling
+# contract for the OpenRouterAdapter. The five expected
+# behaviors under test are:
+#
+# 1. Constructing OpenRouterAdapter without OPENROUTER_API_KEY
+#    raises a clear error.
+# 2. Authorization: Bearer <key> is sent on every request.
+# 3. HTTP-Referer header is sent when http_referer is set; absent
+#    when not.
+# 4. X-Title header is sent when x_title is set; absent when not.
+# 5. __repr__ / __str__ redacts the API key.
+# 6. Error responses from moaxy to the client never include the
+#    API key in plain text (the strongest, full-proxy test).
+# 7. .env.example at the repo root documents OPENROUTER_API_KEY
+#    with a placeholder.
+#
+# Cases (1)-(5) are also covered (defensively) by the
+# TestOpenRouterAdapterConstruction, TestOpenRouterAdapterRequestShape,
+# and TestOpenRouterAdapterReprRedaction classes above. The
+# tests in this class provide a consolidated, single-class view
+# of the auth-and-headers contract that maps 1-to-1 to the
+# feature's expectedBehavior list, plus the full-proxy error
+# response assertion that pins the strongest version of the
+# "no leak" contract.
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestM6AuthAndHeadersContract:
+    """m6-openrouter-auth-and-headers feature contract.
+
+    Each test method corresponds to a single bullet in the
+    feature's ``expectedBehavior`` list. The tests are written
+    to be readable in isolation — a reviewer can match each
+    method to a contract bullet without jumping around the
+    file.
+    """
+
+    def test_env_01_construction_without_api_key_raises(self, monkeypatch):
+        """(1) Constructing OpenRouterAdapter without
+        OPENROUTER_API_KEY raises a clear error.
+
+        The error mentions the env var name so the user can fix
+        the misconfiguration without reading the source.
+        """
+        monkeypatch.delenv(API_KEY_ENV_VAR, raising=False)
+        with pytest.raises(OpenRouterConfigError) as exc_info:
+            OpenRouterAdapter()
+        # The error message names the env var so users can act
+        # on it.
+        assert API_KEY_ENV_VAR in str(exc_info.value)
+        # OpenRouterConfigError is a subclass of RuntimeError
+        # (the spec allows either form; the spec also accepts a
+        # domain-specific subclass that callers can catch
+        # explicitly).
+        assert isinstance(exc_info.value, RuntimeError)
+
+    @pytest.mark.asyncio
+    async def test_env_02_authorization_header_on_every_request(
+        self, monkeypatch
+    ):
+        """(2) Authorization: Bearer <key> is sent on every request.
+
+        Two consecutive chat calls exercise the per-request
+        Authorization header injection: the header MUST be
+        present and equal to ``Bearer <key>`` on every call.
+        """
+        monkeypatch.setenv(
+            API_KEY_ENV_VAR, "sk-or-v1-test-key-placeholder-12345"
+        )
+        seen: list[str] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.headers.get("Authorization", ""))
+            return _json_response(_make_payload())
+
+        adapter = OpenRouterAdapter(_transport=_FakeTransport(handler))
+        try:
+            # Two consecutive calls — the header MUST be present
+            # on both.
+            await adapter.chat(
+                model="anthropic/claude-3-haiku",
+                messages=[{"role": "user", "content": "x"}],
+            )
+            await adapter.chat(
+                model="anthropic/claude-3-haiku",
+                messages=[{"role": "user", "content": "y"}],
+            )
+        finally:
+            await adapter.close()
+
+        assert len(seen) == 2
+        for header in seen:
+            assert header == "Bearer sk-or-v1-test-key-placeholder-12345"
+
+    @pytest.mark.asyncio
+    async def test_env_03_http_referer_conditional(self, monkeypatch):
+        """(3) HTTP-Referer header sent when set; absent when not."""
+        monkeypatch.setenv(API_KEY_ENV_VAR, "sk-or-v1-test-key-placeholder-12345")
+
+        # With http_referer set: the header MUST be present.
+        seen_with: dict[str, Any] = {}
+
+        async def handler_with(request: httpx.Request) -> httpx.Response:
+            seen_with["headers"] = dict(request.headers)
+            return _json_response(_make_payload())
+
+        adapter = OpenRouterAdapter(
+            http_referer="https://my.app",
+            _transport=_FakeTransport(handler_with),
+        )
+        try:
+            await adapter.chat(
+                model="anthropic/claude-3-haiku",
+                messages=[{"role": "user", "content": "x"}],
+            )
+        finally:
+            await adapter.close()
+        assert (
+            seen_with["headers"].get("HTTP-Referer")
+            or seen_with["headers"].get("http-referer")
+        ) == "https://my.app"
+
+        # Without http_referer (default): the header MUST be absent.
+        seen_without: dict[str, Any] = {}
+
+        async def handler_without(request: httpx.Request) -> httpx.Response:
+            seen_without["headers"] = dict(request.headers)
+            return _json_response(_make_payload())
+
+        adapter2 = OpenRouterAdapter(_transport=_FakeTransport(handler_without))
+        try:
+            await adapter2.chat(
+                model="anthropic/claude-3-haiku",
+                messages=[{"role": "user", "content": "x"}],
+            )
+        finally:
+            await adapter2.close()
+        assert "http-referer" not in seen_without["headers"]
+
+    @pytest.mark.asyncio
+    async def test_env_04_x_title_conditional(self, monkeypatch):
+        """(4) X-Title header sent when set; absent when not."""
+        monkeypatch.setenv(API_KEY_ENV_VAR, "sk-or-v1-test-key-placeholder-12345")
+
+        # With x_title set: the header MUST be present.
+        seen_with: dict[str, Any] = {}
+
+        async def handler_with(request: httpx.Request) -> httpx.Response:
+            seen_with["headers"] = dict(request.headers)
+            return _json_response(_make_payload())
+
+        adapter = OpenRouterAdapter(
+            x_title="My App", _transport=_FakeTransport(handler_with)
+        )
+        try:
+            await adapter.chat(
+                model="anthropic/claude-3-haiku",
+                messages=[{"role": "user", "content": "x"}],
+            )
+        finally:
+            await adapter.close()
+        assert (
+            seen_with["headers"].get("X-Title")
+            or seen_with["headers"].get("x-title")
+        ) == "My App"
+
+        # Without x_title (default): the header MUST be absent.
+        seen_without: dict[str, Any] = {}
+
+        async def handler_without(request: httpx.Request) -> httpx.Response:
+            seen_without["headers"] = dict(request.headers)
+            return _json_response(_make_payload())
+
+        adapter2 = OpenRouterAdapter(_transport=_FakeTransport(handler_without))
+        try:
+            await adapter2.chat(
+                model="anthropic/claude-3-haiku",
+                messages=[{"role": "user", "content": "x"}],
+            )
+        finally:
+            await adapter2.close()
+        assert "x-title" not in seen_without["headers"]
+
+    def test_env_05_repr_and_str_redact_api_key(self, monkeypatch):
+        """(5) __repr__ / __str__ redacts the API key.
+
+        The key MUST NOT appear in plain text in either
+        representation. The redacted form is ``<first 6 chars>...``
+        (e.g. ``sk-or-...``) when the key is long enough, or
+        ``<redacted>`` for short keys.
+        """
+        # NOTE: the test key is an obviously fake placeholder
+        # value that matches the OpenRouter key format. Never
+        # replace this with a real key. The key is assembled at
+        # runtime from a known prefix and a clearly-synthetic
+        # suffix so the literal token does not appear in this
+        # source file.
+        key = f"sk-or-v1-{'-'.join(['test', 'FAKE', 'KEY', 'do', 'not', 'use'])}-0000000000"
+        monkeypatch.setenv(API_KEY_ENV_VAR, key)
+        a = OpenRouterAdapter()
+        r = repr(a)
+        s = str(a)
+        # The full key MUST NOT appear in either representation.
+        assert key not in r, f"full key leaked in repr: {r!r}"
+        assert key not in s, f"full key leaked in str: {s!r}"
+        # The redacted form is present in __repr__: the first
+        # six characters ``sk-or-`` followed by ``...``.
+        assert "sk-or-..." in r
+        # __str__ is the same as __repr__.
+        assert s == r
+
+    @pytest.mark.asyncio
+    async def test_env_06_moaxy_error_response_never_includes_api_key(
+        self, monkeypatch
+    ):
+        """(6) Error responses from moaxy to the client never
+        include the API key in plain text — full-proxy test.
+
+        A scripted 401 from the (fake) OpenRouter echoes the
+        key in its own error body. The moaxy proxy translates
+        the adapter-level :class:`UpstreamError` into the
+        canonical ``{"error": {"type", "message", "details"}}``
+        envelope. The full JSON body returned to the client
+        MUST NOT contain the key in plain text, even when the
+        upstream's own error body references it.
+
+        This is the strongest version of the M6 "no leak"
+        contract: it pins the public response surface, not
+        the adapter-level exception, and it covers every
+        place a leak could happen (top-level message, nested
+        details, escaped string values).
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        from moaxy.adapters.registry import AdapterRegistry
+        from moaxy.models.config import (
+            AdapterConfig,
+            MoaxyConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.server.app import create_app
+
+        # NOTE: the test key is an obviously fake placeholder
+        # value that matches the OpenRouter key format. Never
+        # replace this with a real key. The key is assembled at
+        # runtime from a known prefix and a clearly-synthetic
+        # suffix so the literal token does not appear in this
+        # source file.
+        key = f"sk-or-v1-{'-'.join(['leak', 'test', 'FAKE', 'KEY', 'NOT', 'REAL'])}-1234567890"
+        monkeypatch.setenv(API_KEY_ENV_VAR, key)
+
+        # The fake transport returns a 401 with the key in
+        # both the error message and the body. This mirrors a
+        # worst-case real-world upstream that echoes the bad
+        # token back in its own error.
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=401,
+                headers={"content-type": "application/json"},
+                content=(
+                    '{"error": {"message": "invalid key '
+                    + key
+                    + '"}}'
+                ).encode("utf-8"),
+            )
+
+        # Wire the real OpenRouterAdapter (not a FakeAdapter)
+        # into the registry so the proxy path is exercised
+        # end-to-end. The transport is in-process; no real
+        # network is touched.
+        openrouter_adapter = OpenRouterAdapter(
+            _transport=_FakeTransport(handler)
+        )
+        try:
+            registry = AdapterRegistry(
+                {"openrouter-prod": openrouter_adapter}
+            )
+            cfg = MoaxyConfig(
+                backends=[
+                    AdapterConfig(
+                        name="openrouter-prod",
+                        adapter="openrouter",
+                        base_url="https://openrouter.ai/api/v1",
+                    )
+                ],
+                routes=[
+                    RouteConfig(
+                        name="r",
+                        match=ConfigRouteMatch(
+                            model="*", path="/v1/chat/completions"
+                        ),
+                        backend="openrouter-prod",
+                    )
+                ],
+            )
+            app = create_app(config=cfg, adapters=registry)
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+            ) as client:
+                response = await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "anthropic/claude-3-haiku",
+                        "messages": [
+                            {"role": "user", "content": "x"}
+                        ],
+                    },
+                    headers={"Content-Type": "application/json"},
+                )
+
+            # The proxy returns a structured 4xx (the upstream
+            # 401 maps to a client-facing 400 per the proxy's
+            # error-translation table; the envelope shape is
+            # the same regardless of the chosen status code).
+            assert 400 <= response.status_code < 600, (
+                f"expected error status, got {response.status_code}: "
+                f"{response.text[:200]}"
+            )
+            # Content-Type MUST be application/json.
+            assert response.headers["content-type"].startswith(
+                "application/json"
+            )
+            # The full response body MUST NOT contain the key
+            # in plain text. Every place the key could appear
+            # (top-level message, nested details) is covered
+            # by this single assertion.
+            text = response.text
+            assert key not in text, (
+                f"API key leaked in client-facing error body: "
+                f"{text[:300]}"
+            )
+            # The redacted form (<redacted>) MAY appear, but
+            # the key string itself MUST NOT.
+            # The body MUST still be valid JSON.
+            body = response.json()
+            assert "error" in body
+        finally:
+            await openrouter_adapter.close()
+
+    def test_env_07_env_example_documents_api_key(self):
+        """(7) .env.example at the repo root documents
+        OPENROUTER_API_KEY with a placeholder value.
+
+        The file MUST exist, MUST contain a literal
+        ``OPENROUTER_API_KEY=`` line, and the value MUST NOT
+        be empty. A placeholder string (e.g.
+        ``sk-or-v1-replace-me...``) is the canonical
+        form documented in the M6 secrets handling section
+        of the architecture.
+        """
+        repo_root = Path(__file__).resolve().parent.parent
+        env_example = repo_root / ".env.example"
+        assert env_example.is_file(), (
+            f".env.example missing from repo root: {env_example}"
+        )
+        contents = env_example.read_text(encoding="utf-8")
+        # The literal ``OPENROUTER_API_KEY=`` token MUST be
+        # present (the variable is documented).
+        assert "OPENROUTER_API_KEY=" in contents, (
+            f".env.example does not document OPENROUTER_API_KEY: "
+            f"{contents[:300]}"
+        )
+        # The line that names OPENROUTER_API_KEY MUST have a
+        # non-empty value (a placeholder is the canonical
+        # form; the placeholder must not be the literal
+        # secret).
+        for line in contents.splitlines():
+            if line.startswith("OPENROUTER_API_KEY="):
+                value = line.split("=", 1)[1].strip()
+                assert value, "OPENROUTER_API_KEY value is empty"
+                # The placeholder is NOT a real key — a quick
+                # sanity check that the file does not contain
+                # an actual secret.
+                assert "replace-me" in value.lower() or "placeholder" in value.lower() or "your-" in value.lower(), (
+                    f"OPENROUTER_API_KEY placeholder is not a placeholder: {value!r}"
+                )
+                break
+        else:
+            pytest.fail("OPENROUTER_API_KEY line not found in .env.example")
+
+    def test_env_08_gitignore_excludes_env_file(self):
+        """The .env file (the populated secrets file) is
+        excluded by .gitignore. The .env.example file is
+        committed as documentation, but the populated .env
+        must NEVER be committed. This is a defensive
+        regression check: if someone removes ``.env`` from
+        .gitignore, this test fails.
+        """
+        repo_root = Path(__file__).resolve().parent.parent
+        gitignore = repo_root / ".gitignore"
+        assert gitignore.is_file(), (
+            f".gitignore missing from repo root: {gitignore}"
+        )
+        contents = gitignore.read_text(encoding="utf-8")
+        # The .env entry MUST be present (the .env file is
+        # the canonical place to keep the populated
+        # OPENROUTER_API_KEY secret).
+        assert ".env" in contents, (
+            f".gitignore does not exclude .env: {contents!r}"
+        )
+
+
+# ────────────────────────────────────────────────────────────────────
 # Backward compat: the existing tests/test_plugins.py still passes
 # ────────────────────────────────────────────────────────────────────
 
