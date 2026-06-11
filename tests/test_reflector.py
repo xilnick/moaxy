@@ -40,7 +40,12 @@ from moaxy.adapters.base import (
 from moaxy.pipeline.fallback import call_with_fallbacks
 from moaxy.pipeline.message_builders import build_reflection_messages
 from moaxy.pipeline.prompts import DEFAULT_REFLECT_PROMPT
-from moaxy.pipeline.reflector import parse_confidence, reflect_turn
+from moaxy.pipeline.reflector import (
+    parse_confidence,
+    parse_score,
+    parse_weighted_signal,
+    reflect_turn,
+)
 from moaxy.plugins.base import Plugin
 from moaxy.plugins.manager import PluginManager
 from moaxy.plugins.types import PluginType
@@ -757,3 +762,391 @@ class TestReflectTurnWithFallbacks:
         assert fallbacks_used == []
         # And the same content parses to 0.7.
         assert parse_confidence(response.message.content) == 0.7
+
+
+# ────────────────────────────────────────────────────────────────────
+# parse_score (DELTA 5/6: integer-only 0-10 score from critique text)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestParseScoreHappyPath:
+    """The regex matches the documented ``SCORE: <int>`` line."""
+
+    def test_simple_integer(self):
+        assert parse_score("SCORE: 7") == 7
+
+    def test_zero(self):
+        assert parse_score("SCORE: 0") == 0
+
+    def test_ten_upper_bound(self):
+        assert parse_score("SCORE: 10") == 10
+
+    def test_one(self):
+        assert parse_score("SCORE: 1") == 1
+
+    def test_mid_value(self):
+        assert parse_score("SCORE: 5") == 5
+
+    def test_out_of_range_value_recorded_as_is(self):
+        # The parser does not clamp; "11" is recorded as 11 even
+        # though the documented score range is 0..10. The orchestrator
+        # is the layer responsible for any range validation.
+        assert parse_score("SCORE: 11") == 11
+
+
+class TestParseScoreInCritiqueText:
+    """The line can be embedded anywhere in the critique text."""
+
+    def test_line_appears_after_critique(self):
+        text = (
+            "The previous answer is correct and complete.\n"
+            "It addresses all the edge cases I checked.\n"
+            "REFLECT_CONFIDENCE: 0.95\n"
+            "SCORE: 9"
+        )
+        assert parse_score(text) == 9
+
+    def test_takes_last_match_when_multiple_lines(self):
+        # The contract pins "last match wins" semantics mirroring
+        # parse_confidence.
+        text = (
+            "SCORE: 7\n"
+            "Some extra analysis here.\n"
+            "SCORE: 9"
+        )
+        assert parse_score(text) == 9
+
+    def test_appears_after_confidence_line(self):
+        text = "REFLECT_CONFIDENCE: 0.9\nSCORE: 5"
+        assert parse_score(text) == 5
+
+
+class TestParseScoreWhitespaceHandling:
+    """The regex tolerates whitespace around the marker and the number."""
+
+    def test_multiple_spaces_after_colon(self):
+        assert parse_score("SCORE:    7") == 7
+
+    def test_tab_after_colon(self):
+        assert parse_score("SCORE:\t7") == 7
+
+    def test_trailing_whitespace(self):
+        assert parse_score("SCORE: 7   ") == 7
+
+    def test_no_space_after_colon(self):
+        # The regex allows zero-or-more whitespace after the colon.
+        assert parse_score("SCORE:7") == 7
+
+
+class TestParseScoreMissing:
+    """When the line is missing, the helper returns None."""
+
+    def test_no_line_at_all(self):
+        assert parse_score("no score line") is None
+
+    def test_empty_string(self):
+        assert parse_score("") is None
+
+    def test_only_whitespace(self):
+        assert parse_score("   \n\n   \n") is None
+
+    def test_similar_but_wrong_prefix(self):
+        # The marker must be SCORE: exactly.
+        assert parse_score("SCORES: 7") is None
+        assert parse_score("score: 7") is None  # case-sensitive
+
+    def test_substring_match_fails(self):
+        # The regex is anchored; "XSCORE: 7" is not a match.
+        assert parse_score("XSCORE: 7") is None
+        assert parse_score("SCORE: 7Y") is None
+
+    def test_leading_spaces_breaks_anchored_match(self):
+        # Anchored at line start; leading whitespace breaks the match.
+        assert parse_score("    SCORE: 7") is None
+
+
+class TestParseScoreMalformed:
+    """When the line is present but the value is malformed, return None."""
+
+    def test_empty_after_colon(self):
+        assert parse_score("SCORE:") is None
+
+    def test_only_spaces_after_colon(self):
+        assert parse_score("SCORE:   ") is None
+
+    def test_non_numeric_after_colon(self):
+        assert parse_score("SCORE: seven") is None
+
+    def test_float_is_rejected(self):
+        # Integer-only by design; floats are rejected.
+        assert parse_score("SCORE: 7.5") is None
+        assert parse_score("SCORE: 0.92") is None
+
+    def test_negative_integer_rejected(self):
+        # The regex does not allow a leading sign; negatives are
+        # rejected (out-of-range validation is the orchestrator's
+        # responsibility, but a negative cannot even match the
+        # anchored integer regex).
+        assert parse_score("SCORE: -5") is None
+
+
+class TestParseScoreType:
+    """Return type and edge cases for the helper."""
+
+    def test_non_string_input_returns_none(self):
+        # The helper is defensive against non-string input. The
+        # contract passes strings, but a None or non-string must not
+        # raise.
+        assert parse_score(None) is None  # type: ignore[arg-type]
+        assert parse_score(7) is None  # type: ignore[arg-type]
+
+    def test_returned_value_is_int_or_none(self):
+        assert isinstance(parse_score("SCORE: 7"), int)
+        assert parse_score("not a line") is None
+        assert parse_score("") is None
+
+
+# ────────────────────────────────────────────────────────────────────
+# parse_weighted_signal (DELTA 5/7: combined early-exit signal)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestParseWeightedSignalHappyPath:
+    """When both REFLECT_CONFIDENCE and SCORE are present, the weighted
+    formula is applied."""
+
+    def test_documented_formula_06_04(self):
+        # VAL-PIPE-EXTRA-042 example: 0.6 * 0.9 + 0.4 * 0.5 = 0.74.
+        combined, confidence, score = parse_weighted_signal(
+            "REFLECT_CONFIDENCE: 0.9\nSCORE: 5",
+            trust_verbal=0.6,
+            trust_score=0.4,
+        )
+        assert combined == pytest.approx(0.74)
+        assert confidence == pytest.approx(0.9)
+        assert score == 5
+
+    def test_full_verbal_full_score_weights(self):
+        # trust_verbal=1.0, trust_score=1.0 (allowed; the contract
+        # does not require weights sum to 1.0).
+        combined, confidence, score = parse_weighted_signal(
+            "REFLECT_CONFIDENCE: 0.5\nSCORE: 8",
+            trust_verbal=1.0,
+            trust_score=1.0,
+        )
+        # 1.0 * 0.5 + 1.0 * 0.8 = 1.3
+        assert combined == pytest.approx(1.3)
+        assert confidence == pytest.approx(0.5)
+        assert score == 8
+
+    def test_full_verbal_zero_score(self):
+        # The contract pin for VAL-PIPE-EXTRA-010: trust_verbal=1.0,
+        # trust_score=0.0, the early-exit check is confidence only.
+        combined, confidence, score = parse_weighted_signal(
+            "REFLECT_CONFIDENCE: 0.9\nSCORE: 5",
+            trust_verbal=1.0,
+            trust_score=0.0,
+        )
+        assert combined == pytest.approx(0.9)
+        assert confidence == pytest.approx(0.9)
+        assert score == 5
+
+    def test_zero_verbal_full_score(self):
+        # VAL-PIPE-EXTRA-011: trust_verbal=0.0, trust_score=1.0, the
+        # early-exit check is score/10 only.
+        combined, confidence, score = parse_weighted_signal(
+            "REFLECT_CONFIDENCE: 0.5\nSCORE: 9",
+            trust_verbal=0.0,
+            trust_score=1.0,
+        )
+        # 0.0 * 0.5 + 1.0 * 0.9 = 0.9
+        assert combined == pytest.approx(0.9)
+        assert confidence == pytest.approx(0.5)
+        assert score == 9
+
+    def test_combined_weights_05_05(self):
+        # VAL-PIPE-EXTRA-012: 0.5 * 0.6 + 0.5 * 0.9 = 0.75.
+        combined, confidence, score = parse_weighted_signal(
+            "REFLECT_CONFIDENCE: 0.6\nSCORE: 9",
+            trust_verbal=0.5,
+            trust_score=0.5,
+        )
+        assert combined == pytest.approx(0.75)
+        assert confidence == pytest.approx(0.6)
+        assert score == 9
+
+
+class TestParseWeightedSignalScoreMissing:
+    """When SCORE: is missing, the combined signal falls back to
+    ``confidence`` (the v1 invariant)."""
+
+    def test_score_missing_falls_back_to_confidence(self):
+        # VAL-PIPE-EXTRA-014: REFLECT_CONFIDENCE: 0.9 only, no SCORE
+        # line. The combined value is the confidence itself
+        # (NOT 0.6 * confidence). This preserves the v1 threshold
+        # check ``confidence >= threshold``.
+        combined, confidence, score = parse_weighted_signal(
+            "REFLECT_CONFIDENCE: 0.9",
+            trust_verbal=0.6,
+            trust_score=0.4,
+        )
+        assert combined == pytest.approx(0.9)
+        assert confidence == pytest.approx(0.9)
+        assert score is None
+
+    def test_score_missing_falls_back_even_with_full_verbal_weight(self):
+        # The fallback is invariant regardless of the weight values.
+        combined, confidence, score = parse_weighted_signal(
+            "REFLECT_CONFIDENCE: 0.5",
+            trust_verbal=1.0,
+            trust_score=1.0,
+        )
+        assert combined == pytest.approx(0.5)
+        assert confidence == pytest.approx(0.5)
+        assert score is None
+
+    def test_score_missing_with_zero_confidence(self):
+        # The DELTA 7 safety rule: a missing SCORE + a missing
+        # REFLECT_CONFIDENCE yields combined=0.0. The orchestrator
+        # must NOT short-circuit in this case (the
+        # ``confidence == 0.0`` case is "model failed the protocol",
+        # not "model said zero").
+        combined, confidence, score = parse_weighted_signal(
+            "no signals here",
+            trust_verbal=0.6,
+            trust_score=0.4,
+        )
+        assert combined == pytest.approx(0.0)
+        assert confidence == 0.0
+        assert score is None
+
+
+class TestParseWeightedSignalConfidenceMissing:
+    """When REFLECT_CONFIDENCE is missing, parse_confidence returns
+    0.0; the combined value is the trust_score-weighted score/10
+    component only (or 0.0 if SCORE is also missing)."""
+
+    def test_only_score_present(self):
+        # VAL-PIPE-EXTRA-015: SCORE: 9 only, no REFLECT_CONFIDENCE.
+        # The confidence defaults to 0.0 (from parse_confidence's
+        # "missing line" behavior). The combined value is
+        # trust_verbal * 0.0 + trust_score * 0.9 = 0.36
+        # (with trust_verbal=0.6, trust_score=0.4).
+        combined, confidence, score = parse_weighted_signal(
+            "SCORE: 9",
+            trust_verbal=0.6,
+            trust_score=0.4,
+        )
+        assert combined == pytest.approx(0.36)
+        assert confidence == 0.0
+        assert score == 9
+
+    def test_only_score_with_full_score_weight(self):
+        combined, confidence, score = parse_weighted_signal(
+            "SCORE: 9",
+            trust_verbal=0.0,
+            trust_score=1.0,
+        )
+        # 0.0 * 0.0 + 1.0 * 0.9 = 0.9
+        assert combined == pytest.approx(0.9)
+        assert confidence == 0.0
+        assert score == 9
+
+
+class TestParseWeightedSignalBothMissing:
+    """When both signals are missing, the combined value is 0.0."""
+
+    def test_no_signals_at_all(self):
+        combined, confidence, score = parse_weighted_signal(
+            "no markers here",
+            trust_verbal=0.6,
+            trust_score=0.4,
+        )
+        assert combined == 0.0
+        assert confidence == 0.0
+        assert score is None
+
+    def test_empty_string(self):
+        combined, confidence, score = parse_weighted_signal(
+            "",
+            trust_verbal=0.6,
+            trust_score=0.4,
+        )
+        assert combined == 0.0
+        assert confidence == 0.0
+        assert score is None
+
+
+class TestParseWeightedSignalType:
+    """Return type and edge cases for the helper."""
+
+    def test_returns_3_tuple(self):
+        result = parse_weighted_signal(
+            "SCORE: 5",
+            trust_verbal=0.6,
+            trust_score=0.4,
+        )
+        assert isinstance(result, tuple)
+        assert len(result) == 3
+
+    def test_combined_is_float(self):
+        combined, _confidence, _score = parse_weighted_signal(
+            "SCORE: 5",
+            trust_verbal=0.6,
+            trust_score=0.4,
+        )
+        assert isinstance(combined, float)
+
+    def test_confidence_is_float(self):
+        _combined, confidence, _score = parse_weighted_signal(
+            "SCORE: 5",
+            trust_verbal=0.6,
+            trust_score=0.4,
+        )
+        assert isinstance(confidence, float)
+
+    def test_score_is_int_or_none(self):
+        # With SCORE present, score is int.
+        _c, _conf, score = parse_weighted_signal(
+            "SCORE: 5",
+            trust_verbal=0.6,
+            trust_score=0.4,
+        )
+        assert isinstance(score, int)
+        # Without SCORE, score is None.
+        _c, _conf, score = parse_weighted_signal(
+            "REFLECT_CONFIDENCE: 0.5",
+            trust_verbal=0.6,
+            trust_score=0.4,
+        )
+        assert score is None
+
+    def test_non_string_input_returns_zero(self):
+        combined, confidence, score = parse_weighted_signal(  # type: ignore[arg-type]
+            None, trust_verbal=0.6, trust_score=0.4
+        )
+        assert combined == 0.0
+        assert confidence == 0.0
+        assert score is None
+
+    def test_keyword_only_arguments(self):
+        # trust_verbal and trust_score are keyword-only.
+        with pytest.raises(TypeError):
+            parse_weighted_signal("SCORE: 5", 0.6, 0.4)  # type: ignore[misc]
+
+
+class TestParseWeightedSignalPipelinePackageExport:
+    """The helper is re-exported from the :mod:`moaxy.pipeline` package."""
+
+    def test_pipeline_package_re_exports_parse_score(self):
+        from moaxy.pipeline import parse_score as PkgParseScore
+
+        assert PkgParseScore is parse_score
+
+    def test_pipeline_package_re_exports_parse_weighted_signal(self):
+        from moaxy.pipeline import (
+            parse_weighted_signal as PkgParseWeightedSignal,
+        )
+
+        assert PkgParseWeightedSignal is parse_weighted_signal
+

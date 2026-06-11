@@ -41,7 +41,12 @@ from moaxy.adapters.base import (
     UpstreamError,
     Usage,
 )
-from moaxy.pipeline.advisor import advisor_turn, parse_advisor_response
+from moaxy.pipeline.advisor import (
+    advisor_turn,
+    parse_advisor_issues,
+    parse_advisor_response,
+    parse_advisor_score,
+)
 from moaxy.pipeline.message_builders import (
     build_advisor_messages,
     build_advisor_revision_messages,
@@ -1673,4 +1678,337 @@ class TestAdvisorConcurrentRequestIsolation:
         # Each context has its own events list.
         assert len(ctx_a.events) == 3  # initial, advisor, advisor_approve
         assert len(ctx_b.events) >= 3  # initial, advisor, advisor_revised, advisor_revision
+
+
+# ────────────────────────────────────────────────────────────────────
+# parse_advisor_score (DELTA 5/6: integer-only 0-10 score from advisor)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestParseAdvisorScoreHappyPath:
+    """The regex matches the documented ``ADVISOR_SCORE: <int>`` line."""
+
+    def test_simple_integer(self):
+        assert parse_advisor_score("ADVISOR_SCORE: 8") == 8
+
+    def test_zero(self):
+        assert parse_advisor_score("ADVISOR_SCORE: 0") == 0
+
+    def test_ten_upper_bound(self):
+        assert parse_advisor_score("ADVISOR_SCORE: 10") == 10
+
+    def test_mid_value(self):
+        assert parse_advisor_score("ADVISOR_SCORE: 5") == 5
+
+    def test_out_of_range_value_recorded_as_is(self):
+        # The parser does not clamp; "11" is recorded as-is.
+        assert parse_advisor_score("ADVISOR_SCORE: 11") == 11
+
+
+class TestParseAdvisorScoreInAdvisorText:
+    """The line can be embedded anywhere in the advisor's text."""
+
+    def test_line_appears_with_other_markers(self):
+        text = (
+            "ADVISOR_DECISION: REVISE\n"
+            "ADVISOR_SCORE: 7\n"
+            "ADVISOR_REVISE: better answer"
+        )
+        assert parse_advisor_score(text) == 7
+
+    def test_takes_last_match_when_multiple_lines(self):
+        # "Last match wins" mirrors parse_score and parse_confidence.
+        text = (
+            "ADVISOR_SCORE: 3\n"
+            "ADVISOR_SCORE: 8"
+        )
+        assert parse_advisor_score(text) == 8
+
+    def test_no_space_after_colon(self):
+        # The regex allows zero-or-more whitespace after the colon.
+        assert parse_advisor_score("ADVISOR_SCORE:8") == 8
+
+
+class TestParseAdvisorScoreWhitespaceHandling:
+    """The regex tolerates whitespace around the marker and the number."""
+
+    def test_multiple_spaces_after_colon(self):
+        assert parse_advisor_score("ADVISOR_SCORE:    7") == 7
+
+    def test_tab_after_colon(self):
+        assert parse_advisor_score("ADVISOR_SCORE:\t7") == 7
+
+    def test_trailing_whitespace(self):
+        assert parse_advisor_score("ADVISOR_SCORE: 7   ") == 7
+
+
+class TestParseAdvisorScoreMissing:
+    """When the line is missing, the helper returns None."""
+
+    def test_no_line_at_all(self):
+        assert parse_advisor_score("no score line") is None
+
+    def test_empty_string(self):
+        assert parse_advisor_score("") is None
+
+    def test_similar_but_wrong_prefix(self):
+        # The marker must be ADVISOR_SCORE: exactly (case-sensitive).
+        assert parse_advisor_score("ADVISOR SCORE: 7") is None
+        assert parse_advisor_score("advisor_score: 7") is None
+        # The reflector-only SCORE: marker is not the advisor marker.
+        assert parse_advisor_score("SCORE: 7") is None
+
+    def test_substring_match_fails(self):
+        # The regex is anchored; substring matches are not accepted.
+        assert parse_advisor_score("XADVISOR_SCORE: 7") is None
+        assert parse_advisor_score("ADVISOR_SCORE: 7Y") is None
+
+    def test_leading_spaces_breaks_anchored_match(self):
+        # Anchored at line start; leading whitespace breaks the match.
+        assert parse_advisor_score("    ADVISOR_SCORE: 7") is None
+
+
+class TestParseAdvisorScoreMalformed:
+    """When the line is present but the value is malformed, return None."""
+
+    def test_empty_after_colon(self):
+        assert parse_advisor_score("ADVISOR_SCORE:") is None
+
+    def test_only_spaces_after_colon(self):
+        assert parse_advisor_score("ADVISOR_SCORE:   ") is None
+
+    def test_non_numeric_after_colon(self):
+        assert parse_advisor_score("ADVISOR_SCORE: eight") is None
+
+    def test_float_is_rejected(self):
+        # Integer-only by design; floats are rejected.
+        assert parse_advisor_score("ADVISOR_SCORE: 8.5") is None
+        assert parse_advisor_score("ADVISOR_SCORE: 0.92") is None
+
+    def test_negative_integer_rejected(self):
+        # The regex does not allow a leading sign.
+        assert parse_advisor_score("ADVISOR_SCORE: -5") is None
+
+
+class TestParseAdvisorScoreType:
+    """Return type and edge cases for the helper."""
+
+    def test_non_string_input_returns_none(self):
+        # Defensive against non-string input.
+        assert parse_advisor_score(None) is None  # type: ignore[arg-type]
+        assert parse_advisor_score(8) is None  # type: ignore[arg-type]
+
+    def test_returned_value_is_int_or_none(self):
+        assert isinstance(parse_advisor_score("ADVISOR_SCORE: 8"), int)
+        assert parse_advisor_score("not a line") is None
+        assert parse_advisor_score("") is None
+
+
+# ────────────────────────────────────────────────────────────────────
+# parse_advisor_issues (DELTA 2: bullet list from ADVISOR_ISSUES: block)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestParseAdvisorIssuesHappyPath:
+    """The parser recognises the ``ADVISOR_ISSUES:`` block."""
+
+    def test_simple_dash_bullets(self):
+        text = (
+            "ADVISOR_ISSUES:\n"
+            "- issue 1\n"
+            "- issue 2"
+        )
+        assert parse_advisor_issues(text) == ["issue 1", "issue 2"]
+
+    def test_mixed_bullet_markers(self):
+        # The parser tolerates "-", "*", and "•" markers; the order
+        # is preserved.
+        text = (
+            "ADVISOR_ISSUES:\n"
+            "- issue 1\n"
+            "* issue 2\n"
+            "\u2022 issue 3"
+        )
+        assert parse_advisor_issues(text) == ["issue 1", "issue 2", "issue 3"]
+
+    def test_documented_example(self):
+        # The M5 contract example: ADVISOR_ISSUES: followed by "- ",
+        # "* ", and "\u2022 " bullet markers.
+        text = (
+            "ADVISOR_ISSUES:\n"
+            "- issue 1\n"
+            "* issue 2\n"
+            "\u2022 issue 3"
+        )
+        assert parse_advisor_issues(text) == ["issue 1", "issue 2", "issue 3"]
+
+    def test_multiple_bullets_with_dash(self):
+        text = (
+            "ADVISOR_ISSUES:\n"
+            "- first\n"
+            "- second\n"
+            "- third"
+        )
+        assert parse_advisor_issues(text) == ["first", "second", "third"]
+
+
+class TestParseAdvisorIssuesEmpty:
+    """Empty input returns an empty list."""
+
+    def test_empty_string(self):
+        assert parse_advisor_issues("") == []
+
+    def test_non_string_input_returns_empty_list(self):
+        assert parse_advisor_issues(None) == []  # type: ignore[arg-type]
+
+    def test_no_header_at_all(self):
+        # When the ADVISOR_ISSUES: header is missing, the parser
+        # returns an empty list.
+        assert parse_advisor_issues("- issue 1\n- issue 2") == []
+
+    def test_header_only_no_bullets(self):
+        # The header is present but the body is empty (header is the
+        # last line of the text).
+        assert parse_advisor_issues("ADVISOR_ISSUES:") == []
+
+    def test_header_followed_by_blank_line(self):
+        # A blank line after the header terminates the body.
+        assert parse_advisor_issues("ADVISOR_ISSUES:\n\n") == []
+
+
+class TestParseAdvisorIssuesEmptyBullets:
+    """Empty bullets are skipped."""
+
+    def test_dash_only_is_skipped(self):
+        text = "ADVISOR_ISSUES:\n- \n- real issue"
+        assert parse_advisor_issues(text) == ["real issue"]
+
+    def test_star_only_is_skipped(self):
+        text = "ADVISOR_ISSUES:\n* \n* real issue"
+        assert parse_advisor_issues(text) == ["real issue"]
+
+    def test_unicode_bullet_only_is_skipped(self):
+        text = "ADVISOR_ISSUES:\n\u2022 \n\u2022 real issue"
+        assert parse_advisor_issues(text) == ["real issue"]
+
+    def test_mix_of_empty_and_real_bullets(self):
+        text = (
+            "ADVISOR_ISSUES:\n"
+            "- \n"
+            "- real issue 1\n"
+            "* \n"
+            "- real issue 2"
+        )
+        assert parse_advisor_issues(text) == ["real issue 1", "real issue 2"]
+
+
+class TestParseAdvisorIssuesWhitespace:
+    """The parser trims surrounding whitespace."""
+
+    def test_trims_leading_whitespace_on_issue(self):
+        text = "ADVISOR_ISSUES:\n-    lots of leading spaces\n- normal"
+        assert parse_advisor_issues(text) == [
+            "lots of leading spaces",
+            "normal",
+        ]
+
+    def test_trims_trailing_whitespace(self):
+        text = "ADVISOR_ISSUES:\n- issue 1   \n- issue 2\t"
+        assert parse_advisor_issues(text) == ["issue 1", "issue 2"]
+
+    def test_tabs_as_whitespace(self):
+        text = "ADVISOR_ISSUES:\n-\tissue 1\n-\tissue 2"
+        assert parse_advisor_issues(text) == ["issue 1", "issue 2"]
+
+
+class TestParseAdvisorIssuesRejectsNonBullets:
+    """Non-bullet lines are skipped (not errors)."""
+
+    def test_text_without_marker_is_skipped(self):
+        text = (
+            "ADVISOR_ISSUES:\n"
+            "- real issue\n"
+            "this is plain text, not a bullet\n"
+            "- another real issue"
+        )
+        assert parse_advisor_issues(text) == [
+            "real issue",
+            "another real issue",
+        ]
+
+    def test_dash_without_whitespace_is_not_a_bullet(self):
+        # "-word" (no whitespace after the marker) is not a bullet.
+        text = "ADVISOR_ISSUES:\n-word\n- real issue"
+        assert parse_advisor_issues(text) == ["real issue"]
+
+
+class TestParseAdvisorIssuesBlockTermination:
+    """The block ends at the first blank line."""
+
+    def test_blank_line_terminates_block(self):
+        text = (
+            "ADVISOR_ISSUES:\n"
+            "- issue 1\n"
+            "- issue 2\n"
+            "\n"
+            "Some unrelated text after the blank line."
+        )
+        # The unrelated text is NOT part of the issues block; it is
+        # excluded by the blank-line terminator.
+        assert parse_advisor_issues(text) == ["issue 1", "issue 2"]
+
+    def test_continues_until_end_of_string_without_blank_line(self):
+        text = (
+            "ADVISOR_ISSUES:\n"
+            "- issue 1\n"
+            "- issue 2\n"
+            "no blank line at the end"
+        )
+        # "no blank line at the end" is not a bullet and is skipped.
+        assert parse_advisor_issues(text) == ["issue 1", "issue 2"]
+
+
+class TestParseAdvisorIssuesMultipleBlocks:
+    """When multiple ``ADVISOR_ISSUES:`` blocks exist, the LAST one wins."""
+
+    def test_last_block_wins(self):
+        text = (
+            "ADVISOR_ISSUES:\n"
+            "- first issue\n"
+            "ADVISOR_ISSUES:\n"
+            "- second issue"
+        )
+        assert parse_advisor_issues(text) == ["second issue"]
+
+
+class TestParseAdvisorIssuesType:
+    """Return type and edge cases for the helper."""
+
+    def test_returns_list(self):
+        result = parse_advisor_issues("ADVISOR_ISSUES:\n- x")
+        assert isinstance(result, list)
+
+    def test_returns_list_of_strings(self):
+        result = parse_advisor_issues("ADVISOR_ISSUES:\n- x\n- y")
+        for item in result:
+            assert isinstance(item, str)
+
+
+class TestParseAdvisorIssuesPipelinePackageExport:
+    """The helper is re-exported from the :mod:`moaxy.pipeline` package."""
+
+    def test_pipeline_package_re_exports_parse_advisor_score(self):
+        from moaxy.pipeline import (
+            parse_advisor_score as PkgParseAdvisorScore,
+        )
+
+        assert PkgParseAdvisorScore is parse_advisor_score
+
+    def test_pipeline_package_re_exports_parse_advisor_issues(self):
+        from moaxy.pipeline import (
+            parse_advisor_issues as PkgParseAdvisorIssues,
+        )
+
+        assert PkgParseAdvisorIssues is parse_advisor_issues
+
 

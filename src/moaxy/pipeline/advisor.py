@@ -17,7 +17,13 @@ Algorithm
    the parser returns a ``(decision, text)`` tuple where
    ``decision`` is one of ``"approve"`` or ``"revise"`` and ``text``
    is the revised answer (or ``None`` on approve).
-4. Run the configured :class:`moaxy.plugins.types.PluginType.ADVISOR`
+4. Parse the cross-critique markers additively:
+   :func:`parse_advisor_score` extracts the integer from the last
+   ``ADVISOR_SCORE:`` line; :func:`parse_advisor_issues` extracts
+   the bulleted issue list from the ``ADVISOR_ISSUES:`` block. Both
+   helpers are pure and independent of the legacy
+   ``ADVISOR_APPROVE`` / ``ADVISOR_REVISE:`` substring parsers.
+5. Run the configured :class:`moaxy.plugins.types.PluginType.ADVISOR`
    plugins via :meth:`moaxy.plugins.manager.PluginManager.run`. The
    plugin context receives ``advisor_decision`` and
    ``advisor_text`` (the full assistant content) so plugins can
@@ -36,6 +42,7 @@ pipeline log.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from moaxy.adapters.base import Adapter
@@ -47,6 +54,25 @@ logger = logging.getLogger(__name__)
 
 _APPROVE_MARKER = "ADVISOR_APPROVE"
 _REVISE_MARKER = "ADVISOR_REVISE:"
+
+# Anchored regex that extracts the integer from an advisor's last
+# ``ADVISOR_SCORE:`` line. The contract pins the exact pattern
+# ``^ADVISOR_SCORE:\\s*(\\d+)\\s*$`` (VAL-PIPE-EXTRA-040). Integer-
+# only by design; non-integer or non-numeric forms are rejected.
+_ADVISOR_SCORE_RE: re.Pattern[str] = re.compile(
+    r"^ADVISOR_SCORE:\s*(\d+)\s*$",
+    re.MULTILINE,
+)
+
+# Anchored regex that captures the leading ``ADVISOR_ISSUES:`` line
+# (case-sensitive, anchored at line start). The bullet bodies are
+# extracted line-by-line in :func:`parse_advisor_issues` because the
+# regex needs to tolerate multiple bullet markers and arbitrary
+# whitespace.
+_ADVISOR_ISSUES_HEADER_RE: re.Pattern[str] = re.compile(
+    r"^ADVISOR_ISSUES:\s*$",
+    re.MULTILINE,
+)
 
 
 def parse_advisor_response(text: str | None) -> tuple[str, str | None]:
@@ -92,6 +118,138 @@ def parse_advisor_response(text: str | None) -> tuple[str, str | None]:
         return "revise", after.strip()
 
     return "revise", text.strip()
+
+
+def parse_advisor_score(text: str | None) -> int | None:
+    """Return the integer from the last ``ADVISOR_SCORE: <int>`` line.
+
+    The helper uses the regex
+    ``^ADVISOR_SCORE:\\s*(\\d+)\\s*$`` (anchored per line,
+    MULTILINE, integer-only). When the line is missing or the value
+    is not a valid integer, the helper returns ``None`` so the
+    orchestrator can distinguish a missing-score case from a
+    parsed-but-malformed case.
+
+    Args:
+        text: The advisor's reply text. May be ``None`` or a
+            non-string; in that case the helper returns ``None``
+            rather than raising. The contract only passes strings.
+
+    Returns:
+        The integer parsed from the *last* matching line in
+        ``text``, or ``None`` when the regex finds nothing.
+        Integer-only: ``"ADVISOR_SCORE: 8.5"`` and
+        ``"ADVISOR_SCORE: eight"`` return ``None``.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    matches = _ADVISOR_SCORE_RE.findall(text)
+    if not matches:
+        return None
+    try:
+        return int(matches[-1])
+    except (TypeError, ValueError):
+        return None
+
+
+# Bullet markers accepted by :func:`parse_advisor_issues`. The set
+# of allowed markers is closed: ``"-"`` (ASCII hyphen), ``"*"`` (ASCII
+# asterisk), and ``"•"`` (Unicode bullet, U+2022). All markers must
+# be followed by one or more whitespace characters (space or tab) so
+# that text like ``"-"`` mid-sentence is not misread as a bullet.
+_ADVISOR_ISSUES_MARKERS: tuple[str, ...] = ("-", "*", "\u2022")
+_ADVISOR_ISSUES_MARKER_SET: frozenset[str] = frozenset(_ADVISOR_ISSUES_MARKERS)
+
+
+def _parse_issues_block(block: str) -> list[str]:
+    """Extract a list of trimmed bullet strings from a body block.
+
+    The body is the text that follows the ``ADVISOR_ISSUES:`` header
+    line, up to the next blank line or end of input. Each line that
+    starts with one of ``-``, ``*``, or ``•`` followed by one or
+    more whitespace characters is treated as a bullet; the bullet
+    marker and the trailing whitespace are stripped and the
+    remainder is trimmed. Lines that don't start with a recognised
+    marker (or that are blank) are skipped. Order is preserved.
+
+    Args:
+        block: A chunk of text containing zero or more bullet
+            lines. May be empty.
+
+    Returns:
+        A list of trimmed strings, one per recognised bullet line.
+        Empty bullets (``-`` with nothing after) are skipped.
+    """
+    issues: list[str] = []
+    if not block:
+        return issues
+    # Iterate line-by-line. ``str.splitlines()`` collapses \r\n, \r
+    # and \n into a flat list and skips the final empty entry.
+    for line in block.splitlines():
+        # Fast-path: empty / whitespace-only lines.
+        if not line.strip():
+            continue
+        first = line[0]
+        if first not in _ADVISOR_ISSUES_MARKER_SET:
+            continue
+        # The character after the marker must be whitespace.
+        if len(line) < 2 or line[1] not in (" ", "\t"):
+            continue
+        body = line[2:].strip()
+        if not body:
+            # Skip empty bullets.
+            continue
+        issues.append(body)
+    return issues
+
+
+def parse_advisor_issues(text: str | None) -> list[str]:
+    """Parse the ``ADVISOR_ISSUES:`` block into a list of issue strings.
+
+    The helper locates the *last* ``ADVISOR_ISSUES:`` header line in
+    ``text`` (case-sensitive, anchored at the start of a line,
+    MULTILINE) and extracts the bullet lines that follow it, up to
+    the next blank line. Each line is accepted when it starts with
+    one of ``-``, ``*``, or ``•`` (U+2022) followed by one or more
+    whitespace characters. The bullet marker and trailing
+    whitespace are stripped; the remainder is trimmed. Empty
+    bullets are skipped; order is preserved.
+
+    Args:
+        text: The advisor's reply text. May be ``None`` or a
+            non-string; in that case the helper returns ``[]``
+            rather than raising. The contract only passes strings.
+
+    Returns:
+        A list of trimmed issue strings. Returns ``[]`` when the
+        header is missing, the body is empty, or every bullet is
+        blank. The legacy ``ADVISOR_APPROVE`` / ``ADVISOR_REVISE:``
+        markers (substring parsers) are unchanged; this helper is
+        additive.
+    """
+    if not isinstance(text, str) or not text:
+        return []
+    matches = list(_ADVISOR_ISSUES_HEADER_RE.finditer(text))
+    if not matches:
+        return []
+    # Use the *last* header so a model that emits multiple
+    # ``ADVISOR_ISSUES:`` blocks resolves to the final one (mirrors
+    # the "last match wins" pattern used elsewhere).
+    header_match = matches[-1]
+    # The block starts immediately after the header line. Locate
+    # the next newline (or the end of the string) and then scan
+    # line-by-line until a blank line is encountered.
+    start = header_match.end()
+    # Advance to the start of the next line.
+    nl = text.find("\n", start)
+    if nl == -1:
+        return []
+    block = text[nl + 1:]
+    # Truncate the block at the first blank line.
+    blank_line = block.find("\n\n")
+    if blank_line != -1:
+        block = block[:blank_line]
+    return _parse_issues_block(block)
 
 
 async def advisor_turn(
@@ -187,4 +345,9 @@ async def advisor_turn(
     return decision, revised_text
 
 
-__all__ = ["advisor_turn", "parse_advisor_response"]
+__all__ = [
+    "advisor_turn",
+    "parse_advisor_issues",
+    "parse_advisor_response",
+    "parse_advisor_score",
+]

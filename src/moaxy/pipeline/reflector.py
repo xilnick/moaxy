@@ -10,10 +10,18 @@ reflector:
    :func:`parse_confidence` (regex
    ``^REFLECT_CONFIDENCE:\\s*([0-9.]+)\\s*$``). The contract pins the
    exact regex (VAL-PIPE-010); see :data:`_CONFIDENCE_RE`.
-4. Runs the configured ``REFLECTOR`` plugins via
+4. Parses the integer score from the response text using
+   :func:`parse_score` (regex ``^SCORE:\\s*(\\d+)\\s*$``,
+   VAL-PIPE-EXTRA-039).
+5. Computes the weighted early-exit signal with
+   :func:`parse_weighted_signal` (VAL-PIPE-EXTRA-042), the
+   ``trust_verbal * confidence + trust_score * (score / 10)``
+   formula. The "score missing" path falls back to ``confidence``
+   (v1 invariant).
+6. Runs the configured ``REFLECTOR`` plugins via
    :meth:`moaxy.plugins.manager.PluginManager.run` so user-supplied
    plugins can observe (or transform) the critique.
-5. Returns ``(critique_text, confidence)`` so the orchestrator can
+7. Returns ``(critique_text, confidence)`` so the orchestrator can
    decide whether to short-circuit (early-exit) or call the revision
    step.
 
@@ -53,6 +61,17 @@ _CONFIDENCE_RE: re.Pattern[str] = re.compile(
     re.MULTILINE,
 )
 
+# Anchored regex that extracts the integer from a critique's last
+# ``SCORE:`` line. The contract pins the exact pattern
+# ``^SCORE:\\s*(\\d+)\\s*$`` (VAL-PIPE-EXTRA-039, DELTA 5/6). It is
+# integer-only by design: scores are 0..10 and the model is expected
+# to emit integers; non-integer or non-numeric forms (e.g.
+# ``"SCORE: 7.5"``, ``"SCORE: seven"``) are rejected.
+_SCORE_RE: re.Pattern[str] = re.compile(
+    r"^SCORE:\s*(\d+)\s*$",
+    re.MULTILINE,
+)
+
 
 def parse_confidence(text: str | None) -> float:
     """Return the float from the last ``REFLECT_CONFIDENCE: <float>`` line.
@@ -83,6 +102,92 @@ def parse_confidence(text: str | None) -> float:
         return float(matches[-1])
     except (TypeError, ValueError):
         return 0.0
+
+
+def parse_score(text: str | None) -> int | None:
+    """Return the integer from the last ``SCORE: <int>`` line.
+
+    The helper uses the regex ``^SCORE:\\s*(\\d+)\\s*$`` (anchored
+    per line, MULTILINE, integer-only). When the line is missing or
+    the value is not a valid integer, the helper returns ``None``
+    so the orchestrator can distinguish a missing-score case from a
+    parsed-but-malformed case.
+
+    Args:
+        text: The critique text returned by the model. May be
+            ``None`` or a non-string; in that case the helper
+            returns ``None`` rather than raising. The contract only
+            passes strings.
+
+    Returns:
+        The integer parsed from the *last* matching line in
+        ``text``, or ``None`` when the regex finds nothing. The
+        integer-only constraint rejects ``"SCORE: 7.5"`` and
+        ``"SCORE: seven"``. Out-of-range values (e.g. ``"SCORE: 11"``)
+        are recorded as-is; the parser does not clamp.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    matches = _SCORE_RE.findall(text)
+    if not matches:
+        return None
+    try:
+        return int(matches[-1])
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_weighted_signal(
+    text: str | None,
+    *,
+    trust_verbal: float,
+    trust_score: float,
+) -> tuple[float, float, int | None]:
+    """Return ``(combined, confidence, score)`` for the weighted early-exit check.
+
+    The function extracts the last ``REFLECT_CONFIDENCE:`` and
+    ``SCORE:`` values from ``text`` (using the same parsers the
+    orchestrator calls directly), then computes the combined
+    early-exit signal:
+
+    * When a ``SCORE:`` value is present:
+      ``combined = trust_verbal * confidence + trust_score * (score / 10.0)``.
+    * When ``SCORE:`` is missing: ``combined = confidence`` (the
+      v1 behavior). The "score missing" path does NOT multiply
+      confidence by ``trust_verbal``; the v1 threshold check
+      ``confidence >= threshold`` is preserved verbatim. This is
+      DELTA 5's documented exception (VAL-PIPE-EXTRA-035,
+      VAL-PIPE-EXTRA-042).
+
+    Args:
+        text: The critique text returned by the model. May be
+            ``None`` or a non-string; the helper handles it
+            defensively.
+        trust_verbal: Weight applied to the verbal ``REFLECT_CONFIDENCE:``
+            signal. Caller must supply a non-negative float.
+        trust_score: Weight applied to the integer ``SCORE:`` signal
+            (after dividing by 10). Caller must supply a
+            non-negative float.
+
+    Returns:
+        A 3-tuple ``(combined, confidence, score)``.
+
+        * ``combined`` is the early-exit signal the orchestrator
+          compares against the route's ``threshold``. ``confidence``
+          when ``score`` is ``None``; the weighted formula above
+          when both are present.
+        * ``confidence`` is the float parsed from
+          ``REFLECT_CONFIDENCE:`` (or ``0.0`` when the line is
+          missing or malformed).
+        * ``score`` is the integer parsed from ``SCORE:`` (or
+          ``None`` when the line is missing or malformed).
+    """
+    confidence = parse_confidence(text)
+    score = parse_score(text)
+    if score is None:
+        return confidence, confidence, score
+    combined = trust_verbal * confidence + trust_score * (score / 10.0)
+    return combined, confidence, score
 
 
 async def reflect_turn(
@@ -173,4 +278,9 @@ async def reflect_turn(
     return text, confidence
 
 
-__all__ = ["parse_confidence", "reflect_turn"]
+__all__ = [
+    "parse_confidence",
+    "parse_score",
+    "parse_weighted_signal",
+    "reflect_turn",
+]
