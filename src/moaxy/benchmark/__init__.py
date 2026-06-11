@@ -27,6 +27,11 @@ from moaxy.benchmark.prompts import (
     FunctionFromDocstringPrompt,
     RefactorPrompt,
 )
+from moaxy.benchmark.scoring import (
+    score_bug_fix,
+    score_function_from_docstring,
+    score_refactor,
+)
 
 __all__ = [
     "COMPARISON_MODELS",
@@ -39,4 +44,8 @@ __all__ = [
     "PROMPT_SET",
     "RefactorPrompt",
     "make_config",
+    "score_bug_fix",
+    "score_function_from_docstring",
+    "score_refactor",
 ]
+
