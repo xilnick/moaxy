@@ -989,6 +989,582 @@ class TestOpenRouterAdapterStreaming:
 
 
 # ────────────────────────────────────────────────────────────────────
+# M6 streaming parity (VAL-OR-013..015, VAL-PIPE-EXTRA-032)
+#
+# The orchestrator's ``stream_run`` parser already handles the
+# OpenAI-shaped SSE chunk shape the OpenRouterAdapter emits, so no
+# orchestrator changes are required. These tests pin the parity
+# contract end-to-end: an OpenRouter route driven by a
+# :class:`FakeAdapter` that yields OpenAI-shaped SSE chunks (the
+# same shape :meth:`OpenRouterAdapter.stream` produces) produces a
+# ``text/event-stream`` response with the same trailing SSE trailer
+# (all 9 ``x-moaxy-*`` headers in the sidecar ``x_moaxy`` field)
+# as the buffered path on a comparable Ollama route. The M5 deltas
+# (reflection, advisor, conditional skip, weighted early-exit)
+# work on OpenRouter streaming routes identically. The
+# ``[DONE]`` terminator is consumed silently.
+# ────────────────────────────────────────────────────────────────────
+
+
+def _parse_sse_events(body: str) -> list[tuple[str | None, str]]:
+    """Parse an SSE response body into ``(event_name, data_payload)`` pairs.
+
+    Mirrors the helper used by ``test_streaming.py``: the body is a
+    series of events separated by a blank line (``\\n\\n``); the
+    ``event:`` and ``data:`` fields are extracted. The terminator
+    ``[DONE]`` is preserved as a ``data:`` payload so tests can
+    assert on its presence.
+    """
+    events: list[tuple[str | None, str]] = []
+    current_event: str | None = None
+    current_data: list[str] = []
+    for line in body.split("\n"):
+        if line == "":
+            if current_data or current_event is not None:
+                events.append((current_event, "\n".join(current_data)))
+            current_event = None
+            current_data = []
+            continue
+        if line.startswith(":"):
+            continue
+        if ":" in line:
+            field, _, value = line.partition(":")
+            if value.startswith(" "):
+                value = value[1:]
+            if field == "event":
+                current_event = value
+            elif field == "data":
+                current_data.append(value)
+    if current_data or current_event is not None:
+        events.append((current_event, "\n".join(current_data)))
+    return events
+
+
+class TestOpenRouterStreamingParity:
+    """VAL-OR-013..015: streaming path works on OpenRouter routes.
+
+    The orchestrator's ``stream_run`` parser is OpenAI-shaped; the
+    OpenRouterAdapter's ``stream()`` yields the same plain ``str``
+    chunks the OllamaAdapter produces. The hermetic tests below
+    wire a :class:`FakeAdapter` (which yields plain ``str`` chunks
+    just like the OpenRouterAdapter does in real life) into an
+    OpenRouter-backend route and assert that the streaming path
+    works identically to an Ollama route. The contract:
+    ``OpenRouterAdapter.stream() yields plain str chunks`` and
+    ````[DONE]`` is consumed silently`` are pinned here at the
+    orchestrator level (the underlying adapter tests cover the
+    adapter-level behaviour).
+    """
+
+    @pytest.mark.asyncio
+    async def test_streaming_openrouter_route_emits_terminator(self):
+        """A simple ``stream: true`` request on an OpenRouter route
+        produces a ``text/event-stream`` response with multiple
+        ``data:`` lines and a final ``data: [DONE]`` terminator.
+        The terminator is consumed silently (it is never yielded
+        as a chunk, only carried as the SSE terminator line).
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        from moaxy.adapters.registry import AdapterRegistry
+        from moaxy.models.config import (
+            AdapterConfig,
+            MoaxyConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.server.app import create_app
+        from tests.fixtures.fake_adapter import FakeAdapter
+
+        # The FakeAdapter's stream_script yields plain str chunks
+        # — the same shape ``OpenRouterAdapter.stream()`` emits
+        # from a real OpenAI-shaped SSE ``data:`` frame. The
+        # orchestrator treats them identically.
+        adapter = FakeAdapter(stream_script=[["Hel", "lo, ", "world!"]])
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(
+                model="*", path="/v1/chat/completions"
+            ),
+            backend="openrouter-prod",
+        )
+        cfg = MoaxyConfig(
+            backends=[
+                AdapterConfig(
+                    name="openrouter-prod",
+                    adapter="openrouter",
+                    base_url="https://openrouter.ai/api/v1",
+                )
+            ],
+            routes=[route],
+        )
+        registry = AdapterRegistry({"openrouter-prod": adapter})
+        app = create_app(config=cfg, adapters=registry)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "anthropic/claude-3-haiku",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = _parse_sse_events(response.text)
+        # The last event is the [DONE] terminator.
+        assert events[-1] == (None, "[DONE]")
+        # The non-terminator data events have a content key in their
+        # delta (vanilla OpenAI shape).
+        for _name, payload in events[:-1]:
+            decoded = json.loads(payload)
+            assert decoded["choices"][0]["delta"].get("content") is not None
+        # The chunks accumulate to the scripted text.
+        deltas: list[str] = []
+        for _name, payload in events[:-1]:
+            decoded = json.loads(payload)
+            content = decoded["choices"][0]["delta"].get("content", "")
+            if content:
+                deltas.append(content)
+        assert "".join(deltas) == "Hello, world!"
+
+    @pytest.mark.asyncio
+    async def test_streaming_openrouter_route_trailer_carries_all_headers(
+        self,
+    ):
+        """VAL-PIPE-EXTRA-032: the streamed OpenRouter response
+        includes the trailing SSE trailer with all 9
+        ``x-moaxy-*`` headers in the sidecar ``x_moaxy`` field.
+        The trailer mirrors the buffered path's response headers
+        identically, so streaming clients see the same
+        observability as buffered clients.
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        from moaxy.adapters.base import ChatResponse, Message, Usage
+        from moaxy.adapters.registry import AdapterRegistry
+        from moaxy.models.config import (
+            AdapterConfig,
+            AdvisorConfig,
+            MoaxyConfig,
+            ReflectionConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.server.app import create_app
+        from tests.fixtures.fake_adapter import FakeAdapter
+
+        def _chat_response(content: str, model: str) -> ChatResponse:
+            return ChatResponse(
+                id="chatcmpl-or-stream",
+                model=model,
+                message=Message(role="assistant", content=content),
+                usage=Usage(
+                    prompt_tokens=10, completion_tokens=5, total_tokens=15
+                ),
+            )
+
+        # Scripted responses: initial stream, reflection critique
+        # (emits both REFLECT_CONFIDENCE and SCORE for the
+        # reflect-score header), reflection revision, advisor
+        # (emits ADVISOR_SCORE: 8 for the advisor-score header).
+        # The cross-critique markers trigger the M5 events
+        # (reflect_score / advisor_score) on an OpenRouter route.
+        adapter = FakeAdapter(
+            stream_script=[["Hello, ", "world!"]],
+            responses=[
+                _chat_response(
+                    "c\nREFLECT_CONFIDENCE: 0.5\nSCORE: 7",
+                    model="anthropic/claude-3-haiku",
+                ),
+                _chat_response(
+                    "revised answer",
+                    model="anthropic/claude-3-haiku",
+                ),
+                _chat_response(
+                    "ADVISOR_DECISION: APPROVE\nADVISOR_SCORE: 8",
+                    model="openai/gpt-4o-mini",
+                ),
+            ],
+        )
+        route = RouteConfig(
+            name="openrouter-reflective",
+            match=ConfigRouteMatch(
+                model="*", path="/v1/chat/completions"
+            ),
+            backend="openrouter-prod",
+            reflection=ReflectionConfig(
+                turns=1, early_exit=False, threshold=0.85
+            ),
+            advisor=AdvisorConfig(
+                model="openai/gpt-4o-mini", turns=1
+            ),
+        )
+        cfg = MoaxyConfig(
+            backends=[
+                AdapterConfig(
+                    name="openrouter-prod",
+                    adapter="openrouter",
+                    base_url="https://openrouter.ai/api/v1",
+                )
+            ],
+            routes=[route],
+        )
+        registry = AdapterRegistry({"openrouter-prod": adapter})
+        app = create_app(config=cfg, adapters=registry)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "anthropic/claude-3-haiku",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = _parse_sse_events(response.text)
+        # The last event is the [DONE] terminator.
+        assert events[-1] == (None, "[DONE]")
+        # The second-to-last event is the trailing SSE trailer.
+        trailer = json.loads(events[-2][1])
+        x_moaxy = trailer["x_moaxy"]
+        # All 9 ``x-moaxy-*`` headers are present in the trailer,
+        # mirroring the buffered path's response headers. The
+        # OpenRouter route is observed in the trailer with the
+        # same observability as an Ollama route of the same
+        # shape.
+        assert x_moaxy["x-moaxy-alias-resolved"] == "anthropic/claude-3-haiku"
+        assert x_moaxy["x-moaxy-fallbacks-used"] == "0"
+        assert x_moaxy["x-moaxy-reflect-turns"] == "1"
+        # 0.5 is the parsed confidence; the trailer's
+        # reflect-confidence header stringifies it via ``:g``
+        # format (the orchestrator's ``build_response_headers``
+        # helper).
+        assert x_moaxy["x-moaxy-reflect-confidence"] == "0.5"
+        # M5 DELTA 6: ``x-moaxy-reflect-score`` carries the
+        # last parsed SCORE: value (7).
+        assert x_moaxy["x-moaxy-reflect-score"] == "7"
+        # M5 DELTA 6: ``x-moaxy-advisor-score`` carries the
+        # parsed ADVISOR_SCORE: value (8).
+        assert x_moaxy["x-moaxy-advisor-score"] == "8"
+        # Advisor ran (confidence 0.5 < 0.85), so the
+        # advisor-model header is the configured advisor name
+        # and the skip header is "0/no".
+        assert x_moaxy["x-moaxy-advisor-model"] == "openai/gpt-4o-mini"
+        assert x_moaxy["x-moaxy-advisor-skipped"] == "0/no"
+        # The trailer event is ``chat.completion.chunk``-shaped
+        # so vanilla OpenAI clients see a well-formed final
+        # chunk (empty delta, ``finish_reason: "stop"``) at the
+        # trailer position; the ``x_moaxy`` sidecar is the
+        # additive moaxy extension.
+        assert trailer["object"] == "chat.completion.chunk"
+        assert trailer["choices"][0]["delta"]["content"] == ""
+        assert trailer["choices"][0]["finish_reason"] == "stop"
+
+    @pytest.mark.asyncio
+    async def test_streaming_openrouter_conditional_advisor_skip(self):
+        """VAL-PIPE-EXTRA-034: DELTA 1 conditional advisor skip
+        works on OpenRouter streaming routes identically to Ollama
+        routes. When the parsed ``REFLECT_CONFIDENCE`` >= 0.85,
+        the advisor LLM call is short-circuited; no
+        ``event: revision`` for the advisor is emitted; the
+        trailing SSE trailer carries
+        ``x-moaxy-advisor-skipped: 1/confidence=<x>``.
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        from moaxy.adapters.base import ChatResponse, Message, Usage
+        from moaxy.adapters.registry import AdapterRegistry
+        from moaxy.models.config import (
+            AdapterConfig,
+            AdvisorConfig,
+            MoaxyConfig,
+            ReflectionConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.server.app import create_app
+        from tests.fixtures.fake_adapter import FakeAdapter
+
+        def _chat_response(content: str, model: str) -> ChatResponse:
+            return ChatResponse(
+                id="chatcmpl-or-stream",
+                model=model,
+                message=Message(role="assistant", content=content),
+                usage=Usage(
+                    prompt_tokens=10, completion_tokens=5, total_tokens=15
+                ),
+            )
+
+        # Scripted: initial stream, reflection critique with high
+        # confidence (0.9). The advisor is SKIPPED on this route
+        # — no scripted advisor entry is needed.
+        adapter = FakeAdapter(
+            stream_script=[["Hello, ", "world!"]],
+            responses=[
+                _chat_response(
+                    "looks good\nREFLECT_CONFIDENCE: 0.9\nSCORE: 8",
+                    model="anthropic/claude-3-haiku",
+                ),
+            ],
+        )
+        route = RouteConfig(
+            name="openrouter-reflective",
+            match=ConfigRouteMatch(
+                model="*", path="/v1/chat/completions"
+            ),
+            backend="openrouter-prod",
+            reflection=ReflectionConfig(
+                turns=1, early_exit=True, threshold=0.85
+            ),
+            advisor=AdvisorConfig(
+                model="openai/gpt-4o-mini", turns=1
+            ),
+        )
+        cfg = MoaxyConfig(
+            backends=[
+                AdapterConfig(
+                    name="openrouter-prod",
+                    adapter="openrouter",
+                    base_url="https://openrouter.ai/api/v1",
+                )
+            ],
+            routes=[route],
+        )
+        registry = AdapterRegistry({"openrouter-prod": adapter})
+        app = create_app(config=cfg, adapters=registry)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "anthropic/claude-3-haiku",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 200
+        events = _parse_sse_events(response.text)
+        # No revision event in the stream (early-exit + skip).
+        revision_events = [e for e in events if e[0] == "revision"]
+        assert len(revision_events) == 0
+        # The trailer carries the skip header.
+        trailer = json.loads(events[-2][1])
+        x_moaxy = trailer["x_moaxy"]
+        assert x_moaxy["x-moaxy-advisor-skipped"] == "1/confidence=0.9"
+        # The advisor-model header is NOT set on a skip.
+        assert "x-moaxy-advisor-model" not in x_moaxy
+        # Adapter call counts: 1 critique chat-call (the initial
+        # is the streaming path). No advisor chat-call.
+        assert len(adapter.calls) == 1
+        assert len(adapter.stream_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_streaming_openrouter_weighted_early_exit(self):
+        """VAL-PIPE-EXTRA-032: DELTA 5 weighted early-exit works
+        on OpenRouter streaming routes. With
+        ``trust_verbal: 0.0, trust_score: 1.0, threshold: 0.85``
+        and a scripted ``SCORE: 9`` (combined signal = 0.9),
+        the orchestrator short-circuits and emits no revision
+        event; the trailer carries
+        ``x-moaxy-reflect-score: 9``.
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        from moaxy.adapters.base import ChatResponse, Message, Usage
+        from moaxy.adapters.registry import AdapterRegistry
+        from moaxy.models.config import (
+            AdapterConfig,
+            MoaxyConfig,
+            ReflectionConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.server.app import create_app
+        from tests.fixtures.fake_adapter import FakeAdapter
+
+        def _chat_response(content: str, model: str) -> ChatResponse:
+            return ChatResponse(
+                id="chatcmpl-or-stream",
+                model=model,
+                message=Message(role="assistant", content=content),
+                usage=Usage(
+                    prompt_tokens=10, completion_tokens=5, total_tokens=15
+                ),
+            )
+
+        # Critique: REFLECT_CONFIDENCE 0.5, SCORE 9. With
+        # trust_verbal=0.0, trust_score=1.0:
+        # combined = 0.0 * 0.5 + 1.0 * (9/10) = 0.9 >= 0.85
+        # → weighted early-exit fires; no revision.
+        adapter = FakeAdapter(
+            stream_script=[["initial"]],
+            responses=[
+                _chat_response(
+                    "c\nREFLECT_CONFIDENCE: 0.5\nSCORE: 9",
+                    model="anthropic/claude-3-haiku",
+                ),
+            ],
+        )
+        route = RouteConfig(
+            name="openrouter-reflective",
+            match=ConfigRouteMatch(
+                model="*", path="/v1/chat/completions"
+            ),
+            backend="openrouter-prod",
+            reflection=ReflectionConfig(
+                turns=1,
+                early_exit=True,
+                threshold=0.85,
+                trust_verbal=0.0,
+                trust_score=1.0,
+            ),
+        )
+        cfg = MoaxyConfig(
+            backends=[
+                AdapterConfig(
+                    name="openrouter-prod",
+                    adapter="openrouter",
+                    base_url="https://openrouter.ai/api/v1",
+                )
+            ],
+            routes=[route],
+        )
+        registry = AdapterRegistry({"openrouter-prod": adapter})
+        app = create_app(config=cfg, adapters=registry)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "anthropic/claude-3-haiku",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 200
+        events = _parse_sse_events(response.text)
+        # No revision event in the stream.
+        revision_events = [e for e in events if e[0] == "revision"]
+        assert len(revision_events) == 0
+        # 1 critique chat-call. No revision chat-call.
+        assert len(adapter.calls) == 1
+        assert len(adapter.stream_calls) == 1
+        # The trailer carries the parsed score (9) and the
+        # reflect-confidence header (0.5) — the weighted signal
+        # itself is internal; the trailer mirrors the buffered
+        # path's response headers identically.
+        trailer = json.loads(events[-2][1])
+        x_moaxy = trailer["x_moaxy"]
+        assert x_moaxy["x-moaxy-reflect-score"] == "9"
+        assert x_moaxy["x-moaxy-reflect-confidence"] == "0.5"
+        # The M5 weighted early-exit fires; the stream ends
+        # with the [DONE] terminator (the route's advisor
+        # turns is 0 so no advisor call is attempted).
+        assert events[-1] == (None, "[DONE]")
+
+    @pytest.mark.asyncio
+    async def test_streaming_openrouter_done_terminator_consumed_silently(
+        self,
+    ):
+        """VAL-OR-015: the ``[DONE]`` terminator is consumed
+        silently on an OpenRouter streaming route. The SSE
+        stream ends with the canonical ``data: [DONE]\\n\\n``
+        terminator; no ``[DONE]`` is ever yielded as a content
+        chunk, and the FakeAdapter's stream() call count equals
+        the number of streamed calls (the terminator is not
+        counted as a separate call).
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        from moaxy.adapters.registry import AdapterRegistry
+        from moaxy.models.config import (
+            AdapterConfig,
+            MoaxyConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import RouteMatch as ConfigRouteMatch
+        from moaxy.server.app import create_app
+        from tests.fixtures.fake_adapter import FakeAdapter
+
+        # A multi-chunk stream followed by the [DONE] terminator
+        # that the orchestrator's parser MUST consume silently.
+        adapter = FakeAdapter(stream_script=[["a", "b", "c"]])
+        route = RouteConfig(
+            name="r",
+            match=ConfigRouteMatch(
+                model="*", path="/v1/chat/completions"
+            ),
+            backend="openrouter-prod",
+        )
+        cfg = MoaxyConfig(
+            backends=[
+                AdapterConfig(
+                    name="openrouter-prod",
+                    adapter="openrouter",
+                    base_url="https://openrouter.ai/api/v1",
+                )
+            ],
+            routes=[route],
+        )
+        registry = AdapterRegistry({"openrouter-prod": adapter})
+        app = create_app(config=cfg, adapters=registry)
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "anthropic/claude-3-haiku",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "stream": True,
+                },
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 200
+        events = _parse_sse_events(response.text)
+        # The last event is the canonical terminator.
+        assert events[-1] == (None, "[DONE]")
+        # The body ends with the literal ``data: [DONE]\\n\\n``.
+        assert response.text.endswith("data: [DONE]\n\n")
+        # No ``[DONE]`` is ever yielded as a content chunk. The
+        # accumulated content chunks form the streamed text
+        # ``"abc"`` (each chunk's ``delta.content`` is the
+        # scripted string).
+        deltas: list[str] = []
+        for _name, payload in events[:-1]:
+            decoded = json.loads(payload)
+            content = decoded["choices"][0]["delta"].get("content", "")
+            if content:
+                deltas.append(content)
+        assert "".join(deltas) == "abc"
+        # Exactly one stream call was made (the orchestrator
+        # does not re-call the adapter for the [DONE] marker).
+        assert len(adapter.stream_calls) == 1
+
+
+# ────────────────────────────────────────────────────────────────────
 # __repr__ redaction
 # ────────────────────────────────────────────────────────────────────
 
