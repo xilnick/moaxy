@@ -105,6 +105,8 @@ def _build_route(
     retry: int = 0,
     original_model: str = "coder-pro",
     resolved_model: str = "minimax-m3:cloud",
+    trust_verbal: float = 0.6,
+    trust_score: float = 0.4,
 ) -> RouteMatch:
     config_route = RouteConfig(
         name="reflection-test-route",
@@ -119,6 +121,8 @@ def _build_route(
             threshold=threshold,
             parallel=parallel,
             system_prompt=system_prompt,
+            trust_verbal=trust_verbal,
+            trust_score=trust_score,
         ),
         advisor=AdvisorConfig(model=advisor_model, turns=advisor_turns),
     )
@@ -1300,3 +1304,214 @@ class TestFinishReasonPreservation:
         await Orchestrator(adapter).run(ctx)
         assert ctx.upstream_response is not None
         assert ctx.upstream_response.finish_reason == "stop"
+
+
+# ────────────────────────────────────────────────────────────────────
+# 18. Weighted early-exit + DELTA 7 safety (M5)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestWeightedEarlyExit:
+    """M5: the SEQUENTIAL reflection loop uses ``parse_weighted_signal``.
+
+    These tests pin the M5 contract: the threshold check is now driven
+    by the combined confidence+score signal (with the route's trust
+    weights), and a missing ``REFLECT_CONFIDENCE:`` line is treated as
+    a malformed response that does NOT short-circuit.
+    """
+
+    @pytest.mark.asyncio
+    async def test_weighted_signal_used_for_threshold_check(self):
+        """VAL-PIPE-EXTRA-010: trust_verbal=1.0, trust_score=0.0 → confidence only.
+
+        With ``trust_score=0.0`` the SCORE: line is parsed but does not
+        affect the threshold decision. The check reduces to the v1
+        ``confidence >= threshold`` invariant.
+        """
+        adapter = FakeAdapter(
+            [
+                _response("initial"),
+                _critique_response("c", confidence=0.9),
+                _response("revised"),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            trust_verbal=1.0,
+            trust_score=0.0,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # 0.9 >= 0.85 → early exit (no revision).
+        assert [e.type for e in ctx.events] == [
+            "initial",
+            "reflect_critique",
+            "reflect_early_exit",
+        ]
+        assert len(adapter.calls) == 2
+        # The combined signal equals the raw confidence (no score).
+        assert ctx.__dict__["last_combined_signal"] == 0.9
+
+    @pytest.mark.asyncio
+    async def test_reflect_score_event_emitted_when_score_parsed(self):
+        """VAL-PIPE-EXTRA-018: a parsed SCORE: line emits a reflect_score event."""
+        # We need a critique response with both a REFLECT_CONFIDENCE
+        # and a SCORE: line. Build it inline.
+        crit = ChatResponse(
+            id="c1",
+            model="minimax-m3:cloud",
+            message=Message(
+                role="assistant",
+                content="looks good\nREFLECT_CONFIDENCE: 0.9\nSCORE: 7",
+            ),
+            usage=Usage(prompt_tokens=4, completion_tokens=6, total_tokens=10),
+            finish_reason="stop",
+        )
+        adapter = FakeAdapter(
+            [_response("initial"), crit, _response("revised")]
+        )
+        route = _build_route(reflection_turns=1, early_exit=True, threshold=0.85)
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+
+        # A 'reflect_score' event is appended with text="7" and turn=0.
+        score_events = [e for e in ctx.events if e.type == "reflect_score"]
+        assert len(score_events) == 1
+        assert score_events[0].text == "7"
+        assert score_events[0].turn == 0
+        # The ctx.__dict__['last_score'] is also set.
+        assert ctx.__dict__["last_score"] == 7
+
+    @pytest.mark.asyncio
+    async def test_reflect_score_event_not_emitted_when_score_missing(self):
+        """When the model does not emit a SCORE: line, no reflect_score event."""
+        adapter = FakeAdapter(
+            [
+                _response("initial"),
+                _critique_response("c", confidence=0.5),
+                _response("revised"),
+            ]
+        )
+        route = _build_route(reflection_turns=1, early_exit=True, threshold=0.85)
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # No reflect_score event in the list.
+        assert "reflect_score" not in [e.type for e in ctx.events]
+        # last_score is None.
+        assert ctx.__dict__["last_score"] is None
+
+    @pytest.mark.asyncio
+    async def test_delta7_safety_malformed_critique_continues(self):
+        """VAL-PIPE-EXTRA-016: malformed critique (no REFLECT_CONFIDENCE line).
+
+        A critique with NO ``REFLECT_CONFIDENCE:`` line is treated as a
+        malformed response. The orchestrator MUST NOT short-circuit;
+        the revision runs as if ``early_exit: false`` for that turn.
+        """
+        adapter = FakeAdapter(
+            [
+                _response("initial"),
+                _critique_response("a critique with no confidence line", confidence=None),
+                _response("revised after missing line"),
+            ]
+        )
+        route = _build_route(reflection_turns=1, early_exit=True, threshold=0.0)
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+
+        # Even with threshold=0.0, the malformed safety rule forces
+        # clears_threshold=False; the revision runs.
+        assert len(adapter.calls) == 3
+        assert "reflect_early_exit" not in [e.type for e in ctx.events]
+        assert [e.type for e in ctx.events] == [
+            "initial",
+            "reflect_critique",
+            "reflect_revised",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_explicit_zero_confidence_not_malformed(self):
+        """VAL-PIPE-EXTRA-017: explicit zero confidence is NOT malformed.
+
+        The line ``REFLECT_CONFIDENCE: 0.0`` is a successfully parsed
+        value, distinct from the missing-line case. The v1 threshold
+        check applies: 0.0 < 0.85 → revision runs (not the safety path).
+        """
+        adapter = FakeAdapter(
+            [
+                _response("initial"),
+                _critique_response("c", confidence=0.0),
+                _response("revised"),
+            ]
+        )
+        route = _build_route(reflection_turns=1, early_exit=True, threshold=0.85)
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # 0.0 < 0.85 → revision runs.
+        assert len(adapter.calls) == 3
+        assert "reflect_early_exit" not in [e.type for e in ctx.events]
+
+    @pytest.mark.asyncio
+    async def test_combined_signal_exposed_on_context(self):
+        """The combined signal is stored on ctx.__dict__['last_combined_signal']."""
+        # With trust_verbal=0.6, trust_score=0.4 and
+        # REFLECT_CONFIDENCE: 0.6, SCORE: 9: combined = 0.6*0.6 + 0.4*0.9 = 0.72
+        crit = ChatResponse(
+            id="c1",
+            model="minimax-m3:cloud",
+            message=Message(
+                role="assistant",
+                content="c\nREFLECT_CONFIDENCE: 0.6\nSCORE: 9",
+            ),
+            usage=Usage(prompt_tokens=4, completion_tokens=6, total_tokens=10),
+            finish_reason="stop",
+        )
+        adapter = FakeAdapter(
+            [_response("initial"), crit, _response("revised")]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            trust_verbal=0.6,
+            trust_score=0.4,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # 0.72 < 0.85 → revision runs.
+        assert len(adapter.calls) == 3
+        assert ctx.__dict__["last_combined_signal"] == pytest.approx(0.72)
+        assert ctx.__dict__["last_score"] == 9
+        assert ctx.__dict__["last_confidence"] == pytest.approx(0.6)
+
+    @pytest.mark.asyncio
+    async def test_existing_reflection_tests_still_pass(self):
+        """Regression smoke: the weighted-signal refactor does not change
+        the v1 event ordering for the standard 2-turn full loop.
+        """
+        adapter = FakeAdapter(
+            [
+                _response("initial"),
+                _critique_response("c1", confidence=0.5),
+                _response("rev1"),
+                _critique_response("c2", confidence=0.5),
+                _response("rev2"),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=2, early_exit=True, threshold=0.85
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The standard v1 ordering is preserved.
+        assert [e.type for e in ctx.events] == [
+            "initial",
+            "reflect_critique",
+            "reflect_revised",
+            "reflect_critique",
+            "reflect_revised",
+        ]
+        assert ctx.upstream_response is not None
+        assert ctx.upstream_response.message.content == "rev2"

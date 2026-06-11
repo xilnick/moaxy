@@ -108,7 +108,11 @@ from moaxy.pipeline.prompts import (
     DEFAULT_ADVISOR_PROMPT,
     DEFAULT_REFLECT_PROMPT,
 )
-from moaxy.pipeline.reflector import parse_confidence
+from moaxy.pipeline.reflector import (
+    parse_confidence,
+    parse_score,
+    parse_weighted_signal,
+)
 from moaxy.plugins.manager import PluginManager
 
 logger = logging.getLogger(__name__)
@@ -453,10 +457,52 @@ class Orchestrator:
             # Remember the last parsed confidence for the response header.
             ctx.__dict__["last_confidence"] = confidence
 
+            # DELTA 5 / 6: parse the weighted early-exit signal. The
+            # ``parse_weighted_signal`` helper extracts the last
+            # ``REFLECT_CONFIDENCE:`` and ``SCORE:`` values, then
+            # combines them with the route's trust weights. When
+            # ``SCORE:`` is missing, the combined value falls back to
+            # the raw ``confidence`` (v1 behavior, preserving the
+            # ``confidence >= threshold`` invariant).
+            combined, confidence, score = parse_weighted_signal(
+                critique_text,
+                trust_verbal=reflect_cfg.trust_verbal,
+                trust_score=reflect_cfg.trust_score,
+            )
+            ctx.__dict__["last_combined_signal"] = combined
+            ctx.__dict__["last_score"] = score
+            # Emit a reflect_score event whenever a SCORE: line was
+            # successfully parsed. The event's text is the integer
+            # score (as a string) so log consumers can grep for it.
+            if score is not None:
+                ctx.append_event(
+                    "reflect_score",
+                    turn=turn,
+                    model=critique_response.model or model_chain[0],
+                    text=str(score),
+                )
+
             is_last_turn = turn == reflect_cfg.turns - 1
             clears_threshold = (
-                reflect_cfg.early_exit and confidence >= reflect_cfg.threshold
+                reflect_cfg.early_exit and combined >= reflect_cfg.threshold
             )
+
+            # DELTA 7 safety: a critique with no REFLECT_CONFIDENCE:
+            # line is treated as a malformed response (the model
+            # failed to follow the protocol). The orchestrator MUST
+            # NOT short-circuit in this case, even when
+            # ``early_exit: true`` and ``threshold: 0.0``. The
+            # malformed case is distinguishable from an explicit
+            # ``REFLECT_CONFIDENCE: 0.0`` by the absence of the
+            # ``REFLECT_CONFIDENCE:`` line itself: ``parse_score``
+            # also returns ``None`` AND the critique text contains
+            # no ``REFLECT_CONFIDENCE:`` substring.
+            malformed = (
+                "REFLECT_CONFIDENCE:" not in critique_text
+                and parse_score(critique_text) is None
+            )
+            if malformed:
+                clears_threshold = False
 
             # On the last turn, an early-exit short-circuits the
             # revision: the model has declared itself confident and we
