@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from ipaddress import ip_address
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
@@ -20,7 +21,7 @@ from pydantic import (
     model_validator,
 )
 
-AdapterKind = Literal["ollama", "openai"]
+AdapterKind = Literal["ollama", "openai", "openrouter"]
 StrategyKind = Literal["single", "weighted", "round_robin"]
 LogLevel = Literal["debug", "info", "warning", "error"]
 
@@ -59,7 +60,7 @@ class ServerConfig(BaseModel):
 
 
 class AdapterConfig(BaseModel):
-    """Backend adapter (ollama or openai-compatible)."""
+    """Backend adapter (ollama, openai, or openrouter)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -68,6 +69,50 @@ class AdapterConfig(BaseModel):
     base_url: str = Field(min_length=1)
     api_key: str | None = None
     timeout: float = Field(30.0, gt=0.0)
+    http_referer: str | None = None
+    x_title: str | None = None
+    transforms: list[str] | None = None
+
+    @field_validator("http_referer")
+    @classmethod
+    def _http_referer_must_be_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(
+                "http_referer must be a non-empty URL string when set "
+                "(e.g. 'https://example.com'); use null to omit the header"
+            )
+        try:
+            parsed = urlsplit(value.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"http_referer is not a valid URL (got {value!r}): {exc}"
+            ) from exc
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError(
+                f"http_referer must be an absolute URL with a scheme and host "
+                f"(e.g. 'https://example.com'); got {value!r}"
+            )
+        return value
+
+    @field_validator("transforms")
+    @classmethod
+    def _transforms_must_be_non_empty(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        if not isinstance(value, list) or len(value) == 0:
+            raise ValueError(
+                "transforms must be a non-empty list of strings when set; "
+                "use null to omit the field"
+            )
+        for entry in value:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ValueError(
+                    "transforms entries must be non-empty strings "
+                    f"(got {entry!r})"
+                )
+        return value
 
 
 class ApiKey(BaseModel):

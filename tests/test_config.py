@@ -202,6 +202,523 @@ class TestAdapterConfig:
             AdapterConfig(name="x", adapter="ollama", base_url="")
 
 
+# ── AdapterConfig M6 OpenRouter fields ───────────────────────────────────
+
+
+class TestAdapterConfigM6OpenRouterFields:
+    """M6 delta 1: AdapterConfig accepts adapter='openrouter' alongside
+    'ollama' and 'openai', plus three new optional fields
+    (http_referer, x_title, transforms) with strict validation.
+
+    See `m6-openrouter-pydantic-config` in features.json and the
+    `M6 Component Changes` section of architecture.md. The new fields
+    default to ``None`` so existing Ollama / OpenAI configs continue
+    to parse unchanged. Backwards compat is the M6 invariant.
+    """
+
+    # ── AdapterKind literal: openrouter accepted, anthropic rejected ──
+
+    def test_openrouter_literal_accepted(self):
+        # VAL-OR-001: AdapterKind literal accepts "openrouter".
+        a = AdapterConfig(
+            name="or",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        assert a.adapter == "openrouter"
+
+    def test_openrouter_default_base_url_in_canonical_example(self):
+        # The exact URL from the validation contract.
+        a = AdapterConfig(
+            name="x",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        assert a.base_url == "https://openrouter.ai/api/v1"
+        assert a.adapter == "openrouter"
+
+    def test_anthropic_literal_rejected(self):
+        # VAL-OR-001: an unknown adapter literal raises ValidationError
+        # whose message mentions "adapter" and the valid options.
+        with pytest.raises(ValidationError) as exc:
+            AdapterConfig(name="x", adapter="anthropic", base_url="https://x")
+        msg = str(exc.value)
+        assert "adapter" in msg
+        # Pydantic's literal-rejection message includes the valid options.
+        assert "openrouter" in msg or "Input should be" in msg
+
+    def test_anthropic_literal_rejected_on_full_moaxy_config(self):
+        # The literal rejection also works at the MoaxyConfig level.
+        with pytest.raises(ValidationError) as exc:
+            MoaxyConfig(
+                backends=[
+                    {
+                        "name": "x",
+                        "adapter": "anthropic",
+                        "base_url": "https://x",
+                    }
+                ],
+            )
+        assert "adapter" in str(exc.value)
+
+    def test_existing_ollama_literal_still_accepted(self):
+        # Backwards compat: the v1-v5 'ollama' literal keeps working.
+        a = AdapterConfig(
+            name="local",
+            adapter="ollama",
+            base_url="http://127.0.0.1:11434",
+        )
+        assert a.adapter == "ollama"
+
+    def test_existing_openai_literal_still_accepted(self):
+        # Backwards compat: the v1-v5 'openai' literal keeps working.
+        a = AdapterConfig(
+            name="openai",
+            adapter="openai",
+            base_url="https://api.openai.com/v1",
+            api_key="sk-abc",
+        )
+        assert a.adapter == "openai"
+        assert a.api_key == "sk-abc"
+
+    # ── Default values for new fields ────────────────────────────────
+
+    def test_http_referer_defaults_to_none(self):
+        a = AdapterConfig(name="x", adapter="openrouter", base_url="https://x")
+        assert a.http_referer is None
+
+    def test_x_title_defaults_to_none(self):
+        a = AdapterConfig(name="x", adapter="openrouter", base_url="https://x")
+        assert a.x_title is None
+
+    def test_transforms_defaults_to_none(self):
+        a = AdapterConfig(name="x", adapter="openrouter", base_url="https://x")
+        assert a.transforms is None
+
+    def test_ollama_defaults_unchanged(self):
+        # Backwards compat: existing Ollama adapters get None on the new
+        # fields without specifying them.
+        a = AdapterConfig(name="x", adapter="ollama", base_url="http://127.0.0.1:11434")
+        assert a.http_referer is None
+        assert a.x_title is None
+        assert a.transforms is None
+
+    def test_openai_defaults_unchanged(self):
+        a = AdapterConfig(
+            name="x",
+            adapter="openai",
+            base_url="https://api.openai.com/v1",
+            api_key="sk-abc",
+        )
+        assert a.http_referer is None
+        assert a.x_title is None
+        assert a.transforms is None
+
+    # ── http_referer: URL validation ──────────────────────────────────
+
+    def test_http_referer_accepts_https_url(self):
+        # VAL-OR-002: http_referer='https://example.com' is accepted.
+        a = AdapterConfig(
+            name="x",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            http_referer="https://example.com",
+        )
+        assert a.http_referer == "https://example.com"
+
+    def test_http_referer_accepts_http_url(self):
+        a = AdapterConfig(
+            name="x",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            http_referer="http://example.com",
+        )
+        assert a.http_referer == "http://example.com"
+
+    def test_http_referer_accepts_url_with_path(self):
+        a = AdapterConfig(
+            name="x",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            http_referer="https://example.com/some/path",
+        )
+        assert a.http_referer == "https://example.com/some/path"
+
+    def test_http_referer_accepts_url_with_port(self):
+        a = AdapterConfig(
+            name="x",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            http_referer="https://example.com:8443/foo",
+        )
+        assert a.http_referer == "https://example.com:8443/foo"
+
+    def test_http_referer_accepts_url_with_query(self):
+        a = AdapterConfig(
+            name="x",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            http_referer="https://example.com/?ref=moaxy",
+        )
+        assert a.http_referer == "https://example.com/?ref=moaxy"
+
+    def test_http_referer_rejects_garbage(self):
+        # VAL-OR-002: http_referer='not-a-url' raises ValidationError.
+        with pytest.raises(ValidationError) as exc:
+            AdapterConfig(
+                name="x",
+                adapter="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                http_referer="not-a-url",
+            )
+        assert "http_referer" in str(exc.value)
+
+    def test_http_referer_rejects_empty_string(self):
+        with pytest.raises(ValidationError) as exc:
+            AdapterConfig(
+                name="x",
+                adapter="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                http_referer="",
+            )
+        assert "http_referer" in str(exc.value)
+
+    def test_http_referer_rejects_whitespace_only(self):
+        with pytest.raises(ValidationError) as exc:
+            AdapterConfig(
+                name="x",
+                adapter="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                http_referer="   ",
+            )
+        assert "http_referer" in str(exc.value)
+
+    def test_http_referer_rejects_scheme_only(self):
+        with pytest.raises(ValidationError) as exc:
+            AdapterConfig(
+                name="x",
+                adapter="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                http_referer="https://",
+            )
+        assert "http_referer" in str(exc.value)
+
+    def test_http_referer_rejects_host_only(self):
+        # No scheme => rejected (must be absolute).
+        with pytest.raises(ValidationError) as exc:
+            AdapterConfig(
+                name="x",
+                adapter="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                http_referer="example.com",
+            )
+        assert "http_referer" in str(exc.value)
+
+    def test_http_referer_rejects_non_string(self):
+        with pytest.raises(ValidationError) as exc:
+            AdapterConfig(
+                name="x",
+                adapter="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                http_referer=12345,  # type: ignore[arg-type]
+            )
+        assert "http_referer" in str(exc.value)
+
+    # ── x_title: free-form string (no URL validation) ────────────────
+
+    def test_x_title_accepts_plain_string(self):
+        a = AdapterConfig(
+            name="x",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            x_title="My App",
+        )
+        assert a.x_title == "My App"
+
+    def test_x_title_accepts_empty_string(self):
+        # No URL validation here; an empty string is a legitimate (if
+        # useless) value to forward to OpenRouter.
+        a = AdapterConfig(
+            name="x",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            x_title="",
+        )
+        assert a.x_title == ""
+
+    def test_x_title_accepts_unicode(self):
+        a = AdapterConfig(
+            name="x",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            x_title="мой агент",
+        )
+        assert a.x_title == "мой агент"
+
+    def test_x_title_rejects_non_string(self):
+        with pytest.raises(ValidationError):
+            AdapterConfig(
+                name="x",
+                adapter="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                x_title=42,  # type: ignore[arg-type]
+            )
+
+    # ── transforms: non-empty list validation ────────────────────────
+
+    def test_transforms_accepts_single_entry(self):
+        # VAL-OR-003: transforms=['middle-out'] is accepted.
+        a = AdapterConfig(
+            name="x",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            transforms=["middle-out"],
+        )
+        assert a.transforms == ["middle-out"]
+
+    def test_transforms_accepts_multiple_entries(self):
+        a = AdapterConfig(
+            name="x",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            transforms=["middle-out", "custom-transform"],
+        )
+        assert a.transforms == ["middle-out", "custom-transform"]
+
+    def test_transforms_rejects_empty_list(self):
+        # VAL-OR-003: transforms=[] raises ValidationError.
+        with pytest.raises(ValidationError) as exc:
+            AdapterConfig(
+                name="x",
+                adapter="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                transforms=[],
+            )
+        assert "transforms" in str(exc.value)
+
+    def test_transforms_none_is_default(self):
+        # VAL-OR-003: transforms=None is accepted (default).
+        a = AdapterConfig(
+            name="x",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            transforms=None,
+        )
+        assert a.transforms is None
+
+    def test_transforms_rejects_non_list(self):
+        with pytest.raises(ValidationError) as exc:
+            AdapterConfig(
+                name="x",
+                adapter="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                transforms="middle-out",  # type: ignore[arg-type]
+            )
+        assert "transforms" in str(exc.value)
+
+    def test_transforms_rejects_empty_string_entry(self):
+        with pytest.raises(ValidationError) as exc:
+            AdapterConfig(
+                name="x",
+                adapter="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                transforms=["middle-out", ""],
+            )
+        assert "transforms" in str(exc.value)
+
+    def test_transforms_rejects_non_string_entry(self):
+        with pytest.raises(ValidationError) as exc:
+            AdapterConfig(
+                name="x",
+                adapter="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                transforms=["middle-out", 42],  # type: ignore[list-item]
+            )
+        assert "transforms" in str(exc.value)
+
+    # ── All three new fields together (round-trip) ───────────────────
+
+    def test_all_three_new_fields_round_trip_through_adapter_config(self):
+        a = AdapterConfig(
+            name="or",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            http_referer="https://my.app",
+            x_title="My App",
+            transforms=["middle-out"],
+        )
+        assert a.http_referer == "https://my.app"
+        assert a.x_title == "My App"
+        assert a.transforms == ["middle-out"]
+
+    def test_all_three_new_fields_round_trip_through_moaxy_config(self):
+        # VAL-OR-001/002/003: round-trip via MoaxyConfig (the full tree).
+        cfg = MoaxyConfig(
+            backends=[
+                {
+                    "name": "or",
+                    "adapter": "openrouter",
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "http_referer": "https://my.app",
+                    "x_title": "My App",
+                    "transforms": ["middle-out"],
+                }
+            ]
+        )
+        backend = cfg.backends[0]
+        assert backend.adapter == "openrouter"
+        assert backend.http_referer == "https://my.app"
+        assert backend.x_title == "My App"
+        assert backend.transforms == ["middle-out"]
+
+    def test_all_three_new_fields_round_trip_via_model_dump(self):
+        # model_dump() preserves the new fields for re-parsing.
+        a = AdapterConfig(
+            name="or",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            http_referer="https://my.app",
+            x_title="My App",
+            transforms=["middle-out"],
+        )
+        dumped = a.model_dump()
+        assert dumped["http_referer"] == "https://my.app"
+        assert dumped["x_title"] == "My App"
+        assert dumped["transforms"] == ["middle-out"]
+        # Re-parse from the dict to ensure full round-trip.
+        a2 = AdapterConfig(**dumped)
+        assert a2 == a
+
+    def test_all_three_new_fields_round_trip_via_json(self):
+        a = AdapterConfig(
+            name="or",
+            adapter="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            http_referer="https://my.app",
+            x_title="My App",
+            transforms=["middle-out"],
+        )
+        encoded = json.dumps(a.model_dump())
+        reloaded = AdapterConfig(**json.loads(encoded))
+        assert reloaded == a
+
+    # ── YAML load end-to-end ─────────────────────────────────────────
+
+    def test_yaml_load_with_openrouter_backend(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("MOAXY_CONFIG_PATH", raising=False)
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            """
+backends:
+  - name: openrouter-prod
+    adapter: openrouter
+    base_url: https://openrouter.ai/api/v1
+    http_referer: https://my.app
+    x_title: My App
+    transforms: [middle-out]
+""",
+            encoding="utf-8",
+        )
+        from moaxy.config import load_config
+
+        cfg = load_config(path=path)
+        backend = cfg.backends[0]
+        assert backend.adapter == "openrouter"
+        assert backend.http_referer == "https://my.app"
+        assert backend.x_title == "My App"
+        assert backend.transforms == ["middle-out"]
+
+    def test_yaml_load_with_invalid_http_referer_raises(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("MOAXY_CONFIG_PATH", raising=False)
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            """
+backends:
+  - name: or
+    adapter: openrouter
+    base_url: https://openrouter.ai/api/v1
+    http_referer: not-a-url
+""",
+            encoding="utf-8",
+        )
+        from moaxy.config import load_config
+
+        with pytest.raises(ValidationError) as exc:
+            load_config(path=path)
+        assert "http_referer" in str(exc.value)
+
+    def test_yaml_load_with_empty_transforms_raises(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("MOAXY_CONFIG_PATH", raising=False)
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            """
+backends:
+  - name: or
+    adapter: openrouter
+    base_url: https://openrouter.ai/api/v1
+    transforms: []
+""",
+            encoding="utf-8",
+        )
+        from moaxy.config import load_config
+
+        with pytest.raises(ValidationError) as exc:
+            load_config(path=path)
+        assert "transforms" in str(exc.value)
+
+    def test_yaml_load_with_anthropic_adapter_raises(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("MOAXY_CONFIG_PATH", raising=False)
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            """
+backends:
+  - name: bad
+    adapter: anthropic
+    base_url: https://x
+""",
+            encoding="utf-8",
+        )
+        from moaxy.config import load_config
+
+        with pytest.raises(ValidationError) as exc:
+            load_config(path=path)
+        assert "adapter" in str(exc.value)
+
+    def test_yaml_load_ollama_unchanged_with_new_fields_present(self, tmp_path, monkeypatch):
+        # Backwards compat: an existing Ollama config without the new
+        # fields still parses.
+        monkeypatch.delenv("MOAXY_CONFIG_PATH", raising=False)
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            """
+backends:
+  - name: ollama-local
+    adapter: ollama
+    base_url: http://127.0.0.1:11434
+    timeout: 30.0
+""",
+            encoding="utf-8",
+        )
+        from moaxy.config import load_config
+
+        cfg = load_config(path=path)
+        assert cfg.backends[0].adapter == "ollama"
+        assert cfg.backends[0].http_referer is None
+        assert cfg.backends[0].x_title is None
+        assert cfg.backends[0].transforms is None
+
+    # ── Strict schema: extra fields forbidden ────────────────────────
+
+    def test_adapter_rejects_unknown_field_with_openrouter(self):
+        with pytest.raises(ValidationError):
+            AdapterConfig(
+                name="x",
+                adapter="openrouter",
+                base_url="https://x",
+                unknown=1,
+            )
+
+
 # ── AuthConfig + ApiKey ───────────────────────────────────────────────────
 
 
