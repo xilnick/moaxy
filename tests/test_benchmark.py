@@ -28,6 +28,7 @@ table-driven test that catches any regression in one place.
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from moaxy.benchmark import prompts as prompts_module
@@ -48,6 +49,7 @@ from moaxy.benchmark.prompts import (
     RefactorPrompt,
 )
 from moaxy.benchmark.scoring import (
+    LLMJudgeScorer,
     score_bug_fix,
     score_function_from_docstring,
     score_refactor,
@@ -1464,3 +1466,514 @@ def test_package_init_exports_scoring_symbols():
     assert score_function_from_docstring_reexport is scoring_module.score_function_from_docstring
     assert score_bug_fix_reexport is scoring_module.score_bug_fix
     assert score_refactor_reexport is scoring_module.score_refactor
+
+
+# ────────────────────────────────────────────────────────────────────
+# LLM-as-judge scorer
+# ────────────────────────────────────────────────────────────────────
+#
+# M7 feature m7-llm-judge-scorer: the
+# :mod:`moaxy.benchmark.scoring.judge` module owns the
+# :class:`LLMJudgeScorer` — the LLM-as-judge implementation that
+# scores the ``explain`` category's responses on a 0-10 rubric.
+# The contract (VAL-BENCH-006, VAL-BENCH-007) requires:
+#
+# * A known judge response (e.g. ``"The code is correct and clear.
+#   <SCORE> 8 </SCORE>"``) is parsed and the scorer returns
+#   ``8.0``.
+# * A known judge response with a lowercase tag
+#   (``"<score>10</score>"``) is parsed and returns ``10.0``.
+# * A malformed judge response (no ``<SCORE>`` tag, no parseable
+#   integer, empty string) returns ``5.0`` — the documented
+#   default. A single bad judge call must not break the
+#   benchmark.
+# * All scores are in ``[0, 10]`` (the scorer's public surface
+#   is a float in ``[0, 10]``; the report generator
+#   normalises to ``[0, 1]`` at aggregation time).
+#
+# The :class:`TestLLMJudgeScorer` test class below exercises the
+# scorer with canned judge responses via an in-process
+# :class:`httpx.AsyncBaseTransport` (mirroring the M5 / M6
+# hermetic test pattern in :mod:`tests.conftest`). The
+# transport lets the tests run without a real Ollama and
+# without a real judge model.
+
+
+class _FakeJudgeTransport(httpx.AsyncBaseTransport):
+    """A programmable httpx transport for the :class:`LLMJudgeScorer`.
+
+    Mirrors :class:`tests.conftest._FakeOllamaTransport` and
+    :class:`tests.conftest._FakeOpenRouterTransport` so the
+    judge scorer can be exercised in-process. Records every
+    request it sees and dispatches to a user-supplied async
+    handler that returns the scripted :class:`httpx.Response`.
+
+    The transport emits a single OpenAI-shaped
+    ``chat.completion`` JSON object whose
+    ``choices[0].message.content`` is the canned judge
+    response the test wants to assert on. The payload is
+    built with :func:`tests.conftest.make_openrouter_payload`
+    so the shape is consistent with the rest of the
+    test suite.
+    """
+
+    def __init__(self, handler) -> None:
+        self._handler = handler
+        self.requests: list[httpx.Request] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return await self._handler(request)
+
+
+def _judge_response_payload(content: str) -> dict[str, object]:
+    """Build an OpenAI-shaped payload whose assistant content is ``content``.
+
+    The payload mirrors the shape
+    :func:`tests.conftest.make_openrouter_payload` produces.
+    The model name is the default judge model
+    (``deepseek-v4-pro:cloud``) so the canned response is
+    shape-compatible with the production scorer's
+    expectations.
+    """
+    return {
+        "id": "chatcmpl-judge-1",
+        "object": "chat.completion",
+        "created": 1700000000,
+        "model": "deepseek-v4-pro:cloud",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 50,
+            "completion_tokens": 10,
+            "total_tokens": 60,
+        },
+    }
+
+
+def _judge_json_response(content: str) -> httpx.Response:
+    """Build a 200 ``application/json`` response with the canned judge content."""
+    import json
+
+    return httpx.Response(
+        status_code=200,
+        headers={"content-type": "application/json"},
+        content=json.dumps(_judge_response_payload(content)).encode("utf-8"),
+    )
+
+
+class TestLLMJudgeScorer:
+    """VAL-BENCH-006 / VAL-BENCH-007: LLM-judge scorer works.
+
+    The test class targets the four contract assertions:
+
+    * ``VAL-BENCH-006`` positive case: a known judge response
+      with the structured ``<SCORE>`` tag is parsed correctly.
+    * ``VAL-BENCH-006` lowercase variant: a known judge
+      response with a lowercase ``<score>`` tag is parsed
+      correctly.
+    * ``VAL-BENCH-007`` malformed response: a non-parseable
+      response returns the default ``5.0``.
+    * ``VAL-BENCH-007`` empty response: an empty response
+      returns the default ``5.0``.
+    * The score is always a float in ``[0, 10]``.
+
+    The tests use an in-process :class:`httpx.AsyncBaseTransport`
+    (see :class:`_FakeJudgeTransport`) so the scorer is
+    exercised without a real Ollama. The canned judge
+    responses are the contract-pinned inputs from the
+    feature description.
+    """
+
+    async def test_known_score_tag_returns_8(self):
+        # VAL-BENCH-006 positive case: a known judge response
+        # with the canonical ``<SCORE> 8 </SCORE>`` tag returns
+        # 8.0. The canned response mirrors the example in the
+        # feature description verbatim.
+        canned = "The code is correct. <SCORE> 8 </SCORE>"
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return _judge_json_response(canned)
+
+        scorer = LLMJudgeScorer(_transport=_FakeJudgeTransport(handler))
+        try:
+            score = await scorer.score(
+                prompt="Explain what this code does.",
+                model_output="The code returns 1.",
+            )
+        finally:
+            await scorer.close()
+        assert score == 8.0, (
+            f"known judge response {canned!r} expected 8.0, got {score!r}"
+        )
+
+    async def test_lowercase_score_tag_returns_10(self):
+        # VAL-BENCH-006 lowercase variant: a known judge
+        # response with the lowercase ``<score>10</score>``
+        # tag (no inner whitespace) returns 10.0. The parser
+        # is case-insensitive on the tag name and tolerates
+        # the absence of inner whitespace.
+        canned = "<score>10</score>"
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return _judge_json_response(canned)
+
+        scorer = LLMJudgeScorer(_transport=_FakeJudgeTransport(handler))
+        try:
+            score = await scorer.score("p", "m")
+        finally:
+            await scorer.close()
+        assert score == 10.0, (
+            f"lowercase tag judge response {canned!r} expected 10.0, "
+            f"got {score!r}"
+        )
+
+    async def test_malformed_response_returns_5(self):
+        # VAL-BENCH-007 malformed response: a non-parseable
+        # response (no ``<SCORE>`` tag, no bare integer line)
+        # returns the default ``5.0``. The canned response is
+        # a verbose explanation with no structured score
+        # marker.
+        canned = "The code looks fine but the explanation is incomplete."
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return _judge_json_response(canned)
+
+        scorer = LLMJudgeScorer(_transport=_FakeJudgeTransport(handler))
+        try:
+            score = await scorer.score("p", "m")
+        finally:
+            await scorer.close()
+        assert score == 5.0, (
+            f"malformed judge response expected 5.0 fallback, "
+            f"got {score!r}"
+        )
+
+    async def test_empty_response_returns_5(self):
+        # VAL-BENCH-007 empty response: an empty assistant
+        # content returns the default ``5.0``. The transport
+        # is configured to return an OpenAI-shaped response
+        # whose ``content`` is the empty string.
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return _judge_json_response("")
+
+        scorer = LLMJudgeScorer(_transport=_FakeJudgeTransport(handler))
+        try:
+            score = await scorer.score("p", "m")
+        finally:
+            await scorer.close()
+        assert score == 5.0, (
+            f"empty judge response expected 5.0 fallback, "
+            f"got {score!r}"
+        )
+
+    async def test_score_in_unit_interval_for_all_cases(self):
+        # The contract requires every score to be a float in
+        # ``[0, 10]``. Pin the type and the membership
+        # invariant on a battery of canned responses, so a
+        # future edit that drifts the parser outside the
+        # contract is caught here.
+        canned_responses = [
+            "The code is correct. <SCORE> 8 </SCORE>",
+            "<score>10</score>",
+            "<SCORE>0</SCORE>",
+            "<SCORE>  7  </SCORE>",  # whitespace inside tag
+            "<SCORE>5</SCORE>\n",  # trailing newline
+            "score: 6",  # bare-ish integer on a line
+            "5",  # bare integer line
+            "",  # empty
+            "no score here",  # truly malformed
+        ]
+        for canned in canned_responses:
+            async def handler(
+                _request: httpx.Request,
+                _canned: str = canned,
+            ) -> httpx.Response:
+                return _judge_json_response(_canned)
+            scorer = LLMJudgeScorer(_transport=_FakeJudgeTransport(handler))
+            try:
+                score = await scorer.score("p", "m")
+            finally:
+                await scorer.close()
+            assert isinstance(score, float), (
+                f"score for canned response {canned!r} must be a float, "
+                f"got {type(score).__name__}"
+            )
+            assert 0.0 <= score <= 10.0, (
+                f"score for canned response {canned!r} must be in "
+                f"[0.0, 10.0], got {score!r}"
+            )
+
+    async def test_score_clamped_to_unit_interval(self):
+        # The contract (VAL-BENCH-006 / VAL-BENCH-007) requires
+        # the score to be in ``[0, 10]``. A judge that emits
+        # out-of-range integers (e.g. ``-1`` or ``42``) must
+        # be clamped, not surfaced as an out-of-range value.
+        # The clamp is intentionally permissive: a single
+        # bad judge call must not break the benchmark.
+        for canned, expected in [
+            ("<SCORE>-1</SCORE>", 0.0),
+            ("<SCORE>0</SCORE>", 0.0),
+            ("<SCORE>10</SCORE>", 10.0),
+            ("<SCORE>42</SCORE>", 10.0),
+        ]:
+            async def handler(
+                _request: httpx.Request,
+                _canned: str = canned,
+            ) -> httpx.Response:
+                return _judge_json_response(_canned)
+            scorer = LLMJudgeScorer(_transport=_FakeJudgeTransport(handler))
+            try:
+                score = await scorer.score("p", "m")
+            finally:
+                await scorer.close()
+            assert score == expected, (
+                f"canned {canned!r} expected {expected!r} after clamp, "
+                f"got {score!r}"
+            )
+
+    async def test_score_uses_judge_model(self):
+        # The scorer must call the judge model with the
+        # configured ``judge_model`` name. The contract
+        # pins the model name (``deepseek-v4-pro:cloud``)
+        # so the live benchmark calls the cheapest local
+        # model. Pin the model name on the outbound
+        # request so a future edit that swaps the model
+        # without updating the contract is caught here.
+        captured: list[dict[str, object]] = []
+        async def handler(request: httpx.Request) -> httpx.Response:
+            import json
+            payload = json.loads(request.content.decode("utf-8"))
+            captured.append(payload)
+            return _judge_json_response("<SCORE>9</SCORE>")
+
+        scorer = LLMJudgeScorer(_transport=_FakeJudgeTransport(handler))
+        try:
+            score = await scorer.score("p", "m")
+        finally:
+            await scorer.close()
+        assert score == 9.0
+        assert captured, "scorer did not call the judge transport"
+        first_payload = captured[0]
+        assert first_payload.get("model") == "deepseek-v4-pro:cloud", (
+            f"judge call model expected 'deepseek-v4-pro:cloud', "
+            f"got {first_payload.get('model')!r}"
+        )
+        # The judge is called non-streaming.
+        assert first_payload.get("stream") is False, (
+            f"judge call stream expected False, "
+            f"got {first_payload.get('stream')!r}"
+        )
+
+    async def test_score_formats_prompt_and_model_output(self):
+        # The scorer formats the user's prompt and the model's
+        # response into the :data:`JUDGE_PROMPT_TEMPLATE` and
+        # sends the formatted text as the user message. Pin
+        # the formatted text on the outbound request so a
+        # future edit that drops a section (correctness,
+        # completeness, clarity) is caught here.
+        import json
+        captured_messages: list[list[dict[str, object]]] = []
+        async def handler(request: httpx.Request) -> httpx.Response:
+            payload = json.loads(request.content.decode("utf-8"))
+            captured_messages.append(payload.get("messages", []))
+            return _judge_json_response("<SCORE>7</SCORE>")
+
+        scorer = LLMJudgeScorer(_transport=_FakeJudgeTransport(handler))
+        try:
+            score = await scorer.score(
+                prompt="Explain what X does.",
+                model_output="X does Y.",
+            )
+        finally:
+            await scorer.close()
+        assert score == 7.0
+        assert captured_messages, "scorer did not call the judge transport"
+        first_messages = captured_messages[0]
+        assert isinstance(first_messages, list) and first_messages, (
+            f"judge call must include at least one message, got {first_messages!r}"
+        )
+        user_text = str(first_messages[0].get("content", ""))
+        assert "Explain what X does." in user_text, (
+            f"judge prompt must include the original prompt text; got {user_text!r}"
+        )
+        assert "X does Y." in user_text, (
+            f"judge prompt must include the model output text; got {user_text!r}"
+        )
+        # The rubric's three criteria are referenced verbatim
+        # in the template; pin the substrings so a future
+        # edit that drops a criterion is caught here.
+        for criterion in ("Correctness", "Completeness", "Clarity"):
+            assert criterion in user_text, (
+                f"judge prompt must reference criterion {criterion!r}; "
+                f"got {user_text!r}"
+            )
+        # The structured ``<SCORE>`` tag is referenced verbatim
+        # in the template so the judge knows the expected
+        # output shape.
+        assert "<SCORE>" in user_text, (
+            f"judge prompt must instruct the judge to emit <SCORE> tag; "
+            f"got {user_text!r}"
+        )
+
+    async def test_score_does_not_raise_on_http_error(self):
+        # A judge that returns a 4xx/5xx response must not
+        # crash the scorer. The contract (VAL-BENCH-007)
+        # requires the scorer to be robust to any kind of
+        # judge failure; the scorer's score() method must
+        # return the fallback in every case.
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=500,
+                headers={"content-type": "application/json"},
+                content=b'{"error": {"message": "upstream is on fire"}}',
+            )
+
+        scorer = LLMJudgeScorer(_transport=_FakeJudgeTransport(handler))
+        try:
+            score = await scorer.score("p", "m")
+        finally:
+            await scorer.close()
+        assert score == 5.0, (
+            f"5xx judge response expected 5.0 fallback, got {score!r}"
+        )
+
+    async def test_score_does_not_raise_on_network_error(self):
+        # A judge transport that raises a network error must
+        # not crash the scorer. The contract requires the
+        # scorer to be robust; the score() method must
+        # return the fallback in every case.
+        class _FailingTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(
+                self, _request: httpx.Request
+            ) -> httpx.Response:
+                raise httpx.ConnectError("simulated network failure")
+
+        scorer = LLMJudgeScorer(_transport=_FailingTransport())
+        try:
+            score = await scorer.score("p", "m")
+        finally:
+            await scorer.close()
+        assert score == 5.0, (
+            f"network-failure judge response expected 5.0 fallback, "
+            f"got {score!r}"
+        )
+
+    async def test_score_does_not_raise_on_malformed_json(self):
+        # A judge transport that returns a non-JSON body
+        # must not crash the scorer. The contract requires
+        # the scorer to be robust; the score() method must
+        # return the fallback in every case.
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=200,
+                headers={"content-type": "application/json"},
+                content=b"<not-json",
+            )
+
+        scorer = LLMJudgeScorer(_transport=_FakeJudgeTransport(handler))
+        try:
+            score = await scorer.score("p", "m")
+        finally:
+            await scorer.close()
+        assert score == 5.0, (
+            f"malformed-JSON judge response expected 5.0 fallback, "
+            f"got {score!r}"
+        )
+
+    async def test_bare_integer_line_fallback(self):
+        # When the structured ``<SCORE>`` tag is absent, the
+        # parser falls back to a bare integer on a line by
+        # itself. Pin the fallback path so a future edit
+        # that drops the fallback (e.g. only matches the
+        # structured tag) is caught here.
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return _judge_json_response("Some prose here.\n6\nMore prose.")
+
+        scorer = LLMJudgeScorer(_transport=_FakeJudgeTransport(handler))
+        try:
+            score = await scorer.score("p", "m")
+        finally:
+            await scorer.close()
+        assert score == 6.0, (
+            f"bare-integer fallback expected 6.0, got {score!r}"
+        )
+
+    async def test_custom_fallback_score_is_honoured(self):
+        # The scorer's ``default_fallback_score`` constructor
+        # argument lets callers override the fallback. Pin
+        # the override path so a future edit that hardcodes
+        # the fallback (e.g. ignores the constructor
+        # argument) is caught here.
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return _judge_json_response("no score marker here")
+
+        scorer = LLMJudgeScorer(
+            _transport=_FakeJudgeTransport(handler),
+            default_fallback_score=2.5,
+        )
+        try:
+            score = await scorer.score("p", "m")
+        finally:
+            await scorer.close()
+        assert score == 2.5, (
+            f"custom fallback expected 2.5, got {score!r}"
+        )
+
+    async def test_close_is_idempotent(self):
+        # ``LLMJudgeScorer.close()`` must be safe to call
+        # multiple times. The contract does not require this
+        # directly, but the report generator and the live
+        # benchmark CLI both call ``close()`` after
+        # ``score()``; a double-close would raise and crash
+        # the benchmark. Pin the idempotence invariant here
+        # so a future edit that breaks it is caught.
+        async def handler(_request: httpx.Request) -> httpx.Response:
+            return _judge_json_response("<SCORE>8</SCORE>")
+
+        scorer = LLMJudgeScorer(_transport=_FakeJudgeTransport(handler))
+        score = await scorer.score("p", "m")
+        assert score == 8.0
+        await scorer.close()
+        # Second close: must not raise.
+        await scorer.close()
+
+
+def test_package_init_exports_judge_scorer_symbols():
+    # The package's ``__init__`` re-exports the public judge
+    # symbols (``LLMJudgeScorer``, ``DEFAULT_JUDGE_MODEL``,
+    # ``DEFAULT_FALLBACK_SCORE``, ``parse_judge_score``,
+    # ``score_with_judge``) alongside the prompt, config, and
+    # deterministic-scorer types. Pin the re-exports so a
+    # future refactor of the package facade does not silently
+    # break downstream imports.
+    from moaxy.benchmark import (
+        DEFAULT_FALLBACK_SCORE as DEFAULT_FALLBACK_SCORE_REEXPORT,
+    )
+    from moaxy.benchmark import (
+        DEFAULT_JUDGE_MODEL as DEFAULT_JUDGE_MODEL_REEXPORT,
+    )
+    from moaxy.benchmark import (
+        LLMJudgeScorer as LLMJudgeScorerReexport,
+    )
+    from moaxy.benchmark import (
+        parse_judge_score as parse_judge_score_reexport,
+    )
+    from moaxy.benchmark import (
+        score_with_judge as score_with_judge_reexport,
+    )
+    from moaxy.benchmark import scoring as scoring_module
+
+    assert LLMJudgeScorerReexport is scoring_module.LLMJudgeScorer
+    assert parse_judge_score_reexport is scoring_module.parse_judge_score
+    assert score_with_judge_reexport is scoring_module.score_with_judge
+    assert (
+        DEFAULT_JUDGE_MODEL_REEXPORT
+        is scoring_module.DEFAULT_JUDGE_MODEL
+    )
+    assert (
+        DEFAULT_FALLBACK_SCORE_REEXPORT
+        is scoring_module.DEFAULT_FALLBACK_SCORE
+    )

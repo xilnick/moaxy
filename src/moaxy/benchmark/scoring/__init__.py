@@ -1,6 +1,6 @@
 """M7 benchmark scoring modules.
 
-The :mod:`moaxy.benchmark.scoring` package owns the two scoring
+The :mod:`moaxy.benchmark.scoring` package owns the scoring
 strategies the benchmark harness uses to score a model response
 against a :class:`~moaxy.benchmark.prompts.CodingPrompt`:
 
@@ -25,9 +25,27 @@ from moaxy.benchmark.scoring.deterministic import (
     score_function_from_docstring,
     score_refactor,
 )
+from moaxy.benchmark.scoring.judge import (
+    DEFAULT_FALLBACK_SCORE,
+    DEFAULT_JUDGE_BASE_URL,
+    DEFAULT_JUDGE_MODEL,
+    DEFAULT_JUDGE_TIMEOUT_S,
+    LLMJudgeScorer,
+    parse_judge_score,
+)
+from moaxy.benchmark.scoring.judge import (
+    score as score_with_judge,
+)
 
 __all__ = [
+    "DEFAULT_FALLBACK_SCORE",
+    "DEFAULT_JUDGE_BASE_URL",
+    "DEFAULT_JUDGE_MODEL",
+    "DEFAULT_JUDGE_TIMEOUT_S",
+    "LLMJudgeScorer",
+    "parse_judge_score",
     "score_bug_fix",
     "score_function_from_docstring",
     "score_refactor",
+    "score_with_judge",
 ]

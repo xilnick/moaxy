@@ -28,13 +28,21 @@ from moaxy.benchmark.prompts import (
     RefactorPrompt,
 )
 from moaxy.benchmark.scoring import (
+    DEFAULT_FALLBACK_SCORE,
+    DEFAULT_JUDGE_MODEL,
+    LLMJudgeScorer,
+    parse_judge_score,
     score_bug_fix,
     score_function_from_docstring,
     score_refactor,
+    score_with_judge,
 )
 
 __all__ = [
     "COMPARISON_MODELS",
+    "DEFAULT_FALLBACK_SCORE",
+    "DEFAULT_JUDGE_MODEL",
+    "LLMJudgeScorer",
     "MODEL_ALIASES",
     "BugFixPrompt",
     "CodingPrompt",
@@ -44,8 +52,10 @@ __all__ = [
     "PROMPT_SET",
     "RefactorPrompt",
     "make_config",
+    "parse_judge_score",
     "score_bug_fix",
     "score_function_from_docstring",
     "score_refactor",
+    "score_with_judge",
 ]
 
