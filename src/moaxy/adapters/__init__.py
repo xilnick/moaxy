@@ -2,9 +2,9 @@
 
 Each adapter wraps one provider's HTTP API behind the uniform
 :class:`moaxy.adapters.base.Adapter` interface. The
-:class:`moaxy.adapters.ollama.OllamaAdapter` is the only concrete adapter
-shipped in M1; the OpenAI-compatible adapter will be added in a later
-milestone.
+:class:`moaxy.adapters.ollama.OllamaAdapter` is the M1 Ollama adapter;
+:class:`moaxy.adapters.openrouter.OpenRouterAdapter` is the M6 OpenRouter
+adapter. The OpenAI-compatible adapter is reserved for a future milestone.
 
 The :class:`moaxy.adapters.registry.AdapterRegistry` constructs
 :class:`Adapter` instances from the ``backends`` list of a parsed
@@ -23,6 +23,7 @@ from moaxy.adapters.base import (
     UsageAccumulator,
 )
 from moaxy.adapters.ollama import OllamaAdapter
+from moaxy.adapters.openrouter import OpenRouterAdapter, OpenRouterConfigError
 from moaxy.adapters.registry import (
     AdapterRegistry,
     DuplicateAdapterNameError,
@@ -37,6 +38,8 @@ __all__ = [
     "DuplicateAdapterNameError",
     "Message",
     "OllamaAdapter",
+    "OpenRouterAdapter",
+    "OpenRouterConfigError",
     "UnknownAdapterError",
     "UpstreamError",
     "UpstreamTimeoutError",
