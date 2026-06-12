@@ -5242,3 +5242,744 @@ class TestM8SkipReason:
         assert headers["x-moaxy-skip-reason"] == "high_score"
         assert headers["x-moaxy-advisor-skipped"] == "1"
 
+
+# ────────────────────────────────────────────────────────────────────
+# M8 — Top-level test classes (m8-tests-and-compat)
+# (The m8-tests-and-compat feature spec names these classes as the
+# canonical M8 contract surface for the orchestrator tests. The
+# granular M8 test classes above — TestM8FreshContextPrompt,
+# TestM8FreshContextOrchestratorEvent, and TestM8SkipReason —
+# cover the M8 contract in detail. The two classes below are
+# the public-facing test entry points named in the feature spec;
+# they assert the M8 contract invariants end-to-end using the
+# existing ScriptedAdapter / _FakeOpenRouterTransport helpers
+# and exercise the 4 M8 hermetic contract assertions
+# (VAL-M8-001..008 subset) in a focused, single-class form.
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestM8FreshContext:
+    """M8 contract: ``ReflectionConfig.fresh_context`` isolates the
+    critique prompt from the original request context (the M8 "type
+    2 reflection" delta). The feature spec names this class
+    explicitly. The granular M8 tests above
+    (:class:`TestM8FreshContextPrompt` and
+    :class:`TestM8FreshContextOrchestratorEvent`) cover the full
+    surface; this class provides the single public entry point
+    for the m8-tests-and-compat feature.
+
+    Contract pins (VAL-M8-001, VAL-M8-002, VAL-M8-003):
+
+    * ``ReflectionConfig.fresh_context: bool = False`` (default)
+      preserves M1-M7 byte-identical behavior.
+    * ``fresh_context=True`` excludes the original system prompt,
+      the user request, and the chat history from the critique
+      message list.
+    * ``fresh_context=True`` emits a one-shot
+      ``reflect_fresh_context`` event after the first critique
+      (text="True", turn=0).
+    """
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_field_defaults_to_false(self):
+        """VAL-M8-001: ``ReflectionConfig(turns=1).fresh_context`` is
+        ``False`` by default. Loading a config without the field is
+        equivalent to loading one with ``fresh_context: false``.
+        """
+        reflection = ReflectionConfig(turns=1)
+        assert reflection.fresh_context is False
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_true_excludes_system_prompt(self):
+        """VAL-M8-002 (a): with ``fresh_context=True``, the critique
+        prompt does NOT include the original system prompt
+        substring.
+        """
+        original_system = "M8_FRESH_CTX_SYSTEM_SENTINEL"
+        user_request = "M8_FRESH_CTX_USER_SENTINEL"
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "cold critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[
+                {"role": "system", "content": original_system},
+                {"role": "user", "content": user_request},
+            ],
+        )
+        await Orchestrator(adapter).run(ctx)
+        assert len(adapter.calls) >= 2
+        critique_call = adapter.calls[1]
+        all_text = "\n".join(
+            str(m.get("content", "")) for m in critique_call["messages"]
+        )
+        assert original_system not in all_text, (
+            "fresh_context critique must NOT include the original system "
+            "prompt; got:\n" + all_text
+        )
+        assert user_request not in all_text, (
+            "fresh_context critique must NOT include the user request; "
+            "got:\n" + all_text
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_true_includes_candidate_answer(self):
+        """VAL-M8-002 (c): with ``fresh_context=True``, the critique
+        prompt DOES include the candidate answer (the rubric asks
+        the model to grade the answer cold).
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response(
+                    "M8_FRESH_CANDIDATE_ANSWER_TEXT",
+                    prompt_tokens=5,
+                    completion_tokens=2,
+                ),
+                _response(
+                    "cold critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        assert len(adapter.calls) >= 2
+        critique_call = adapter.calls[1]
+        all_text = "\n".join(
+            str(m.get("content", "")) for m in critique_call["messages"]
+        )
+        assert "M8_FRESH_CANDIDATE_ANSWER_TEXT" in all_text, (
+            "fresh_context critique must include the candidate answer; "
+            "got:\n" + all_text
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_true_emits_reflect_fresh_context_event(self):
+        """VAL-M8-003: with ``fresh_context=True``, the orchestrator
+        appends a one-shot ``reflect_fresh_context`` event to
+        ``ctx.events`` after the first critique (text="True",
+        turn=0). The event is NOT emitted when ``fresh_context``
+        is False (the M1-M7 default).
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "cold critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        events = [
+            e for e in ctx.events if e.type == "reflect_fresh_context"
+        ]
+        assert len(events) == 1, (
+            f"expected exactly 1 reflect_fresh_context event when "
+            f"fresh_context=True, got {len(events)}: "
+            f"{[e.type for e in ctx.events]!r}"
+        )
+        assert events[0].text == "True", (
+            f"reflect_fresh_context event text must be 'True', got "
+            f"{events[0].text!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_false_does_not_emit_event(self):
+        """VAL-M8-003 (b): the M1-M7 default (``fresh_context=False``)
+        does NOT emit the ``reflect_fresh_context`` event. The
+        backward-compat invariant is preserved.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=False,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        events = [
+            e for e in ctx.events if e.type == "reflect_fresh_context"
+        ]
+        assert len(events) == 0, (
+            f"expected NO reflect_fresh_context event when "
+            f"fresh_context=False, got {len(events)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_false_preserves_original_context(self):
+        """VAL-M8-001/002: the M1-M7 default (``fresh_context=False``)
+        preserves the original critique prompt construction — the
+        original system prompt and user request ARE included in the
+        critique message list.
+        """
+        original_system = "M8_LEGACY_SYSTEM_SENTINEL"
+        user_request = "M8_LEGACY_USER_SENTINEL"
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=False,
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[
+                {"role": "system", "content": original_system},
+                {"role": "user", "content": user_request},
+            ],
+        )
+        await Orchestrator(adapter).run(ctx)
+        assert len(adapter.calls) >= 2
+        critique_call = adapter.calls[1]
+        all_text = "\n".join(
+            str(m.get("content", "")) for m in critique_call["messages"]
+        )
+        assert original_system in all_text, (
+            "fresh_context=False critique MUST include the original "
+            "system prompt (M1-M7 invariant); got:\n" + all_text
+        )
+        assert user_request in all_text, (
+            "fresh_context=False critique MUST include the user "
+            "request (M1-M7 invariant); got:\n" + all_text
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_event_is_at_most_once_with_multi_turns(self):
+        """VAL-M8-003 (c): the ``reflect_fresh_context`` event is
+        emitted exactly once per request, even when multiple
+        reflection turns are configured. The orchestrator uses a
+        runtime guard so multi-turn loops do not re-emit the event.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "critique 1\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised 1", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "critique 2\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised 2", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=2,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        events = [
+            e for e in ctx.events if e.type == "reflect_fresh_context"
+        ]
+        assert len(events) == 1, (
+            f"expected exactly 1 reflect_fresh_context event with "
+            f"turns=2, got {len(events)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_pydantic_field_exists(self):
+        """VAL-M8-001: ``ReflectionConfig.fresh_context: bool = False``
+        is a real Pydantic v2 field. Round-tripping a config
+        preserves the field.
+        """
+        from moaxy.models.config import (
+            AdapterConfig,
+            MoaxyConfig,
+        )
+
+        # Build a minimal MoaxyConfig with reflection.fresh_context=True.
+        config = MoaxyConfig(
+            backends=[
+                AdapterConfig(
+                    name="olloma-local",
+                    adapter="ollama",
+                    base_url="http://127.0.0.1:11434",
+                )
+            ],
+            routes=[
+                RouteConfig(
+                    name="r",
+                    match=ConfigRouteMatch(
+                        model="*", path="/v1/chat/completions"
+                    ),
+                    backend="olloma-local",
+                    reflection=ReflectionConfig(
+                        turns=1, fresh_context=True
+                    ),
+                )
+            ],
+        )
+        # The field is set on the route's reflection config.
+        assert config.routes[0].reflection.fresh_context is True
+        # The field round-trips through model_dump / model_validate.
+        round_tripped = MoaxyConfig.model_validate(
+            config.model_dump()
+        )
+        assert (
+            round_tripped.routes[0].reflection.fresh_context is True
+        )
+        # The default (field omitted) is False.
+        default_config = MoaxyConfig(
+            backends=[
+                AdapterConfig(
+                    name="olloma-local",
+                    adapter="ollama",
+                    base_url="http://127.0.0.1:11434",
+                )
+            ],
+            routes=[
+                RouteConfig(
+                    name="r2",
+                    match=ConfigRouteMatch(
+                        model="*", path="/v1/chat/completions"
+                    ),
+                    backend="olloma-local",
+                    reflection=ReflectionConfig(turns=1),
+                )
+            ],
+        )
+        assert (
+            default_config.routes[0].reflection.fresh_context is False
+        )
+
+
+class TestM8ScoreAwareSkip:
+    """M8 contract: score-aware advisor skip. The existing M5
+    confidence-only skip is extended so the advisor is also
+    skipped when ``last_score >= 8`` AND ``last_confidence < 0.85``.
+    The new ``x-moaxy-skip-reason`` response header is always
+    present and carries one of three values:
+    ``"confidence"``, ``"high_score"``, or ``"insufficient_signal"``.
+    The legacy ``x-moaxy-advisor-skipped: 0|1`` boolean header is
+    preserved for backward compat.
+
+    The feature spec names this class explicitly. The granular
+    M8 tests above (:class:`TestM8SkipReason`) cover the full
+    surface; this class provides the single public entry point
+    for the m8-tests-and-compat feature.
+
+    Contract pins (VAL-M8-004, VAL-M8-005, VAL-M8-006):
+
+    * ``last_score >= 8`` AND ``last_confidence < 0.85`` →
+      advisor skipped, ``x-moaxy-skip-reason: high_score``,
+      ``x-moaxy-advisor-skipped: 1``.
+    * ``last_score is None`` → advisor runs as normal,
+      ``x-moaxy-skip-reason: insufficient_signal``,
+      ``x-moaxy-advisor-skipped: 0``.
+    * The new ``x-moaxy-skip-reason`` header is ALWAYS present
+      on every ``/v1/chat/completions`` response.
+    """
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_confidence_when_confidence_above_threshold(
+        self,
+    ):
+        """VAL-M8-006 (a): ``last_confidence >= 0.85`` →
+        ``x-moaxy-skip-reason == "confidence"`` and
+        ``x-moaxy-advisor-skipped == "1"``.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.92\nSCORE: 9",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The skip fired (M5 confidence rule); the reason is
+        # ``"confidence"`` because the confidence wins over the
+        # score when both fire.
+        assert headers["x-moaxy-skip-reason"] == "confidence"
+        assert headers["x-moaxy-advisor-skipped"] == "1"
+        # The advisor LLM call was NOT made — adapter.call_count
+        # is exactly 2 (initial + critique; no revision because
+        # early_exit=True with confidence >= threshold short-
+        # circuits the last-turn revision; no advisor because
+        # the skip fired).
+        assert len(adapter.calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_high_score_when_score_above_threshold(self):
+        """VAL-M8-004: ``last_score >= 8`` AND
+        ``last_confidence < 0.85`` → advisor skipped,
+        ``x-moaxy-skip-reason: high_score``,
+        ``x-moaxy-advisor-skipped: 1``.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                # Low confidence (0.5) but a strong score (9);
+                # the M8 score-aware skip fires on the advisor.
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5\nSCORE: 9",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                # The reflection REVISION still runs because
+                # early_exit=False (the M5 combined signal at
+                # trust_verbal=0.6, trust_score=0.4 is
+                # 0.6*0.5 + 0.4*0.9 = 0.66, below the 0.85
+                # threshold, so the revision runs). Then the
+                # M8 score-aware skip fires on the advisor.
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                # The orchestrator MUST NOT call the advisor
+                # because the score-aware skip fires; the
+                # response carries the post-reflection answer.
+                # (No scripted response for an advisor call —
+                # if the orchestrator tried to call the advisor,
+                # the ScriptedAdapter would raise ``IndexError``.)
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-skip-reason"] == "high_score"
+        assert headers["x-moaxy-advisor-skipped"] == "1"
+        # 3 LLM calls: initial + critique + revised. The advisor
+        # LLM call was NOT made — score-aware skip fired.
+        assert len(adapter.calls) == 3
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_insufficient_signal_when_no_skip(self):
+        """VAL-M8-005: ``last_score is None`` (model did not emit a
+        ``SCORE:`` line) AND ``last_confidence < 0.85`` → advisor
+        runs as normal, ``x-moaxy-skip-reason: insufficient_signal``,
+        ``x-moaxy-advisor-skipped: 0``.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                # The reflection REVISION still runs (early_exit
+                # path does not fire because confidence < threshold).
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                # The advisor call: the script returns an approve.
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
+        assert headers["x-moaxy-advisor-skipped"] == "0"
+        # The advisor LLM call WAS made. Total: 4 calls
+        # (initial + critique + revised + advisor).
+        assert len(adapter.calls) == 4
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_header_always_present(self):
+        """VAL-M8-006: the ``x-moaxy-skip-reason`` header is ALWAYS
+        present on every ``/v1/chat/completions`` response, with
+        one of the three valid values.
+        """
+        valid_reasons = {"confidence", "high_score", "insufficient_signal"}
+        # Three scenarios: confidence skip, score-aware skip, no skip.
+        for script, expected in [
+            (
+                [
+                    _response("initial"),
+                    _response(
+                        "c\nREFLECT_CONFIDENCE: 0.95\nSCORE: 9"
+                    ),
+                    _response("revised"),
+                ],
+                "confidence",
+            ),
+            (
+                [
+                    _response("initial"),
+                    _response("c\nREFLECT_CONFIDENCE: 0.5\nSCORE: 9"),
+                    _response("revised"),
+                ],
+                "high_score",
+            ),
+            (
+                [
+                    _response("initial"),
+                    _response("c\nREFLECT_CONFIDENCE: 0.5"),
+                    _response("revised"),
+                    _response("ADVISOR_APPROVE"),
+                ],
+                "insufficient_signal",
+            ),
+        ]:
+            adapter = ScriptedAdapter(script)
+            route = _build_route(
+                reflection_turns=1,
+                early_exit=False,
+                threshold=0.85,
+                advisor_model="deepseek-v4-pro:cloud",
+                advisor_turns=1,
+            )
+            ctx = _build_context(route)
+            await Orchestrator(adapter).run(ctx)
+            headers = build_response_headers(
+                ctx, request_id=ctx.request_id
+            )
+            assert "x-moaxy-skip-reason" in headers, (
+                "x-moaxy-skip-reason MUST always be present"
+            )
+            assert headers["x-moaxy-skip-reason"] in valid_reasons, (
+                f"x-moaxy-skip-reason must be one of {valid_reasons}, "
+                f"got {headers['x-moaxy-skip-reason']!r}"
+            )
+            assert headers["x-moaxy-skip-reason"] == expected
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_high_score_threshold_is_exactly_8(self):
+        """VAL-M8-004 (boundary): the score-aware skip fires when
+        ``last_score >= 8`` (inclusive) and does NOT fire when
+        ``last_score == 7``. The boundary is inclusive.
+        """
+        # last_score = 8 → skip fires.
+        adapter = ScriptedAdapter(
+            [
+                _response("initial"),
+                _response("c\nREFLECT_CONFIDENCE: 0.5\nSCORE: 8"),
+                _response("revised"),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-skip-reason"] == "high_score"
+        # last_score = 7 → skip does NOT fire.
+        adapter2 = ScriptedAdapter(
+            [
+                _response("initial"),
+                _response("c\nREFLECT_CONFIDENCE: 0.5\nSCORE: 7"),
+                _response("revised"),
+                _response("ADVISOR_APPROVE"),
+            ]
+        )
+        route2 = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx2 = _build_context(route2)
+        await Orchestrator(adapter2).run(ctx2)
+        headers2 = build_response_headers(ctx2, request_id=ctx2.request_id)
+        assert headers2["x-moaxy-skip-reason"] == "insufficient_signal"
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_confidence_wins_over_high_score(self):
+        """VAL-M8-006: when both branches fire
+        (``last_confidence >= 0.85`` AND ``last_score >= 8``), the
+        reason is ``"confidence"`` (the confidence branch has
+        priority). The M5 backward-compat invariant is preserved.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial"),
+                _response("c\nREFLECT_CONFIDENCE: 0.95\nSCORE: 9"),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # Both branches fire; confidence wins.
+        assert headers["x-moaxy-skip-reason"] == "confidence"
+        assert ctx.__dict__.get("advisor_skip_reason") == "confidence"
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_no_score_line_preserves_m5_behavior(self):
+        """VAL-M8-005 (M5 backward-compat): when the model did NOT
+        emit a ``SCORE:`` line, the score-aware skip does NOT
+        fire even when confidence is also below 0.85. The advisor
+        runs as normal (M5 behavior). The M8 ``x-moaxy-skip-reason``
+        is ``"insufficient_signal"``.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial"),
+                _response("c\nREFLECT_CONFIDENCE: 0.5"),
+                _response("revised"),
+                _response("ADVISOR_APPROVE"),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
+        assert headers["x-moaxy-advisor-skipped"] == "0"
+        # The advisor LLM call was made. Total: 4 calls
+        # (initial + critique + revised + advisor).
+        assert len(adapter.calls) == 4
+
+    @pytest.mark.asyncio
+    async def test_boolean_header_consistent_with_skip_reason(self):
+        """VAL-M8-006 (M5 backward-compat): the legacy
+        ``x-moaxy-advisor-skipped: 0|1`` boolean header is
+        consistent with the new ``x-moaxy-skip-reason`` enum: it
+        is ``"1"`` exactly when ``skip_reason !=
+        "insufficient_signal"``, and ``"0"`` otherwise.
+        """
+        for script, expected_reason, expected_bool in [
+            (
+                [
+                    _response("initial"),
+                    _response(
+                        "c\nREFLECT_CONFIDENCE: 0.95\nSCORE: 9"
+                    ),
+                    _response("revised"),
+                ],
+                "confidence",
+                "1",
+            ),
+            (
+                [
+                    _response("initial"),
+                    _response(
+                        "c\nREFLECT_CONFIDENCE: 0.5\nSCORE: 9"
+                    ),
+                    _response("revised"),
+                ],
+                "high_score",
+                "1",
+            ),
+            (
+                [
+                    _response("initial"),
+                    _response("c\nREFLECT_CONFIDENCE: 0.5"),
+                    _response("revised"),
+                    _response("ADVISOR_APPROVE"),
+                ],
+                "insufficient_signal",
+                "0",
+            ),
+        ]:
+            adapter = ScriptedAdapter(script)
+            route = _build_route(
+                reflection_turns=1,
+                early_exit=False,
+                threshold=0.85,
+                advisor_model="deepseek-v4-pro:cloud",
+                advisor_turns=1,
+            )
+            ctx = _build_context(route)
+            await Orchestrator(adapter).run(ctx)
+            headers = build_response_headers(
+                ctx, request_id=ctx.request_id
+            )
+            assert headers["x-moaxy-skip-reason"] == expected_reason
+            assert headers["x-moaxy-advisor-skipped"] == expected_bool
+
+

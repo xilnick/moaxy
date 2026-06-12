@@ -4941,3 +4941,221 @@ class TestLiveBenchmarkContract:
             "OpenRouter API key prefix 'sk-or-v1-'; the report "
             "MUST NOT include the API key in plain text"
         )
+
+
+# ────────────────────────────────────────────────────────────────────
+# M8 live benchmark data — VAL-M8-008 + 4 M8 hermetic contract tests
+# (The m8-tests-and-compat feature spec: "The 4 m8 hermetic contract
+# tests are soft-skipped if the live M8 output is not present.")
+#
+# The M8 contract (VAL-M8-008) requires the live benchmark run
+# output to be committed to the repo at
+# ``.benchmarks/results/m8-live-run.json`` and
+# ``.benchmarks/results/m8-live-report.md``. The test class asserts
+# the contract invariants on those files. The class is skipped when
+# the live data is not present (the canonical
+# ``pytest.mark.skipif`` pattern, mirroring the M7
+# :class:`TestLiveBenchmarkContract` and the M6
+# ``TestOpenRouterAdapterReal`` class).
+# ────────────────────────────────────────────────────────────────────
+
+
+# Canonical on-disk paths the M8 contract pins. The test class
+# uses these constants so a future edit that moves the live
+# data to a different location is caught by the test's
+# existence checks.
+_M8_LIVE_RUN_JSON: Final[str] = ".benchmarks/results/m8-live-run.json"
+"""The canonical path of the M8 live benchmark JSON results file."""
+
+_M8_LIVE_REPORT_MD: Final[str] = ".benchmarks/results/m8-live-report.md"
+"""The canonical path of the M8 live benchmark markdown report file."""
+
+
+def _m8_live_benchmark_present() -> bool:
+    """Return True iff the M8 live benchmark output files exist on disk.
+
+    The helper is the skipif gate for
+    :class:`TestM8LiveBenchmarkContract`. It returns True only
+    when BOTH the JSON and the markdown report files exist
+    on disk. The M8 contract (VAL-M8-008) pins both files as
+    committed artefacts; when either is missing, the test class
+    is skipped with a clear reason.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    json_path = repo_root / _M8_LIVE_RUN_JSON
+    md_path = repo_root / _M8_LIVE_REPORT_MD
+    return json_path.exists() and md_path.exists()
+
+
+@pytest.mark.skipif(
+    not _m8_live_benchmark_present(),
+    reason=(
+        "M8 live benchmark data is not committed at "
+        f"{_M8_LIVE_RUN_JSON} / {_M8_LIVE_REPORT_MD}; "
+        "the M8 live benchmark run has not produced output. "
+        "Re-run the M8 sweep against the live OpenRouter to "
+        "regenerate the live data, then commit the output "
+        "files."
+    ),
+)
+class TestM8LiveBenchmarkContract:
+    """M8 hermetic contract: live benchmark data is present and
+    correct.
+
+    The class is the contract-pinned test for the M8 live
+    benchmark output. It asserts the four M8 hermetic
+    contract invariants on the committed files:
+
+    1. ``.benchmarks/results/m8-live-run.json`` exists and
+       parses as JSON with at least 10 cells of real data
+       (5 variants × 2 models, the canonical M8 sweep).
+    2. ``.benchmarks/results/m8-live-report.md`` exists, is
+       non-empty, and references the canonical model
+       aliases.
+    3. The M8 live report has the ``M8 vs M7 Delta`` section
+       (or equivalent ``Δ vs M7`` column) so the effect of
+       the new M8 behaviors is legible at a glance.
+    4. The report does NOT contain the literal OpenRouter key
+       prefix ``sk-or-v1-`` (the live run output is committed
+       to the repo, and a leaked key is a security incident).
+
+    The class is skipped when the live M8 benchmark output is
+    not present. The skip is a soft gate: a worker that has
+    not yet run the live M8 benchmark sees the skip, and a
+    worker that has committed the live data sees the contract
+    assertions run. The pattern mirrors the M7
+    :class:`TestLiveBenchmarkContract` and the M6
+    :class:`TestOpenRouterAdapterReal` classes.
+    """
+
+    def _repo_root(self) -> Path:
+        """Return the repository root (the parent of ``tests/``)."""
+        return Path(__file__).resolve().parent.parent
+
+    def _live_json_path(self) -> Path:
+        """Return the absolute path of the M8 live benchmark JSON file."""
+        return self._repo_root() / _M8_LIVE_RUN_JSON
+
+    def _live_report_path(self) -> Path:
+        """Return the absolute path of the M8 live benchmark markdown report."""
+        return self._repo_root() / _M8_LIVE_REPORT_MD
+
+    def test_m8_live_json_exists_and_has_ten_cells(self):
+        """M8 hermetic contract (1): ``.benchmarks/results/m8-live-run.json``
+        is committed to the repo, parses as JSON, and contains at
+        least 10 cells of real data (5 variants × 2 models).
+
+        The ``_m8_live_benchmark_present`` skipif gate guarantees
+        the file exists; this test asserts it parses and has the
+        canonical 10-cell count.
+        """
+        path = self._live_json_path()
+        assert path.exists(), (
+            f"M8 live benchmark JSON does not exist at {path!s}"
+        )
+        text = path.read_text(encoding="utf-8")
+        assert text.strip(), "M8 live benchmark JSON is empty"
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(
+                f"M8 live benchmark JSON at {path!s} is not valid "
+                f"JSON: {exc}"
+            ) from exc
+        assert isinstance(payload, dict), (
+            f"M8 live JSON must be a dict, got {type(payload).__name__}"
+        )
+        assert "cells" in payload, (
+            "M8 live JSON must contain a 'cells' key (the canonical "
+            "schema from moaxy.benchmark.run)"
+        )
+        cells = payload["cells"]
+        assert isinstance(cells, list), (
+            f"M8 live JSON 'cells' must be a list, got "
+            f"{type(cells).__name__}"
+        )
+        # The M8 contract (VAL-M8-008) requires at least 10
+        # cells of real data; the canonical M8 sweep is
+        # ``len(COMPARISON_MODELS) * len(ConfigVariant) = 2 *
+        # 5 = 10``.
+        assert len(cells) >= 10, (
+            f"M8 live JSON must contain at least 10 cells, got "
+            f"{len(cells)}; the M8 sweep is 2 models x 5 variants "
+            f"= 10 cells"
+        )
+
+    def test_m8_live_report_references_canonical_models(self):
+        """M8 hermetic contract (2): ``.benchmarks/results/m8-live-report.md``
+        is committed to the repo, is non-empty, and references at
+        least one of the canonical model aliases
+        (``minimax-m3`` or ``mimo-v2.5-pro``).
+        """
+        path = self._live_report_path()
+        assert path.exists(), (
+            f"M8 live benchmark report does not exist at {path!s}"
+        )
+        text = path.read_text(encoding="utf-8")
+        assert text.strip(), "M8 live benchmark report is empty"
+        # The report must include at least one canonical
+        # markdown header.
+        assert any(
+            line.lstrip().startswith("#") for line in text.splitlines()
+        ), "M8 live benchmark report contains no markdown headers"
+        # The report must reference at least one canonical
+        # model alias (the live sweep must produce data for
+        # ``minimax-m3`` and/or ``mimo-v2.5-pro``).
+        referenced = any(
+            alias in text for alias in _LIVE_MODELS
+        )
+        assert referenced, (
+            f"M8 live benchmark report at {path!s} does not "
+            f"reference any of the canonical model aliases "
+            f"{_LIVE_MODELS!r}; the report must include the "
+            "model aliases the sweep tested"
+        )
+
+    def test_m8_live_report_has_delta_section(self):
+        """M8 hermetic contract (3): the M8 live report has the
+        ``M8 vs M7 Delta`` section (or equivalent). The M8
+        contract (VAL-M8-008) requires the report to include
+        a delta-vs-M7 column or section so the effect of the
+        new M8 behaviors is legible at a glance.
+        """
+        path = self._live_report_path()
+        text = path.read_text(encoding="utf-8")
+        # The M8 contract pins the section header as
+        # ``## M8 vs M7 Delta`` OR the table column header
+        # ``Δ vs M7`` (with the Greek capital delta).
+        # Pin both; the test accepts either form because
+        # the report can present the delta in either
+        # surface (column or section).
+        has_section = "## M8 vs M7 Delta" in text
+        has_column = "Δ vs M7" in text
+        assert has_section or has_column, (
+            f"M8 live benchmark report at {path!s} does not "
+            "include a delta-vs-M7 section ('## M8 vs M7 Delta') "
+            "or column ('Δ vs M7'); the M8 contract requires "
+            "the report to make the delta legible"
+        )
+
+    def test_m8_live_report_does_not_leak_api_key(self):
+        """M8 hermetic contract (4): the M8 live report does NOT
+        contain the literal OpenRouter key prefix ``sk-or-v1-``.
+        The report is committed to the repo; a leaked key is a
+        security incident. The M8 contract (VAL-M8-008) requires
+        the report to be free of API-key leaks; a regression
+        that accidentally logs the key surfaces here.
+        """
+        path = self._live_report_path()
+        text = path.read_text(encoding="utf-8")
+        # The canonical OpenRouter key prefix is
+        # ``sk-or-v1-``. The substring check is intentional:
+        # a leak of any key with that prefix is a security
+        # incident, and a substring check is the
+        # contract-pinned defence.
+        assert "sk-or-v1-" not in text, (
+            f"M8 live benchmark report at {path!s} contains the "
+            "OpenRouter API key prefix 'sk-or-v1-'; the report "
+            "MUST NOT include the API key in plain text"
+        )
+
