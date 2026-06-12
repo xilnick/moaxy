@@ -1,4 +1,4 @@
-"""M7 benchmark markdown report generator.
+"""M7 benchmark markdown report generator (with the M8 REFLECTION_FRESH delta).
 
 The :mod:`moaxy.benchmark.report` module owns the
 :class:`MarkdownReportGenerator`, the public surface that turns a
@@ -7,15 +7,16 @@ a human-readable markdown report. The generator is the canonical
 sister of the :class:`~moaxy.benchmark.harness.BenchmarkRunner`:
 the runner produces :class:`CellResult` objects; the generator
 turns them into the report the live benchmark CLI commits to
-``.benchmarks/results/m7-live-report.md``.
+``.benchmarks/results/m7-live-report.md`` (M7) or
+``.benchmarks/results/m8-live-report.md`` (M8).
 
 The contract (VAL-BENCH-009) requires the rendered report to
 contain five sections:
 
 1. **Per-cell table** — one row per ``(model, variant)`` cell with
    the four summary statistics: mean quality, mean latency, mean
-   tokens, pass-rate. Eight rows in the canonical M7 sweep
-   (``len(COMPARISON_MODELS) * len(ConfigVariant) = 2 * 4 = 8``).
+   tokens, pass-rate. Ten rows in the canonical M8 sweep
+   (``len(COMPARISON_MODELS) * len(ConfigVariant) = 2 * 5 = 10``).
 2. **Best configuration per model** — for each model, the variant
    that maximises mean quality.
 3. **Best model per configuration** — for each variant, the

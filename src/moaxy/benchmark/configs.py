@@ -1,8 +1,8 @@
-"""M7 benchmark config variants.
+"""M7 benchmark config variants (with the M8 REFLECTION_FRESH delta).
 
-The :mod:`moaxy.benchmark.configs` module owns the four
-:class:`ConfigVariant` values that the M7 benchmark harness sweeps
-over for every (model, configuration) cell:
+The :mod:`moaxy.benchmark.configs` module owns the
+:class:`ConfigVariant` values that the M7 / M8 benchmark harness
+sweeps over for every (model, configuration) cell:
 
 * :attr:`ConfigVariant.BASELINE` — no reflection, no advisor; one
   outbound LLM call per request. The control cell.
@@ -15,15 +15,30 @@ over for every (model, configuration) cell:
   model critic in isolation.
 * :attr:`ConfigVariant.BOTH` — one self-reflection turn followed by
   one advisor turn. The cell that measures the combined effect.
+* :attr:`ConfigVariant.REFLECTION_FRESH` — one self-reflection
+  turn with the M8 ``fresh_context: true`` toggle (the critique
+  is graded "cold", with no system prompt, chat history, or
+  user request in scope). The cell that measures the value of
+  type-2 reflection. The advisor is disabled
+  (``advisor.turns == 0``); the variant isolates the
+  fresh-context reflection delta.
 
 For every model in :data:`COMPARISON_MODELS`, the :func:`make_config`
 factory returns a fully-validated :class:`moaxy.models.config.MoaxyConfig`
 that routes the model through the canonical OpenRouter backend and
 applies the variant's reflection/advisor configuration.
 
-The contract (VAL-BENCH-002) asserts the following:
+The contract (VAL-BENCH-002 / VAL-M8-007) asserts the following:
 
-* Exactly four variants exist on the :class:`ConfigVariant` enum.
+* The M7 contract pins four variants on the :class:`ConfigVariant`
+  enum; the M8 delta extends the enum to five variants by
+  appending :attr:`ConfigVariant.REFLECTION_FRESH`. The M7
+  contract's "exactly four" invariant is REPLACED by the M8
+  contract's "exactly five" invariant (see
+  :class:`TestConfigVariantsContract` in :mod:`tests.test_benchmark`
+  for the version that pins the M7 invariant, and
+  :class:`TestM8BenchmarkConfig` in the same file for the M8
+  invariant).
 * For every variant and every model in :data:`COMPARISON_MODELS`,
   the result of :func:`make_config` validates cleanly through
   :meth:`moaxy.models.config.MoaxyConfig.model_validate` (i.e. the
@@ -31,6 +46,10 @@ The contract (VAL-BENCH-002) asserts the following:
 * The :attr:`~moaxy.models.config.AdvisorConfig.model` field of
   :attr:`ConfigVariant.ADVISOR_ONLY` and :attr:`ConfigVariant.BOTH`
   is the OTHER comparison model's full OpenRouter id (cross-advise).
+* :attr:`ConfigVariant.REFLECTION_FRESH` returns a config whose
+  route has :attr:`~moaxy.models.config.ReflectionConfig.fresh_context`
+  equal to ``True`` and :attr:`~moaxy.models.config.AdvisorConfig.turns`
+  equal to ``0`` (the advisor is disabled for this variant).
 
 The module deliberately re-exports :data:`COMPARISON_MODELS`,
 :data:`MODEL_ALIASES`, and :func:`make_config` so callers (the
@@ -94,12 +113,12 @@ COMPARISON_MODELS: Final[tuple[str, ...]] = (
 )
 """The two model aliases the benchmark sweeps over.
 
-The contract (VAL-BENCH-002) fixes this tuple at length 2; the live
-benchmark runs ``len(COMPARISON_MODELS) * len(ConfigVariant) = 8``
-cells. Cross-advise for a model is defined as ``the other model in
-this tuple`` — so when testing ``minimax-m3`` with
-:attr:`ConfigVariant.ADVISOR_ONLY`, the advisor is
-``mimo-v2.5-pro``'s OpenRouter id, and vice versa.
+The contract (VAL-BENCH-002) fixes this tuple at length 2; the
+M8 live benchmark runs ``len(COMPARISON_MODELS) * len(ConfigVariant)
+= 2 * 5 = 10`` cells. Cross-advise for a model is defined as
+``the other model in this tuple`` — so when testing
+``minimax-m3`` with :attr:`ConfigVariant.ADVISOR_ONLY`, the
+advisor is ``mimo-v2.5-pro``'s OpenRouter id, and vice versa.
 
 Editing this tuple? Update the test in
 :mod:`tests.test_benchmark` that pins the length-2 invariant.
@@ -130,11 +149,12 @@ _ROUTE_NAME: Final[str] = "bench"
 
 
 class ConfigVariant(Enum):
-    """The four configuration variants the M7 benchmark sweeps.
+    """The configuration variants the M7 / M8 benchmark sweeps.
 
     Each variant fixes the values of
-    :attr:`~moaxy.models.config.ReflectionConfig.turns` and
-    :attr:`~moaxy.models.config.AdvisorConfig.turns` (and, for
+    :attr:`~moaxy.models.config.ReflectionConfig.turns`,
+    :attr:`~moaxy.models.config.ReflectionConfig.fresh_context`,
+    and :attr:`~moaxy.models.config.AdvisorConfig.turns` (and, for
     advisor-enabled variants, the advisor's
     :attr:`~moaxy.models.config.AdvisorConfig.model`). The
     :func:`make_config` factory consults this enum to assemble a
@@ -154,18 +174,27 @@ class ConfigVariant(Enum):
     * ``BOTH`` — ``reflection.turns = 1``, ``advisor.turns = 1``,
       ``advisor.model = the OTHER comparison model`` (cross-advise).
       The cell that measures the combined effect.
+    * ``REFLECTION_FRESH`` — M8 delta: ``reflection.turns = 1``,
+      ``reflection.fresh_context = True``, ``advisor.turns = 0``.
+      The cell that measures the value of "type 2" / cold-grading
+      reflection: the critique message list excludes the client's
+      system prompt, chat history, and user request. The advisor
+      is disabled for this variant so the cell isolates the
+      fresh-context reflection delta.
 
-    The enum has exactly four members. The contract
-    (VAL-BENCH-002) pins ``len(ConfigVariant) == 4`` and the
-    explicit member names; the
-    :class:`TestConfigVariantsContract` test class enforces both
-    invariants.
+    The enum has exactly five members (M7 + the M8
+    ``REFLECTION_FRESH`` delta). The M7 contract pins
+    ``len(ConfigVariant) == 4``; the M8 contract extends the pin
+    to ``len(ConfigVariant) == 5``. The
+    :class:`TestM8BenchmarkConfig` test class in
+    :mod:`tests.test_benchmark` enforces the M8 invariants.
     """
 
     BASELINE = "baseline"
     REFLECTION_ONLY = "reflection_only"
     ADVISOR_ONLY = "advisor_only"
     BOTH = "both"
+    REFLECTION_FRESH = "reflection_fresh"
 
 
 # Pin the canonical cross-advise model for a given (model, variant)
@@ -240,6 +269,7 @@ class _VariantParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reflection_turns: int
+    fresh_context: bool = False
     advisor_turns: int
     advisor_model: str | None
 
@@ -248,46 +278,64 @@ def _params_for(variant: ConfigVariant, model_alias: str) -> _VariantParams:
     """Return the per-variant reflection/advisor settings.
 
     The function is the single source of truth for the
-    ``(variant, model) → (reflection.turns, advisor.turns,
-    advisor.model)`` mapping. The four expected cases are pinned
-    by the contract (VAL-BENCH-002) and matched by the
-    :class:`TestConfigVariantsContract` test class.
+    ``(variant, model) → (reflection.turns, fresh_context,
+    advisor.turns, advisor.model)`` mapping. The four M7 cases
+    and the M8 ``REFLECTION_FRESH`` delta are pinned by the
+    contract (VAL-BENCH-002 / VAL-M8-007) and matched by the
+    :class:`TestConfigVariantsContract` and
+    :class:`TestM8BenchmarkConfig` test classes.
 
     Args:
-        variant: One of the four :class:`ConfigVariant` values.
+        variant: One of the five :class:`ConfigVariant` values.
         model_alias: The client-facing alias of the model the cell
             is testing. Used only for ``ADVISOR_ONLY`` and ``BOTH``,
             where the advisor is the OTHER comparison model.
 
     Returns:
         A :class:`_VariantParams` with the variant's
-        ``reflection.turns``, ``advisor.turns``, and
-        ``advisor.model`` (which is ``None`` for the two advisor-
-        disabled variants).
+        ``reflection.turns``, ``fresh_context``, ``advisor.turns``,
+        and ``advisor.model`` (which is ``None`` for the three
+        advisor-disabled variants).
     """
     if variant is ConfigVariant.BASELINE:
         return _VariantParams(
             reflection_turns=0,
+            fresh_context=False,
             advisor_turns=0,
             advisor_model=None,
         )
     if variant is ConfigVariant.REFLECTION_ONLY:
         return _VariantParams(
             reflection_turns=1,
+            fresh_context=False,
             advisor_turns=0,
             advisor_model=None,
         )
     if variant is ConfigVariant.ADVISOR_ONLY:
         return _VariantParams(
             reflection_turns=0,
+            fresh_context=False,
             advisor_turns=1,
             advisor_model=_cross_advise_model(model_alias),
         )
     if variant is ConfigVariant.BOTH:
         return _VariantParams(
             reflection_turns=1,
+            fresh_context=False,
             advisor_turns=1,
             advisor_model=_cross_advise_model(model_alias),
+        )
+    if variant is ConfigVariant.REFLECTION_FRESH:
+        # M8 delta: fresh-context reflection. One critique
+        # turn, the cold-grading rubric in
+        # :mod:`moaxy.pipeline.message_builders`, and the
+        # advisor disabled so the cell isolates the
+        # fresh-context reflection delta.
+        return _VariantParams(
+            reflection_turns=1,
+            fresh_context=True,
+            advisor_turns=0,
+            advisor_model=None,
         )
     # Defensive: Enum members are exhaustive but the explicit
     # ``raise`` documents the invariant for static analysers and
@@ -322,11 +370,16 @@ def make_config(model_alias: str, variant: ConfigVariant) -> MoaxyConfig:
     * configures the route's
       :class:`~moaxy.models.config.ReflectionConfig` and
       :class:`~moaxy.models.config.AdvisorConfig` to the values
-      :func:`_params_for` returns for the requested variant.
+      :func:`_params_for` returns for the requested variant. The
+      M8 ``REFLECTION_FRESH`` variant flips
+      :attr:`~moaxy.models.config.ReflectionConfig.fresh_context`
+      to ``True`` so the orchestrator's reflection stage uses
+      the cold-grading rubric.
 
     The result is returned as a fully-validated
     :class:`moaxy.models.config.MoaxyConfig`. The contract
-    (VAL-BENCH-002) requires the result to round-trip through
+    (VAL-BENCH-002 / VAL-M8-007) requires the result to
+    round-trip through
     :meth:`moaxy.models.config.MoaxyConfig.model_validate` without
     raising; the factory does not call ``model_validate`` itself
     (the constructor's Pydantic v2 validation already does), so
@@ -336,7 +389,9 @@ def make_config(model_alias: str, variant: ConfigVariant) -> MoaxyConfig:
         model_alias: The client-facing alias of the model the cell
             is testing. Must be a key of :data:`MODEL_ALIASES` (and
             a member of :data:`COMPARISON_MODELS`).
-        variant: One of the four :class:`ConfigVariant` values.
+        variant: One of the five :class:`ConfigVariant` values
+            (the four M7 variants plus the M8 ``REFLECTION_FRESH``
+            delta).
 
     Returns:
         A :class:`moaxy.models.config.MoaxyConfig` ready to be
@@ -384,7 +439,10 @@ def make_config(model_alias: str, variant: ConfigVariant) -> MoaxyConfig:
         aliases={model_alias: model_id},
         fallbacks=[],
         retry=0,
-        reflection=ReflectionConfig(turns=params.reflection_turns),
+        reflection=ReflectionConfig(
+            turns=params.reflection_turns,
+            fresh_context=params.fresh_context,
+        ),
         advisor=AdvisorConfig(
             turns=params.advisor_turns,
             model=params.advisor_model,

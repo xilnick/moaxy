@@ -83,10 +83,12 @@ logger = logging.getLogger(__name__)
 # The mapping from the user-friendly short config name to the
 # canonical :class:`ConfigVariant` member. The live benchmark CLI
 # accepts the short aliases (``baseline``, ``reflection``,
-# ``advisor``, ``both``) so the on-the-wire command line is short
-# and readable; the table also accepts the canonical enum values
-# (``baseline``, ``reflection_only``, ``advisor_only``, ``both``)
-# for symmetry with the ``ConfigVariant.value`` strings.
+# ``advisor``, ``both``, ``reflection_fresh``) so the
+# on-the-wire command line is short and readable; the table also
+# accepts the canonical enum values (``baseline``,
+# ``reflection_only``, ``advisor_only``, ``both``,
+# ``reflection_fresh``) for symmetry with the
+# ``ConfigVariant.value`` strings.
 _CONFIG_NAME_TO_VARIANT: Final[dict[str, ConfigVariant]] = {
     "baseline": ConfigVariant.BASELINE,
     "reflection": ConfigVariant.REFLECTION_ONLY,
@@ -94,11 +96,14 @@ _CONFIG_NAME_TO_VARIANT: Final[dict[str, ConfigVariant]] = {
     "advisor": ConfigVariant.ADVISOR_ONLY,
     "advisor_only": ConfigVariant.ADVISOR_ONLY,
     "both": ConfigVariant.BOTH,
+    "reflection_fresh": ConfigVariant.REFLECTION_FRESH,
+    "fresh": ConfigVariant.REFLECTION_FRESH,
 }
 """User-friendly config name → :class:`ConfigVariant` mapping.
 
 The short aliases (``baseline``, ``reflection``, ``advisor``,
-``both``) are the contract-pinned CLI surface; the canonical
+``both``, ``reflection_fresh`` / ``fresh``) are the
+contract-pinned CLI surface; the canonical
 ``ConfigVariant.value`` strings are accepted for symmetry with
 internal code that already uses the canonical names.
 """

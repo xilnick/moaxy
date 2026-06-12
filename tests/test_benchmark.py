@@ -423,35 +423,47 @@ def test_package_init_exports_prompt_symbols():
 # Config variants
 # ────────────────────────────────────────────────────────────────────
 #
-# M7 feature m7-config-variants: the
+# M7 feature m7-config-variants (extended in M8 by
+# m8-benchmark-config-variants-m8): the
 # :mod:`moaxy.benchmark.configs` module exports a
-# :class:`ConfigVariant` enum with exactly four members
-# (BASELINE, REFLECTION_ONLY, ADVISOR_ONLY, BOTH) and a
-# :func:`make_config` factory that returns a fully-validated
+# :class:`ConfigVariant` enum with exactly five members
+# (BASELINE, REFLECTION_ONLY, ADVISOR_ONLY, BOTH,
+# REFLECTION_FRESH) and a :func:`make_config` factory that
+# returns a fully-validated
 # :class:`moaxy.models.config.MoaxyConfig` for every
-# (variant, model) cell. The contract (VAL-BENCH-002) asserts:
+# (variant, model) cell. The contract (VAL-BENCH-002 /
+# VAL-M8-007) asserts:
 #
-# * 4 variants exist.
-# * All 8 configs (4 variants x 2 models) parse cleanly through
-#   :meth:`moaxy.models.config.MoaxyConfig.model_validate`.
+# * 5 variants exist (M7 pinned 4; M8 adds REFLECTION_FRESH).
+# * All 10 configs (5 variants x 2 models) parse cleanly
+#   through :meth:`moaxy.models.config.MoaxyConfig.model_validate`.
 # * The advisor model for ADVISOR_ONLY and BOTH is the OTHER
 #   comparison model (cross-advise).
+# * The REFLECTION_FRESH variant has
+#   ``reflection.fresh_context == True`` and
+#   ``advisor.turns == 0``.
 #
-# The :class:`TestConfigVariantsContract` class below enforces every
-# contract invariant with a focused test, plus a single
+# The :class:`TestConfigVariantsContract` class below enforces
+# every contract invariant with a focused test, plus a single
 # table-driven test that catches any regression in one place.
+# The M8-only invariants (the new ``REFLECTION_FRESH`` value and
+# the hermetic sweep behaviour) are enforced by
+# :class:`TestM8BenchmarkConfig` further down in this file.
 
 
-# The four required variant names, pinned by the contract. The
+# The five required variant names, pinned by the contract. The
 # literal values match the string values declared on the
 # :class:`ConfigVariant` enum. The test class references this
 # constant so a future variant rename is surfaced as a test edit
-# (not a silent regression).
+# (not a silent regression). The M8 delta adds
+# :attr:`ConfigVariant.REFLECTION_FRESH` to the M7 set
+# (BASELINE, REFLECTION_ONLY, ADVISOR_ONLY, BOTH).
 REQUIRED_VARIANTS: tuple[ConfigVariant, ...] = (
     ConfigVariant.BASELINE,
     ConfigVariant.REFLECTION_ONLY,
     ConfigVariant.ADVISOR_ONLY,
     ConfigVariant.BOTH,
+    ConfigVariant.REFLECTION_FRESH,
 )
 
 
@@ -482,46 +494,50 @@ def _expected_advisor_model(model_alias: str) -> str:
 
 
 class TestConfigVariantsContract:
-    """VAL-BENCH-002: the 4 config variants parse cleanly.
+    """VAL-BENCH-002 / VAL-M8-007: the 5 config variants parse cleanly.
 
     Each test method below targets a single contract invariant.
     The tests are deliberately small and focused so a failure
     message points directly at the broken invariant.
     """
 
-    def test_four_variants_exist(self):
+    def test_five_variants_exist(self):
         # Contract: the :class:`ConfigVariant` enum has exactly
-        # four members. The expected set is pinned by
-        # :data:`REQUIRED_VARIANTS`; this test asserts both the
-        # exact set and the cardinality.
+        # five members (the M7 four plus the M8
+        # :attr:`ConfigVariant.REFLECTION_FRESH` delta). The
+        # expected set is pinned by :data:`REQUIRED_VARIANTS`;
+        # this test asserts both the exact set and the
+        # cardinality.
         actual = set(ConfigVariant)
         expected = set(REQUIRED_VARIANTS)
         assert actual == expected, (
             f"ConfigVariant mismatch: expected {sorted(v.name for v in expected)}, "
             f"got {sorted(v.name for v in actual)}"
         )
-        assert len(ConfigVariant) == 4, (
-            f"ConfigVariant must have exactly 4 members, got {len(ConfigVariant)}"
+        assert len(ConfigVariant) == 5, (
+            f"ConfigVariant must have exactly 5 members, got {len(ConfigVariant)}"
         )
 
     def test_required_variant_names(self):
-        # Contract: the four variant names are BASELINE,
-        # REFLECTION_ONLY, ADVISOR_ONLY, BOTH. Pin the
-        # ``.name`` attribute (Python identifier form) so a
-        # future rename of one of the values is caught here
-        # with a clear failure message.
+        # Contract: the five variant names are BASELINE,
+        # REFLECTION_ONLY, ADVISOR_ONLY, BOTH,
+        # REFLECTION_FRESH. Pin the ``.name`` attribute
+        # (Python identifier form) so a future rename of one
+        # of the values is caught here with a clear failure
+        # message.
         names = {v.name for v in ConfigVariant}
         assert names == {
             "BASELINE",
             "REFLECTION_ONLY",
             "ADVISOR_ONLY",
             "BOTH",
+            "REFLECTION_FRESH",
         }, f"unexpected ConfigVariant name set: {names}"
 
-    def test_all_eight_configs_parse_cleanly(self):
-        # Contract: all 8 configs (4 variants x 2 models) parse
-        # cleanly through ``MoaxyConfig.model_validate``. Loop
-        # over the Cartesian product and assert each one
+    def test_all_ten_configs_parse_cleanly(self):
+        # Contract: all 10 configs (5 variants x 2 models)
+        # parse cleanly through ``MoaxyConfig.model_validate``.
+        # Loop over the Cartesian product and assert each one
         # round-trips. ``make_config`` returns an instance of
         # :class:`MoaxyConfig` (which is already Pydantic-
         # validated at construction), but the contract is
@@ -663,11 +679,13 @@ class TestConfigVariantsContract:
             == MODEL_ALIASES["minimax-m3"]
         )
 
-    def test_eight_cell_table(self):
+    def test_ten_cell_table(self):
         # Single table-driven test that pins the full
         # (variant, model) → expected settings mapping in one
         # place. A regression in any cell shows up with a
-        # clear pointer to the cell that failed.
+        # clear pointer to the cell that failed. The M8
+        # delta adds the two ``REFLECTION_FRESH`` rows to
+        # the M7 8-cell table; the table is now 10 cells.
         expected_table: dict[
             tuple[ConfigVariant, str], dict[str, int | str | None]
         ] = {
@@ -711,9 +729,19 @@ class TestConfigVariantsContract:
                 "advisor_turns": 1,
                 "advisor_model": MODEL_ALIASES["minimax-m3"],
             },
+            (ConfigVariant.REFLECTION_FRESH, "minimax-m3"): {
+                "reflection_turns": 1,
+                "advisor_turns": 0,
+                "advisor_model": None,
+            },
+            (ConfigVariant.REFLECTION_FRESH, "mimo-v2.5-pro"): {
+                "reflection_turns": 1,
+                "advisor_turns": 0,
+                "advisor_model": None,
+            },
         }
-        assert len(expected_table) == 8, (
-            f"expected table must have 8 cells, got {len(expected_table)}"
+        assert len(expected_table) == 10, (
+            f"expected table must have 10 cells, got {len(expected_table)}"
         )
         for (variant, model_alias), expected in expected_table.items():
             config = make_config(model_alias, variant)
@@ -808,6 +836,538 @@ class TestConfigVariantsContract:
         # programmer error.
         with pytest.raises(ValueError):
             make_config("not-a-comparison-model", ConfigVariant.BASELINE)
+
+
+# ────────────────────────────────────────────────────────────────────
+# M8 — REFLECTION_FRESH config variant
+# ────────────────────────────────────────────────────────────────────
+#
+# M8 feature m8-benchmark-config-variants-m8: the
+# :mod:`moaxy.benchmark.configs` module adds a 5th
+# :class:`ConfigVariant` value, :attr:`ConfigVariant.REFLECTION_FRESH`,
+# that flips :attr:`moaxy.models.config.ReflectionConfig.fresh_context`
+# to ``True`` and sets
+# :attr:`moaxy.models.config.AdvisorConfig.turns` to ``0``.
+# The contract (VAL-M8-007) asserts:
+#
+# * :attr:`ConfigVariant.REFLECTION_FRESH` is a valid
+#   :class:`ConfigVariant` member.
+# * ``make_config('minimax-m3', ConfigVariant.REFLECTION_FRESH)``
+#   returns a :class:`moaxy.models.config.MoaxyConfig` whose
+#   ``route.reflection.fresh_context`` is ``True`` and whose
+#   ``route.advisor.turns`` is ``0``.
+# * All 5 variants can be instantiated for both model
+#   aliases (10 ``make_config`` cells total).
+# * The hermetic ``BenchmarkRunner`` sweep with ``--fake-adapter``
+#   produces 10 cells; the 2 ``REFLECTION_FRESH`` cells are
+#   distinguishable from the 8 non-``REFLECTION_FRESH`` cells
+#   by the ``reflect_fresh_context`` event the orchestrator
+#   emits when ``fresh_context=True`` is configured.
+#
+# The :class:`TestM8BenchmarkConfig` class below enforces every
+# contract invariant with a focused test, plus a single
+# table-driven test that catches any regression in one place.
+# The event-capture part of the contract uses a
+# :class:`ScriptedAdapter`-driven orchestrator (mirroring the
+# pattern in :mod:`tests.test_orchestrator`) so the test does
+# not need to intercept the proxy's internal ``ctx.events``.
+
+
+class TestM8BenchmarkConfig:
+    """VAL-M8-007: REFLECTION_FRESH variant configures fresh_context.
+
+    The test class targets the four M8 contract assertions:
+
+    * (a) ``ConfigVariant.REFLECTION_FRESH`` is a valid enum
+      value.
+    * (b) ``make_config('minimax-m3', ConfigVariant.REFLECTION_FRESH)``
+      returns a :class:`moaxy.models.config.MoaxyConfig` with
+      ``route.reflection.fresh_context == True`` and
+      ``route.advisor.turns == 0``.
+    * (c) All 5 variants can be instantiated for both model
+      aliases (10 ``make_config`` cells total).
+    * (d) Hermetic sweep with ``--fake-adapter`` produces 10
+      cells; each ``REFLECTION_FRESH`` cell is associated
+      with the ``reflect_fresh_context`` event the orchestrator
+      emits.
+    """
+
+    def test_reflection_fresh_is_valid_enum_value(self):
+        # Contract (a): ``ConfigVariant.REFLECTION_FRESH`` is
+        # a valid enum member. Pin the ``.name`` (Python
+        # identifier) and ``.value`` (canonical string) so a
+        # future rename of one of them is caught here with a
+        # clear failure message.
+        assert hasattr(ConfigVariant, "REFLECTION_FRESH")
+        assert ConfigVariant.REFLECTION_FRESH.name == "REFLECTION_FRESH"
+        assert ConfigVariant.REFLECTION_FRESH.value == "reflection_fresh"
+        # The enum has exactly 5 members (M7's 4 + M8's 1).
+        assert len(ConfigVariant) == 5, (
+            f"ConfigVariant must have exactly 5 members, got {len(ConfigVariant)}"
+        )
+
+    def test_make_config_reflection_fresh_sets_fresh_context(self):
+        # Contract (b) (positive): ``make_config`` for the
+        # ``REFLECTION_FRESH`` variant returns a
+        # :class:`moaxy.models.config.MoaxyConfig` whose
+        # route has ``reflection.fresh_context == True`` and
+        # ``advisor.turns == 0``. The test exercises both
+        # canonical models so a future edit that
+        # accidentally per-model-binds the fresh-context
+        # toggle is caught here.
+        for model_alias in COMPARISON_MODELS:
+            config = make_config(model_alias, ConfigVariant.REFLECTION_FRESH)
+            assert isinstance(config, MoaxyConfig), (
+                f"make_config({model_alias!r}, REFLECTION_FRESH) must "
+                f"return a MoaxyConfig, got {type(config).__name__}"
+            )
+            assert len(config.routes) == 1, (
+                f"make_config({model_alias!r}, REFLECTION_FRESH) must "
+                f"return a config with exactly 1 route, got {len(config.routes)}"
+            )
+            route = config.routes[0]
+            assert route.reflection.fresh_context is True, (
+                f"REFLECTION_FRESH for {model_alias!r} expected "
+                f"reflection.fresh_context=True, got {route.reflection.fresh_context!r}"
+            )
+            assert route.advisor.turns == 0, (
+                f"REFLECTION_FRESH for {model_alias!r} expected "
+                f"advisor.turns=0, got {route.advisor.turns}"
+            )
+
+    def test_make_config_reflection_fresh_runs_one_reflection_turn(self):
+        # Contract (b) (positive, cont.): the
+        # ``REFLECTION_FRESH`` variant runs one reflection
+        # turn (the ``turns`` field is ``1``, not ``0``).
+        # The advisor is disabled (``advisor.turns == 0``)
+        # so the cell isolates the fresh-context reflection
+        # delta without an advisor pass.
+        for model_alias in COMPARISON_MODELS:
+            config = make_config(model_alias, ConfigVariant.REFLECTION_FRESH)
+            route = config.routes[0]
+            assert route.reflection.turns == 1, (
+                f"REFLECTION_FRESH for {model_alias!r} expected "
+                f"reflection.turns=1, got {route.reflection.turns}"
+            )
+            assert route.advisor.model is None, (
+                f"REFLECTION_FRESH for {model_alias!r} expected "
+                f"advisor.model=None, got {route.advisor.model!r}"
+            )
+
+    def test_all_ten_variants_instantiate_for_both_models(self):
+        # Contract (c): all 5 variants can be instantiated
+        # for both model aliases (10 ``make_config`` cells
+        # total). The test loops over the Cartesian
+        # product and asserts every cell round-trips
+        # cleanly through :meth:`MoaxyConfig.model_validate`.
+        for variant in ConfigVariant:
+            for model_alias in COMPARISON_MODELS:
+                config = make_config(model_alias, variant)
+                # The constructor already validates; the
+                # round-trip exercises the dict parsing
+                # path the production loader uses, and
+                # pin the M8 contract invariant that the
+                # ``fresh_context`` field is the canonical
+                # ``bool`` type (not, e.g., ``int`` or
+                # ``str``).
+                round_tripped = MoaxyConfig.model_validate(
+                    config.model_dump()
+                )
+                assert isinstance(round_tripped, MoaxyConfig)
+                assert isinstance(
+                    round_tripped.routes[0].reflection.fresh_context,
+                    bool,
+                ), (
+                    f"cell (variant={variant.name!r}, "
+                    f"model={model_alias!r}): "
+                    f"reflection.fresh_context must be a bool, "
+                    f"got "
+                    f"{type(round_tripped.routes[0].reflection.fresh_context).__name__}"
+                )
+
+    def test_reflection_fresh_round_trip_preserves_fresh_context(self):
+        # Contract (b) (round-trip): the ``fresh_context``
+        # field on the ``REFLECTION_FRESH`` config survives
+        # a ``model_dump()`` / ``model_validate()`` round
+        # trip. A future edit that drops the field from the
+        # ``ReflectionConfig`` Pydantic model (or from
+        # ``make_config``'s output) is caught here.
+        config = make_config(
+            "minimax-m3", ConfigVariant.REFLECTION_FRESH
+        )
+        round_tripped = MoaxyConfig.model_validate(config.model_dump())
+        assert (
+            round_tripped.routes[0].reflection.fresh_context is True
+        ), (
+            "REFLECTION_FRESH round-trip must preserve "
+            "reflection.fresh_context=True"
+        )
+
+    @pytest.mark.asyncio
+    async def test_reflection_fresh_orchestrator_emits_reflect_fresh_context_event(
+        self,
+    ):
+        # Contract (d) (event-level): when the
+        # ``REFLECTION_FRESH`` variant's
+        # ``reflection.fresh_context`` is ``True``, the
+        # orchestrator emits a one-shot
+        # ``reflect_fresh_context`` event to ``ctx.events``
+        # after the first critique. The test drives the
+        # orchestrator directly with a
+        # :class:`ScriptedAdapter` (mirroring the
+        # :class:`TestM8FreshContextOrchestratorEvent`
+        # pattern in :mod:`tests.test_orchestrator`) and
+        # asserts the event is present on ``ctx.events``
+        # for the ``REFLECTION_FRESH`` cell.
+        from moaxy.adapters.base import (
+            Adapter,
+            ChatResponse,
+            Message,
+            Usage,
+        )
+        from moaxy.models.config import (
+            AdvisorConfig,
+            ReflectionConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import (
+            RouteMatch as ConfigRouteMatch,
+        )
+        from moaxy.pipeline.context import PipelineContext
+        from moaxy.pipeline.orchestrator import Orchestrator
+        from moaxy.routing.matcher import RouteMatch
+
+        class _ScriptedAdapter(Adapter):
+            """A scripted adapter for the event-capture test.
+
+            Mirrors the helper in
+            :mod:`tests.test_orchestrator`. Returns
+            :class:`ChatResponse` entries from a script;
+            records every call so a future test can assert
+            on the messages the orchestrator forwarded.
+            """
+
+            name = "scripted-m8"
+
+            def __init__(self, script: list[ChatResponse]) -> None:
+                self._script = list(script)
+                self._index = 0
+                self.calls: list[dict[str, object]] = []
+
+            async def chat(
+                self, *, model: str, messages: list[dict[str, object]], **kwargs: object
+            ) -> ChatResponse:
+                self.calls.append(
+                    {"model": model, "messages": messages, **kwargs}
+                )
+                if self._index >= len(self._script):
+                    raise AssertionError(
+                        f"_ScriptedAdapter: no more scripted responses "
+                        f"(call #{self._index + 1} for model={model})"
+                    )
+                entry = self._script[self._index]
+                self._index += 1
+                return entry
+
+            async def stream(self, *, model: str, messages: list[dict[str, object]], **kwargs: object):  # pragma: no cover
+                if False:
+                    yield ""
+
+            async def close(self) -> None:  # pragma: no cover
+                return None
+
+        def _response(
+            content: str,
+            *,
+            model: str = "minimax-m3:cloud",
+            prompt_tokens: int = 10,
+            completion_tokens: int = 5,
+        ) -> ChatResponse:
+            return ChatResponse(
+                id="chatcmpl-m8-test",
+                model=model,
+                message=Message(role="assistant", content=content),
+                usage=Usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                ),
+                finish_reason="stop",
+            )
+
+        adapter = _ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "cold critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        # Build a route that mirrors what
+        # ``make_config('minimax-m3', REFLECTION_FRESH)`` would
+        # build. The route's ``reflection.fresh_context`` is
+        # ``True``; ``advisor.turns`` is ``0``; ``reflection.turns``
+        # is ``1``.
+        config_route = RouteConfig(
+            name="bench",
+            match=ConfigRouteMatch(
+                model="minimax-m3", path="/v1/chat/completions"
+            ),
+            backend="openrouter-main",
+            aliases={"minimax-m3": "minimax/minimax-m3"},
+            fallbacks=[],
+            retry=0,
+            reflection=ReflectionConfig(
+                turns=1,
+                early_exit=False,
+                threshold=0.85,
+                fresh_context=True,
+            ),
+            advisor=AdvisorConfig(turns=0, model=None),
+        )
+        route = RouteMatch(
+            route=config_route,
+            original_model="minimax-m3",
+            resolved_model="minimax/minimax-m3",
+            backend="openrouter-main",
+            path="/v1/chat/completions",
+            reflection=config_route.reflection,
+            advisor=config_route.advisor,
+            fallbacks=list(config_route.fallbacks),
+            retry=config_route.retry,
+            aliases=dict(config_route.aliases),
+        )
+        ctx = PipelineContext(
+            request_id="req-m8-1",
+            request={
+                "model": "minimax-m3",
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+            route=route,
+            model_alias_resolved=route.resolved_model,
+            target_backend=route.backend,
+            original_model=route.original_model,
+        )
+        await Orchestrator(adapter).run(ctx)
+        # The ``reflect_fresh_context`` event MUST be present
+        # on the orchestrator's events list because
+        # ``reflection.fresh_context`` is ``True``.
+        events = [
+            e for e in ctx.events if e.type == "reflect_fresh_context"
+        ]
+        assert len(events) == 1, (
+            f"expected exactly 1 reflect_fresh_context event for the "
+            f"REFLECTION_FRESH cell, got {len(events)}: "
+            f"{[(e.type, e.text) for e in ctx.events]}"
+        )
+        assert events[0].text == "True"
+        assert events[0].turn == 0
+
+    @pytest.mark.asyncio
+    async def test_non_reflection_fresh_orchestrator_does_not_emit_event(
+        self,
+    ):
+        # Contract (d) (negative control): when
+        # ``reflection.fresh_context`` is ``False`` (the M7
+        # default), the orchestrator does NOT emit the
+        # ``reflect_fresh_context`` event. The test is the
+        # negative control for the previous test: it
+        # confirms the event is gated on the
+        # ``fresh_context`` toggle, not on the variant name.
+        from moaxy.adapters.base import (
+            Adapter,
+            ChatResponse,
+            Message,
+            Usage,
+        )
+        from moaxy.models.config import (
+            AdvisorConfig,
+            ReflectionConfig,
+            RouteConfig,
+        )
+        from moaxy.models.config import (
+            RouteMatch as ConfigRouteMatch,
+        )
+        from moaxy.pipeline.context import PipelineContext
+        from moaxy.pipeline.orchestrator import Orchestrator
+        from moaxy.routing.matcher import RouteMatch
+
+        class _ScriptedAdapter(Adapter):
+            name = "scripted-m8-control"
+
+            def __init__(self, script: list[ChatResponse]) -> None:
+                self._script = list(script)
+                self._index = 0
+                self.calls: list[dict[str, object]] = []
+
+            async def chat(
+                self, *, model: str, messages: list[dict[str, object]], **kwargs: object
+            ) -> ChatResponse:
+                self.calls.append(
+                    {"model": model, "messages": messages, **kwargs}
+                )
+                entry = self._script[self._index]
+                self._index += 1
+                return entry
+
+            async def stream(self, *, model: str, messages: list[dict[str, object]], **kwargs: object):  # pragma: no cover
+                if False:
+                    yield ""
+
+            async def close(self) -> None:  # pragma: no cover
+                return None
+
+        def _response(
+            content: str,
+            *,
+            model: str = "minimax-m3:cloud",
+            prompt_tokens: int = 10,
+            completion_tokens: int = 5,
+        ) -> ChatResponse:
+            return ChatResponse(
+                id="chatcmpl-m8-control",
+                model=model,
+                message=Message(role="assistant", content=content),
+                usage=Usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                ),
+                finish_reason="stop",
+            )
+
+        adapter = _ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        # Same route as the positive test, but with
+        # ``fresh_context=False`` (the M7 default). The
+        # event MUST NOT be emitted.
+        config_route = RouteConfig(
+            name="bench",
+            match=ConfigRouteMatch(
+                model="minimax-m3", path="/v1/chat/completions"
+            ),
+            backend="openrouter-main",
+            aliases={"minimax-m3": "minimax/minimax-m3"},
+            fallbacks=[],
+            retry=0,
+            reflection=ReflectionConfig(
+                turns=1,
+                early_exit=False,
+                threshold=0.85,
+                fresh_context=False,
+            ),
+            advisor=AdvisorConfig(turns=0, model=None),
+        )
+        route = RouteMatch(
+            route=config_route,
+            original_model="minimax-m3",
+            resolved_model="minimax/minimax-m3",
+            backend="openrouter-main",
+            path="/v1/chat/completions",
+            reflection=config_route.reflection,
+            advisor=config_route.advisor,
+            fallbacks=list(config_route.fallbacks),
+            retry=config_route.retry,
+            aliases=dict(config_route.aliases),
+        )
+        ctx = PipelineContext(
+            request_id="req-m8-control",
+            request={
+                "model": "minimax-m3",
+                "messages": [{"role": "user", "content": "ping"}],
+            },
+            route=route,
+            model_alias_resolved=route.resolved_model,
+            target_backend=route.backend,
+            original_model=route.original_model,
+        )
+        await Orchestrator(adapter).run(ctx)
+        events = [
+            e for e in ctx.events if e.type == "reflect_fresh_context"
+        ]
+        assert len(events) == 0, (
+            f"expected NO reflect_fresh_context event when "
+            f"fresh_context=False (the M7 default), got {len(events)}: "
+            f"{[(e.type, e.text) for e in ctx.events]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_hermetic_sweep_produces_ten_cells(self):
+        # Contract (d) (cell-count): the hermetic sweep
+        # with ``fake_adapter=True`` produces 10 cells
+        # (5 variants x 2 models). The test runs the
+        # runner in hermetic mode and asserts the
+        # canonical sweep produces 10 cells, with the
+        # two ``REFLECTION_FRESH`` cells distinguishable
+        # from the 8 non-``REFLECTION_FRESH`` cells.
+        from moaxy.benchmark.harness import BenchmarkRunner
+
+        runner = BenchmarkRunner(
+            models=COMPARISON_MODELS,
+            config_variants=list(ConfigVariant),
+            prompts=PROMPT_SET,
+            fake_adapter=True,
+        )
+        results = await runner.execute()
+        assert len(results) == 10, (
+            f"hermetic sweep must produce 10 cells (5 variants x 2 "
+            f"models), got {len(results)}"
+        )
+        # The 10 cells must cover the 2x5 Cartesian
+        # product. The test asserts the exact set of
+        # (model, variant) pairs is present, with
+        # ``REFLECTION_FRESH`` represented for both
+        # models.
+        seen = {(r.model, r.variant) for r in results}
+        expected = {
+            (m, v)
+            for m in COMPARISON_MODELS
+            for v in ConfigVariant
+        }
+        assert seen == expected, (
+            f"hermetic sweep cells must be the full 2x5 Cartesian "
+            f"product; expected {sorted(expected)!r}, got {sorted(seen)!r}"
+        )
+        # The 2 ``REFLECTION_FRESH`` cells are the
+        # canonical M8 delta; pin their presence so a
+        # future edit that drops the variant from the
+        # ``ConfigVariant`` enum is caught here.
+        reflection_fresh_cells = [
+            r for r in results
+            if r.variant is ConfigVariant.REFLECTION_FRESH
+        ]
+        assert len(reflection_fresh_cells) == 2, (
+            f"hermetic sweep must produce 2 REFLECTION_FRESH cells "
+            f"(one per comparison model), got {len(reflection_fresh_cells)}"
+        )
+        for cell in reflection_fresh_cells:
+            assert cell.model in COMPARISON_MODELS
+            assert cell.prompt_count >= 10, (
+                f"REFLECTION_FRESH cell for model {cell.model!r} "
+                f"expected prompt_count >= 10, got {cell.prompt_count}"
+            )
+        # The 8 non-``REFLECTION_FRESH`` cells are the
+        # M7 baseline (4 variants x 2 models).
+        non_fresh_cells = [
+            r for r in results
+            if r.variant is not ConfigVariant.REFLECTION_FRESH
+        ]
+        assert len(non_fresh_cells) == 8, (
+            f"hermetic sweep must produce 8 non-REFLECTION_FRESH "
+            f"cells (the M7 4x2 sweep), got {len(non_fresh_cells)}"
+        )
 
 
 def test_package_init_exports_config_symbols():
@@ -2016,11 +2576,12 @@ def test_package_init_exports_judge_scorer_symbols():
 
 
 class TestBenchmarkRunnerHermetic:
-    """VAL-BENCH-003: BenchmarkRunner executes all 8 cells without errors.
+    """VAL-BENCH-003 / VAL-M8-007: BenchmarkRunner executes all 10 cells without errors.
 
     The test class exercises the :class:`BenchmarkRunner`'s
     hermetic path end-to-end. The runner is constructed with
-    the canonical 2-model × 4-variant sweep, the curated
+    the canonical 2-model × 5-variant sweep (M7's 4 variants
+    plus the M8 ``REFLECTION_FRESH`` delta), the curated
     :data:`PROMPT_SET`, and ``fake_adapter=True`` (no real
     OpenRouter key needed). Every test method below targets
     a single contract invariant so a failure message points
@@ -2028,7 +2589,7 @@ class TestBenchmarkRunnerHermetic:
     """
 
     def _build_runner(self):
-        """Build a hermetic :class:`BenchmarkRunner` over the full 2×4 sweep.
+        """Build a hermetic :class:`BenchmarkRunner` over the full 2×5 sweep.
 
         The helper is the single source of truth for the
         runner construction; every test in the class uses it
@@ -2046,15 +2607,16 @@ class TestBenchmarkRunnerHermetic:
         )
 
     @pytest.mark.asyncio
-    async def test_runner_executes_all_eight_cells(self):
+    async def test_runner_executes_all_ten_cells(self):
         # Contract: the runner produces one :class:`CellResult`
         # per ``(model, variant)`` cell. With
         # :data:`COMPARISON_MODELS` of length 2 and
-        # :class:`ConfigVariant` of length 4, the expected
-        # result count is 8. The test asserts the exact
-        # cardinality; future edits that drop a model or a
-        # variant are caught here with a clear failure
-        # message.
+        # :class:`ConfigVariant` of length 5 (the four M7
+        # variants plus the M8 ``REFLECTION_FRESH`` delta),
+        # the expected result count is 10. The test asserts
+        # the exact cardinality; future edits that drop a
+        # model or a variant are caught here with a clear
+        # failure message.
         runner = self._build_runner()
         results = await runner.execute()
         expected = len(COMPARISON_MODELS) * len(ConfigVariant)
@@ -2064,7 +2626,7 @@ class TestBenchmarkRunnerHermetic:
         )
 
     @pytest.mark.asyncio
-    async def test_eight_cells_table(self):
+    async def test_ten_cells_table(self):
         # Single table-driven test that pins the full
         # (model, variant) → CellResult-shape mapping in one
         # place. A regression in any cell shows up with a
@@ -2074,7 +2636,7 @@ class TestBenchmarkRunnerHermetic:
         # floor, summary-statistics presence) on every cell.
         runner = self._build_runner()
         results = await runner.execute()
-        assert len(results) == 8
+        assert len(results) == 10
         seen: set[tuple[str, str]] = set()
         for result in results:
             from moaxy.benchmark.harness import CellResult
@@ -2278,14 +2840,15 @@ class TestBenchmarkRunnerHermetic:
         # cell. The runner exposes the per-cell handler
         # list at :attr:`BenchmarkRunner.hermetic_handlers`;
         # the test asserts the list has one entry per
-        # cell (8 entries) so a future edit that drops the
-        # hermetic wiring is caught here.
+        # cell (10 entries for the M8 2×5 sweep) so a
+        # future edit that drops the hermetic wiring is
+        # caught here.
         runner = self._build_runner()
         results = await runner.execute()
-        assert len(results) == 8
-        assert len(runner.hermetic_handlers) == 8, (
+        assert len(results) == 10
+        assert len(runner.hermetic_handlers) == 10, (
             f"hermetic_handlers expected one entry per cell "
-            f"(8 total), got {len(runner.hermetic_handlers)}"
+            f"(10 total), got {len(runner.hermetic_handlers)}"
         )
         # Each handler must have a non-empty ``calls`` log
         # (at least the initial LLM call per prompt). The
@@ -2419,12 +2982,12 @@ class TestBenchmarkRunnerHermetic:
         # caught here.
         runner = self._build_runner()
         results = await runner.execute()
-        assert len(results) == 8
+        assert len(results) == 10
         # The hermetic path exposes a handler per cell; if
         # the runner instead started uvicorn, the handler
         # list would be empty (the live path does not
         # populate it).
-        assert len(runner.hermetic_handlers) == 8, (
+        assert len(runner.hermetic_handlers) == 10, (
             "hermetic path must populate hermetic_handlers; "
             "if it is empty, the runner is running the live "
             "(uvicorn) path in fake_adapter=True mode"
@@ -2432,7 +2995,7 @@ class TestBenchmarkRunnerHermetic:
 
     @pytest.mark.asyncio
     async def test_single_cell_runner_runs_one_cell(self):
-        # The contract pins the full 2×4 sweep, but the
+        # The contract pins the full 2×5 sweep, but the
         # runner is also useful for sub-sweeps (a
         # developer who only wants to test one model
         # against one variant). Pin the sub-sweep
@@ -2461,14 +3024,14 @@ class TestBenchmarkRunnerHermetic:
         # runner sets a placeholder env var only when one
         # is not already present. The test removes the env
         # var (when one is set) and confirms the runner
-        # still produces 8 cells. ``monkeypatch.delenv``
+        # still produces 10 cells. ``monkeypatch.delenv``
         # reverts the change at teardown so subsequent
         # tests see the user's actual value.
         runner = self._build_runner()
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         results = await runner.execute()
-        assert len(results) == 8, (
-            "hermetic runner must run all 8 cells without "
+        assert len(results) == 10, (
+            "hermetic runner must run all 10 cells without "
             "OPENROUTER_API_KEY set in the env"
         )
 
@@ -2490,7 +3053,7 @@ class TestBenchmarkRunnerHermetic:
         monkeypatch.setenv("OPENROUTER_API_KEY", sentinel)
         runner = self._build_runner()
         results = await runner.execute()
-        assert len(results) == 8
+        assert len(results) == 10
         import os
 
         assert os.environ.get("OPENROUTER_API_KEY") == sentinel, (
@@ -2549,13 +3112,13 @@ def test_package_init_exports_harness_symbols():
 #
 # * The string is valid markdown (no syntax errors).
 # * All five section headers are present.
-# * The per-cell table has exactly 8 rows (one per
-#   ``(model, variant)`` cell; the canonical M7 sweep is
-#   2 models × 4 variants = 8 cells).
+# * The per-cell table has exactly 10 rows (one per
+#   ``(model, variant)`` cell; the canonical M8 sweep is
+#   2 models × 5 variants = 10 cells).
 # * The "best configuration per model" section names a config
 #   for each of the two comparison models.
 # * The "best model per configuration" section names a model
-#   for each of the four variants.
+#   for each of the five variants.
 #
 # The :class:`TestReportGeneratorContract` test class enforces
 # every contract invariant with a focused test, plus a single
@@ -2610,19 +3173,19 @@ def _canned_prompt_result(
 
 
 def _canned_cell_results() -> list[CellResult]:
-    """Build the canonical 8-cell canned input for the report tests.
+    """Build the canonical 10-cell canned input for the report tests.
 
     The canned input is one :class:`CellResult` per
-    ``(model, variant)`` cell in the canonical M7 sweep.
-    The mean quality, mean tokens, and pass rate vary
-    per cell so the "best" computations in the
-    per-model and per-config sections have a
-    well-defined, deterministic answer. The values are
-    pinned by the per-section tests so a future edit
-    that flips a comparison is caught.
+    ``(model, variant)`` cell in the canonical M8 sweep
+    (5 variants x 2 models = 10 cells). The mean quality,
+    mean tokens, and pass rate vary per cell so the
+    "best" computations in the per-model and per-config
+    sections have a well-defined, deterministic answer.
+    The values are pinned by the per-section tests so a
+    future edit that flips a comparison is caught.
 
     Returns:
-        A list of 8 :class:`CellResult` objects in the
+        A list of 10 :class:`CellResult` objects in the
         order ``(model[0], variant[0]), (model[0],
         variant[1]), ..., (model[-1], variant[-1])``
         (variants vary fastest), matching the
@@ -2635,20 +3198,24 @@ def _canned_cell_results() -> list[CellResult]:
         ("minimax-m3", "reflection_only"): 0.85,
         ("minimax-m3", "advisor_only"): 0.80,
         ("minimax-m3", "both"): 0.90,
+        ("minimax-m3", "reflection_fresh"): 0.83,
         ("mimo-v2.5-pro", "baseline"): 0.65,
         ("mimo-v2.5-pro", "reflection_only"): 0.75,
         ("mimo-v2.5-pro", "advisor_only"): 0.82,
         ("mimo-v2.5-pro", "both"): 0.78,
+        ("mimo-v2.5-pro", "reflection_fresh"): 0.77,
     }
     tokens_table: dict[tuple[str, str], float] = {
         ("minimax-m3", "baseline"): 100.0,
         ("minimax-m3", "reflection_only"): 300.0,
         ("minimax-m3", "advisor_only"): 250.0,
         ("minimax-m3", "both"): 450.0,
+        ("minimax-m3", "reflection_fresh"): 320.0,
         ("mimo-v2.5-pro", "baseline"): 120.0,
         ("mimo-v2.5-pro", "reflection_only"): 320.0,
         ("mimo-v2.5-pro", "advisor_only"): 270.0,
         ("mimo-v2.5-pro", "both"): 480.0,
+        ("mimo-v2.5-pro", "reflection_fresh"): 340.0,
     }
     cells: list[CellResult] = []
     for model_alias in COMPARISON_MODELS:
@@ -2684,7 +3251,7 @@ class TestReportGeneratorContract:
     the canonical 8-cell canned input and pins the
     five contract invariants: the report is a string,
     the string contains all five section headers, the
-    per-cell table has exactly 8 rows, the
+    per-cell table has exactly 10 rows, the
     "best configuration per model" section names a
     config for each model, and the "best model per
     configuration" section names a model for each
@@ -2767,17 +3334,17 @@ class TestReportGeneratorContract:
                 "as present in the rendered markdown"
             )
 
-    def test_per_cell_table_has_eight_rows(self):
-        # Contract: the per-cell table has exactly 8
+    def test_per_cell_table_has_ten_rows(self):
+        # Contract: the per-cell table has exactly 10
         # rows (one per ``(model, variant)`` cell; the
-        # canonical M7 sweep is 2 models × 4 variants
-        # = 8 cells). The test counts the table rows
+        # canonical M8 sweep is 2 models × 5 variants
+        # = 10 cells). The test counts the table rows
         # by counting the lines that start with
         # ``"| "`` (the markdown table cell prefix)
         # and lie between the per-cell section header
         # and the next section header. The count
-        # includes the header row + the 8 data rows
-        # = 9 total table lines.
+        # includes the header row + the 10 data rows
+        # = 11 total table lines.
         from moaxy.benchmark.report import MarkdownReportGenerator
 
         cells = _canned_cell_results()
@@ -2788,7 +3355,7 @@ class TestReportGeneratorContract:
         per_cell_section = report[per_cell_start:next_section_idx]
         # Count table rows: lines that start with
         # ``"| "``. The header row, the separator row,
-        # and the 8 data rows all start with ``"|"``;
+        # and the 10 data rows all start with ``"|"``;
         # the header and data rows start with ``"| "``
         # (with a space after the leading bar). The
         # separator row starts with ``"|-"``. We count
@@ -2799,14 +3366,14 @@ class TestReportGeneratorContract:
             for line in per_cell_section.splitlines()
             if line.startswith("| ") and not line.startswith("|---")
         ]
-        # 1 header row + 8 data rows = 9 table lines.
-        assert len(table_lines) == 9, (
-            f"per-cell table expected 1 header row + 8 data rows = 9 "
-            f"table lines, got {len(table_lines)}; the contract "
-            "(VAL-BENCH-009) pins exactly 8 data rows"
+        # 1 header row + 10 data rows = 11 table lines.
+        assert len(table_lines) == 11, (
+            f"per-cell table expected 1 header row + 10 data rows = 11 "
+            f"table lines, got {len(table_lines)}; the M8 contract "
+            "pins exactly 10 data rows for the 2x5 sweep"
         )
-        # The 8 data rows must be a permutation of
-        # the 8 (model, variant) cells; the test
+        # The 10 data rows must be a permutation of
+        # the 10 (model, variant) cells; the test
         # checks the data rows mention each model and
         # each variant at least once.
         data_rows = table_lines[1:]  # skip the header row
@@ -2854,7 +3421,7 @@ class TestReportGeneratorContract:
         # comparison models. The test asserts each
         # model alias appears in the section's body
         # and is followed by a variant value (one of
-        # the four :class:`ConfigVariant` values).
+        # the five :class:`ConfigVariant` values).
         from moaxy.benchmark.report import MarkdownReportGenerator
 
         cells = _canned_cell_results()
@@ -2870,7 +3437,7 @@ class TestReportGeneratorContract:
             )
             # The model must be followed by a variant
             # value. The test checks that one of the
-            # four :class:`ConfigVariant` values
+            # five :class:`ConfigVariant` values
             # appears in the section (it is shared
             # across the two model bullets).
         variant_values = {v.value for v in ConfigVariant}
@@ -2885,7 +3452,7 @@ class TestReportGeneratorContract:
 
     def test_best_model_per_configuration_names_a_model_for_each_config(self):
         # Contract: the "best model per configuration"
-        # section names a model for each of the four
+        # section names a model for each of the five
         # config variants. The test asserts each
         # variant value appears in the section's body
         # and is followed by a model alias (one of
@@ -2906,7 +3473,7 @@ class TestReportGeneratorContract:
         # The section must name a model alias for
         # each variant. The test checks that each
         # model alias appears in the section (the
-        # four bullets together mention both models
+        # five bullets together mention both models
         # at least once).
         for model_alias in COMPARISON_MODELS:
             assert model_alias in section, (
@@ -2936,17 +3503,17 @@ class TestReportGeneratorContract:
         assert "Quality" in section or "quality" in section.lower(), (
             "cost-quality scatter section does not mention quality"
         )
-        # The section must include a row per cell (8
+        # The section must include a row per cell (10
         # rows in the canned input).
         table_lines = [
             line
             for line in section.splitlines()
             if line.startswith("| ") and not line.startswith("|---")
         ]
-        # 1 header row + 8 data rows = 9 table lines.
-        assert len(table_lines) == 9, (
-            f"cost-quality scatter table expected 1 header + 8 data rows "
-            f"= 9 table lines, got {len(table_lines)}"
+        # 1 header row + 10 data rows = 11 table lines.
+        assert len(table_lines) == 11, (
+            f"cost-quality scatter table expected 1 header + 10 data rows "
+            f"= 11 table lines, got {len(table_lines)}"
         )
 
     def test_raw_data_appendix_section_present(self):
@@ -2974,7 +3541,7 @@ class TestReportGeneratorContract:
             f"({len(cells)}), got {len(sub_headers)}"
         )
 
-    def test_table_driven_eight_section_check(self):
+    def test_table_driven_ten_section_check(self):
         # Single table-driven test that pins the
         # full report contract in one place. A
         # regression in any section or any cell
@@ -2993,9 +3560,10 @@ class TestReportGeneratorContract:
             "## Raw Data Appendix",
         ):
             assert header in report, f"missing section header: {header!r}"
-        # All 8 cells are represented in the per-cell
-        # table. The 8 (model, variant) combinations
-        # are the canonical M7 sweep.
+        # All 10 cells are represented in the per-cell
+        # table. The 10 (model, variant) combinations
+        # are the canonical M8 sweep (5 variants x 2
+        # models).
         for model_alias in COMPARISON_MODELS:
             for variant in ConfigVariant:
                 assert (model_alias in report), (
@@ -3005,11 +3573,11 @@ class TestReportGeneratorContract:
                     f"variant {variant.value!r} missing from report"
                 )
         # The per-cell table is the only place that
-        # has 8 data rows in the table sense; the
+        # has 10 data rows in the table sense; the
         # other tables (best-per-model,
-        # best-per-config, cost-quality) have 2, 4,
-        # and 8 rows respectively. The total
-        # per-cell-table row count of 8 data rows
+        # best-per-config, cost-quality) have 2, 5,
+        # and 10 rows respectively. The total
+        # per-cell-table row count of 10 data rows
         # is the contract pin; the test re-checks
         # the count here in the table-driven sweep
         # so a regression shows up with a single
@@ -3025,8 +3593,8 @@ class TestReportGeneratorContract:
             and "Model" not in line
             and "Mean Quality" not in line
         ]
-        assert len(data_rows) == 8, (
-            f"per-cell table expected exactly 8 data rows (one per "
+        assert len(data_rows) == 10, (
+            f"per-cell table expected exactly 10 data rows (one per "
             f"(model, variant) cell), got {len(data_rows)}"
         )
 
@@ -3034,9 +3602,9 @@ class TestReportGeneratorContract:
         # Belt-and-braces: the generator must not
         # raise on an empty input list. The contract
         # pins the report's structure for the
-        # canonical 8-cell input, but a sub-sweep
+        # canonical 10-cell input, but a sub-sweep
         # (or a future feature) may pass an empty
-        # list. The generator renders the four
+        # list. The generator renders the five
         # summary sections with empty tables and
         # bullets; the appendix reports "no cell
         # results to render".
@@ -3067,7 +3635,7 @@ class TestReportGeneratorContract:
         # raise when a cell has ``None`` summary
         # statistics (the cell produced no data).
         # The contract pins the report's structure
-        # for the canonical 8-cell input, but a
+        # for the canonical 10-cell input, but a
         # partially-failed cell (no LLM calls
         # recorded) is a legitimate edge case.
         from moaxy.benchmark.harness import CellResult
@@ -3117,9 +3685,11 @@ class TestReportGeneratorContract:
 #   ``moaxy.benchmark.run.main`` is importable and is a
 #   synchronous callable that returns an integer exit code.
 # * Invoking the CLI with
-#   ``--models <m1>,<m2> --configs <c1>,<c2>,<c3>,<c4> --output <dir> --fake-adapter``
-#   exits 0 and writes ``<output>/results.json`` (8 cells) and
-#   ``<output>/report.md`` (per-cell table with 8 rows).
+#   ``--models <m1>,<m2> --configs <c1>,<c2>,<c3>,<c4>,<c5> --output <dir> --fake-adapter``
+#   exits 0 and writes ``<output>/results.json`` (10 cells) and
+#   ``<output>/report.md`` (per-cell table with 10 rows). The M8
+#   delta adds the fifth ``reflection_fresh`` config to the
+#   canonical CLI sweep.
 # * The hermetic ``--fake-adapter`` path runs without a real
 #   ``OPENROUTER_API_KEY`` in the environment.
 #
@@ -3146,6 +3716,7 @@ def _run_cli_hermetic(
     tmp_dir: Path,
     *,
     extra_args: list[str] | None = None,
+    configs: str = "baseline,reflection,advisor,both,reflection_fresh",
 ) -> subprocess.CompletedProcess[str]:
     """Invoke the benchmark CLI in hermetic mode via :func:`subprocess.run`.
 
@@ -3172,6 +3743,13 @@ def _run_cli_hermetic(
             flags that vary between tests (e.g. an
             invalid model alias for the argument-error
             test).
+        configs: The ``--configs`` argument the helper
+            passes. Defaults to the canonical M8 sweep
+            (the four M7 variants plus the M8
+            ``reflection_fresh`` delta). Tests that want
+            the M7 4-variant sweep pass
+            ``configs="baseline,reflection,advisor,both"``
+            explicitly.
 
     Returns:
         The :class:`subprocess.CompletedProcess` for the
@@ -3188,7 +3766,7 @@ def _run_cli_hermetic(
         "--models",
         "minimax-m3,mimo-v2.5-pro",
         "--configs",
-        "baseline,reflection,advisor,both",
+        configs,
         "--output",
         str(tmp_dir),
         "--fake-adapter",
@@ -3232,8 +3810,9 @@ class TestCLIEntryPoint:
     :class:`tempfile.TemporaryDirectory` and inspected for
     the contract-pinned files (``results.json`` and
     ``report.md``) and the contract-pinned content
-    (8 cells in the JSON, 8 data rows in the report's
-    per-cell table).
+    (10 cells in the JSON, 10 data rows in the report's
+    per-cell table). The M8 delta adds
+    ``reflection_fresh`` as the fifth canonical config.
     """
 
     def test_cli_main_is_importable(self):
@@ -3305,24 +3884,28 @@ class TestCLIEntryPoint:
         # ``python -m moaxy.benchmark.run`` with
         # ``--fake-adapter`` exits 0. The test asserts the
         # subprocess returncode and confirms the stdout
-        # message the CLI prints on success.
+        # message the CLI prints on success. The M8
+        # delta adds ``reflection_fresh`` to the default
+        # ``--configs`` so the CLI now reports 10 cells
+        # (2 models x 5 variants) on the canonical sweep.
         result = _run_cli_hermetic(tmp_path)
         assert result.returncode == 0, (
             f"hermetic CLI must exit 0, got {result.returncode}; "
             f"stdout: {result.stdout!r}; stderr: {result.stderr!r}"
         )
-        assert "wrote 8 cells" in result.stdout, (
-            f"CLI stdout must confirm 8 cells were written; "
+        assert "wrote 10 cells" in result.stdout, (
+            f"CLI stdout must confirm 10 cells were written; "
             f"got {result.stdout!r}"
         )
 
     def test_cli_subprocess_hermetic_writes_results_json(self, tmp_path):
         # Contract: the CLI writes ``<output>/results.json``
-        # with 8 cells of data. The test runs the CLI
-        # hermetically, locates the timestamped output
-        # directory the CLI created under ``tmp_path``,
-        # and asserts ``results.json`` exists and contains
-        # the 8 (model, variant) cells.
+        # with 10 cells of data (the M8 2x5 sweep). The
+        # test runs the CLI hermetically, locates the
+        # timestamped output directory the CLI created
+        # under ``tmp_path``, and asserts ``results.json``
+        # exists and contains the 10 (model, variant)
+        # cells.
         result = _run_cli_hermetic(tmp_path)
         assert result.returncode == 0, (
             f"hermetic CLI must exit 0, got {result.returncode}; "
@@ -3336,14 +3919,16 @@ class TestCLIEntryPoint:
         with open(results_json, encoding="utf-8") as fh:
             payload = json.load(fh)
         cells = payload.get("cells", [])
-        assert len(cells) == 8, (
-            f"results.json must contain 8 cells (one per "
+        assert len(cells) == 10, (
+            f"results.json must contain 10 cells (one per "
             f"(model, variant) pair), got {len(cells)}; the "
-            "contract (VAL-BENCH-008) pins the 8-cell invariant"
+            "M8 contract (VAL-M8-007) pins the 10-cell invariant"
+            " for the canonical 2x5 sweep"
         )
-        # The 8 cells must cover the 2x4 Cartesian product
-        # (2 models x 4 variants). The test asserts the
-        # exact set of (model, variant) pairs is present.
+        # The 10 cells must cover the 2x5 Cartesian
+        # product (2 models x 5 variants). The test
+        # asserts the exact set of (model, variant) pairs
+        # is present.
         seen = {(c["model"], c["variant"]) for c in cells}
         expected_models = {"minimax-m3", "mimo-v2.5-pro"}
         expected_variants = {
@@ -3351,6 +3936,7 @@ class TestCLIEntryPoint:
             "reflection_only",
             "advisor_only",
             "both",
+            "reflection_fresh",
         }
         expected = {
             (m, v)
@@ -3358,17 +3944,18 @@ class TestCLIEntryPoint:
             for v in expected_variants
         }
         assert seen == expected, (
-            f"results.json cells must be the full 2x4 Cartesian "
+            f"results.json cells must be the full 2x5 Cartesian "
             f"product; expected {expected!r}, got {seen!r}"
         )
 
     def test_cli_subprocess_hermetic_writes_report_md(self, tmp_path):
         # Contract: the CLI writes ``<output>/report.md``
-        # with a per-cell table containing 8 rows. The
-        # test runs the CLI hermetically, locates the
-        # timestamped output directory, and asserts
-        # ``report.md`` exists and contains a per-cell
-        # table with exactly 8 data rows.
+        # with a per-cell table containing 10 rows (the
+        # M8 2x5 sweep). The test runs the CLI
+        # hermetically, locates the timestamped output
+        # directory, and asserts ``report.md`` exists and
+        # contains a per-cell table with exactly 10 data
+        # rows.
         result = _run_cli_hermetic(tmp_path)
         assert result.returncode == 0, (
             f"hermetic CLI must exit 0, got {result.returncode}; "
@@ -3381,7 +3968,7 @@ class TestCLIEntryPoint:
         )
         with open(report_md, encoding="utf-8") as fh:
             report_text = fh.read()
-        # The report's per-cell table must have exactly 8
+        # The report's per-cell table must have exactly 10
         # data rows. The test slices the report to the
         # per-cell section (between the per-cell header
         # and the next section header) and counts the
@@ -3401,10 +3988,11 @@ class TestCLIEntryPoint:
             and "Model" not in line
             and "Mean Quality" not in line
         ]
-        assert len(data_rows) == 8, (
-            f"report.md per-cell table must have 8 data rows, "
-            f"got {len(data_rows)}; the contract (VAL-BENCH-008) "
-            "pins the 8-row per-cell-table invariant"
+        assert len(data_rows) == 10, (
+            f"report.md per-cell table must have 10 data rows, "
+            f"got {len(data_rows)}; the M8 contract (VAL-M8-007) "
+            "pins the 10-row per-cell-table invariant for the "
+            "2x5 sweep"
         )
 
     def test_cli_subprocess_rejects_unknown_model(self, tmp_path):
