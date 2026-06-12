@@ -117,6 +117,24 @@ _DEFAULT_OUTPUT: Final[str] = ".benchmarks/results/m7-run"
 """The default ``--output`` directory when the user does not set one."""
 
 
+# The canonical on-disk path of the M7 live benchmark JSON. The
+# M8 report generator consults this file (when present) to
+# populate the ``Δ vs M7`` column and the ``M8 vs M7 Delta``
+# section. The path is a module-level constant so a future
+# relocation of the M7 baseline is caught by a single edit.
+_M7_LIVE_BASELINE_PATH: Final[str] = ".benchmarks/results/m7-live-run.json"
+"""The canonical on-disk path of the M7 live benchmark JSON.
+
+The M8 live run reads this file (when present) to populate
+the ``Δ vs M7`` column in the per-cell table and the
+``M8 vs M7 Delta`` section in the report. When the file is
+absent (the hermetic path, or an M8 sweep that runs before
+the M7 baseline is committed), the report is rendered
+without the delta surface — the M7-only contract
+(VAL-BENCH-009) is unaffected.
+"""
+
+
 # The exit codes the CLI uses. The constants are module-level
 # so a future test (or a wrapper script) can reference them
 # without re-implementing the magic numbers.
@@ -126,6 +144,75 @@ _EXIT_ARG_ERROR: Final[int] = 1
 """The CLI's argument-error exit code (bad model, bad config, etc.)."""
 _EXIT_RUNTIME_ERROR: Final[int] = 2
 """The CLI's runtime-error exit code (the runner raised)."""
+
+
+def _load_m7_baseline(path: str = _M7_LIVE_BASELINE_PATH) -> dict[str, float] | None:
+    """Load the M7 live baseline dict from ``path`` (if present).
+
+    The function is a pure helper that reads the M7 live
+    benchmark JSON and converts it into the composite-keyed
+    ``dict[str, float]`` the
+    :class:`~moaxy.benchmark.report.MarkdownReportGenerator`
+    consumes. The composite key is the same one the
+    generator builds (:func:`_baseline_key` in
+    :mod:`moaxy.benchmark.report`): ``"<model>:<variant.value>"``.
+
+    The function is deliberately defensive: a missing file
+    returns ``None`` (the report renders without the delta
+    surface); a malformed file returns ``None`` and logs a
+    warning (a worker running the M8 sweep before the M7
+    baseline is regenerated sees a clean, no-delta report
+    rather than a crash). The function is the single
+    integration point between the M7 baseline JSON and the
+    M8 report's delta surface.
+
+    Args:
+        path: The on-disk path of the M7 baseline JSON.
+            Defaults to the canonical
+            :data:`_M7_LIVE_BASELINE_PATH`.
+
+    Returns:
+        A ``dict[str, float]`` mapping the composite
+        ``"<model>:<variant.value>"`` key to the M7
+        baseline mean quality, or ``None`` when the file
+        is absent or malformed. The contract pins the
+        returned dict's keys to the four M7 variants;
+        the M8 ``REFLECTION_FRESH`` variant has no M7
+        counterpart and is therefore absent from the
+        dict (the report renders ``"N/A (new variant)"``
+        for those rows).
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "m7 baseline at %s could not be loaded: %s; "
+            "the M8 report will render without the delta surface",
+            path,
+            exc,
+        )
+        return None
+    cells = payload.get("cells") if isinstance(payload, dict) else None
+    if not isinstance(cells, list):
+        return None
+    baseline: dict[str, float] = {}
+    for cell in cells:
+        if not isinstance(cell, dict):
+            continue
+        model = cell.get("model")
+        variant = cell.get("variant")
+        quality = cell.get("mean_quality")
+        if not (isinstance(model, str) and isinstance(variant, str)):
+            continue
+        if not isinstance(quality, (int, float)):
+            continue
+        baseline[f"{model}:{variant}"] = float(quality)
+    if not baseline:
+        return None
+    return baseline
 
 
 def _parse_models(raw: str) -> list[str]:
@@ -541,7 +628,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _EXIT_RUNTIME_ERROR
     try:
         _write_results_json(cells, results_json_path)
-        report_text = MarkdownReportGenerator(cells).render()
+        m7_baseline = _load_m7_baseline()
+        if m7_baseline is not None:
+            logger.info(
+                "loaded M7 baseline (%d cells) from %s; "
+                "the M8 report will include the Δ vs M7 column "
+                "and the M8 vs M7 Delta section",
+                len(m7_baseline),
+                _M7_LIVE_BASELINE_PATH,
+            )
+        report_text = MarkdownReportGenerator(
+            cells, m7_baseline=m7_baseline
+        ).render()
         with open(report_md_path, "w", encoding="utf-8") as fh:
             fh.write(report_text)
     except OSError as exc:
