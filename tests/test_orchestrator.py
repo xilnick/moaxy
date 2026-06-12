@@ -3619,7 +3619,11 @@ class TestM8FreshContextPrompt:
     async def test_fresh_context_preserves_event_ordering(self):
         """M8: the events list ordering is the same in fresh-context
         mode as in the default mode. The flag changes the prompt
-        content but not the orchestration semantics.
+        content but not the orchestration semantics. The
+        ``reflect_fresh_context`` observability event is inserted
+        after the first ``reflect_critique`` (i.e. between the
+        critique and the revised); this is the canonical M8 placement
+        documented in the validation contract VAL-M8-003.
         """
         adapter = ScriptedAdapter(
             [
@@ -3643,11 +3647,14 @@ class TestM8FreshContextPrompt:
             request_messages=[{"role": "user", "content": "any user request"}],
         )
         await Orchestrator(adapter).run(ctx)
-        # 3 LLM calls (initial, critique, revised) and 3 events.
+        # 3 LLM calls (initial, critique, revised); 4 events because
+        # the M8 ``reflect_fresh_context`` event is inserted after
+        # the first critique.
         assert len(adapter.calls) == 3
         assert [e.type for e in ctx.events] == [
             "initial",
             "reflect_critique",
+            "reflect_fresh_context",
             "reflect_revised",
         ]
 
@@ -3679,11 +3686,14 @@ class TestM8FreshContextPrompt:
             request_messages=[{"role": "user", "content": "any user request"}],
         )
         await Orchestrator(adapter).run(ctx)
-        # 2 LLM calls (initial + critique); no revision.
+        # 2 LLM calls (initial + critique); no revision. The M8
+        # ``reflect_fresh_context`` event is inserted after the
+        # first critique, before the early-exit event.
         assert len(adapter.calls) == 2
         assert [e.type for e in ctx.events] == [
             "initial",
             "reflect_critique",
+            "reflect_fresh_context",
             "reflect_early_exit",
         ]
         # The final response is the initial answer.
@@ -3776,3 +3786,610 @@ class TestM8FreshContextPrompt:
                 f"M8 fresh_context critique #{idx} must NOT include the "
                 f"user request; got:\n" + all_text
             )
+
+
+# ────────────────────────────────────────────────────────────────────
+# M8 — ReflectionConfig.fresh_context orchestrator wiring
+# (VAL-M8-003 / m8-reflection-fresh-context-orchestrator)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestM8FreshContextOrchestratorEvent:
+    """M8: the orchestrator emits a one-shot ``reflect_fresh_context``
+    event when the matched route's ``reflection.fresh_context`` flag
+    is ``True``. The event is appended to ``ctx.events`` after the
+    first critique, with ``text='True'`` and ``turn`` set to the
+    current reflection turn (typically 0, the 0-indexed loop counter
+    for the first critique).
+
+    When ``fresh_context=False`` (the default), the event is NOT
+    emitted. The event is at-most-once per request — the orchestrator
+    uses a runtime guard (``ctx.__dict__["reflect_fresh_context_emitted"]``)
+    to keep the event from being appended once per turn, even when
+    multiple turns are configured. The orchestrator's response body
+    is unchanged (same model output, same headers minus the new
+    event) — the M1-M7 M5 contract invariants are preserved
+    byte-for-byte when ``fresh_context=False``.
+
+    The tests below use a hermetic :class:`ScriptedAdapter` (a
+    FakeAdapter equivalent that records every call's ``messages``)
+    to drive the orchestrator and assert on the resulting
+    ``ctx.events``. The full M1-M7 hermetic test suite continues to
+    pass with the default ``fresh_context=False`` path; the
+    ``fresh_context=True`` path is the new M8 behavior under test.
+    """
+
+    # ── (a) fresh_context=True emits the event ──
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_true_emits_reflect_fresh_context_event(self):
+        """VAL-M8-003 (a): with ``fresh_context=True``, the orchestrator
+        appends a ``reflect_fresh_context`` event to ``ctx.events``
+        after the first critique. The event's ``text`` is the literal
+        string ``'True'`` and ``turn`` is the current reflection
+        turn (0 for the first critique, which is 0-indexed).
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "cold critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The reflect_fresh_context event MUST be present.
+        events = [e for e in ctx.events if e.type == "reflect_fresh_context"]
+        assert len(events) == 1, (
+            f"expected exactly 1 reflect_fresh_context event; got {len(events)}: "
+            f"{[(e.type, e.text) for e in ctx.events]}"
+        )
+        # The event's text is the literal string 'True'.
+        assert events[0].text == "True"
+        # The event's turn is the current reflection turn (0 for the
+        # first critique, which is 0-indexed).
+        assert events[0].turn == 0
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_true_event_positioned_after_first_critique(self):
+        """VAL-M8-003: the ``reflect_fresh_context`` event is appended
+        IMMEDIATELY AFTER the first ``reflect_critique`` event (and
+        BEFORE any subsequent ``reflect_revised`` /
+        ``reflect_early_exit`` events).
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # Event ordering: initial, reflect_critique, reflect_fresh_context,
+        # reflect_revised.
+        assert [e.type for e in ctx.events] == [
+            "initial",
+            "reflect_critique",
+            "reflect_fresh_context",
+            "reflect_revised",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_true_event_positioned_with_early_exit(self):
+        """VAL-M8-003: when ``early_exit`` fires on the last turn
+        (confidence >= threshold), the ``reflect_fresh_context``
+        event is still emitted between the critique and the
+        ``reflect_early_exit`` event.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.95",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        assert [e.type for e in ctx.events] == [
+            "initial",
+            "reflect_critique",
+            "reflect_fresh_context",
+            "reflect_early_exit",
+        ]
+
+    # ── (b) fresh_context=False does NOT emit ──
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_false_does_not_emit_event(self):
+        """VAL-M8-003 (b): with ``fresh_context=False`` (the default),
+        the orchestrator does NOT append a ``reflect_fresh_context``
+        event to ``ctx.events``. The default path preserves the M1-M7
+        event list shape verbatim.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=False,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The event MUST NOT be present.
+        events = [e for e in ctx.events if e.type == "reflect_fresh_context"]
+        assert events == [], (
+            f"expected no reflect_fresh_context events; got {len(events)}: "
+            f"{[(e.type, e.text) for e in ctx.events]}"
+        )
+        # The default event shape is preserved (M1-M7 backward compat).
+        assert [e.type for e in ctx.events] == [
+            "initial",
+            "reflect_critique",
+            "reflect_revised",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_default_fresh_context_omitted_does_not_emit_event(self):
+        """VAL-M8-003 (b): the YAML omission path (``fresh_context``
+        is NOT specified in the route config) defaults to ``False``
+        and the event is NOT emitted. The ``ReflectionConfig``
+        default is ``fresh_context=False`` per the contract.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        # Build a route without specifying fresh_context; it must
+        # default to False.
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+        )
+        assert route.route.reflection.fresh_context is False
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        events = [e for e in ctx.events if e.type == "reflect_fresh_context"]
+        assert events == []
+
+    # ── (c) The event is emitted exactly once per request ──
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_event_emitted_exactly_once_with_two_turns(self):
+        """VAL-M8-003 (c): the ``reflect_fresh_context`` event is
+        emitted at most once per request, even when the reflection
+        loop is configured with multiple turns. The orchestrator uses
+        a runtime guard to suppress the event on subsequent turns.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c0\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("rev0", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "c1\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("rev1", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=2,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # Exactly one reflect_fresh_context event in the events list.
+        events = [e for e in ctx.events if e.type == "reflect_fresh_context"]
+        assert len(events) == 1
+        # The single event has turn=0 (the first critique).
+        assert events[0].turn == 0
+        assert events[0].text == "True"
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_event_emitted_exactly_once_with_three_turns(self):
+        """VAL-M8-003 (c): same as the two-turn case but with
+        ``turns=3``. The event MUST be emitted exactly once.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c0\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("rev0", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "c1\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("rev1", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "c2\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("rev2", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=3,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        events = [e for e in ctx.events if e.type == "reflect_fresh_context"]
+        assert len(events) == 1
+        assert events[0].turn == 0
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_runtime_guard_is_set_after_first_event(self):
+        """VAL-M8-003 (c): the orchestrator stamps
+        ``ctx.__dict__["reflect_fresh_context_emitted"] = True`` after
+        the first emit, so subsequent path-conditional checks
+        (parallel / self-reflection) suppress duplicate events.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The runtime guard MUST be set after the first emit.
+        assert ctx.__dict__.get("reflect_fresh_context_emitted") is True
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_runtime_guard_unset_when_false(self):
+        """VAL-M8-003 (b): when ``fresh_context=False``, the runtime
+        guard MUST NOT be set (the event path was never taken).
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=False,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The guard MUST remain unset (no event was emitted, so no
+        # guard was stamped).
+        assert ctx.__dict__.get("reflect_fresh_context_emitted", False) is False
+
+    # ── (d) The orchestrator's response body is unchanged ──
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_event_does_not_change_response_body(self):
+        """VAL-M8-003 (d): the M8 ``reflect_fresh_context`` event is an
+        observability hook only. It does NOT change the model output
+        the orchestrator returns. The ``ctx.upstream_response.message
+        .content`` is the same as the equivalent ``fresh_context=False``
+        run with the same scripted adapter responses.
+        """
+        # Run the same script twice: once with fresh_context=False,
+        # once with fresh_context=True. The model output MUST be
+        # identical; only the events list differs.
+        script = [
+            _response("initial answer", prompt_tokens=5, completion_tokens=2),
+            _response(
+                "c\nREFLECT_CONFIDENCE: 0.5",
+                prompt_tokens=4,
+                completion_tokens=6,
+            ),
+            _response("revised", prompt_tokens=4, completion_tokens=6),
+        ]
+        adapter_off = ScriptedAdapter(list(script))
+        route_off = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=False,
+        )
+        ctx_off = _build_context(route_off)
+        await Orchestrator(adapter_off).run(ctx_off)
+
+        adapter_on = ScriptedAdapter(list(script))
+        route_on = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx_on = _build_context(route_on)
+        await Orchestrator(adapter_on).run(ctx_on)
+
+        # The final assistant text MUST be identical.
+        assert (
+            ctx_off.upstream_response is not None
+            and ctx_on.upstream_response is not None
+        )
+        assert (
+            ctx_off.upstream_response.message.content
+            == ctx_on.upstream_response.message.content
+        )
+        assert (
+            ctx_off.upstream_response.message.content == "revised"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_event_does_not_change_response_model(self):
+        """VAL-M8-003 (d): the response's ``model`` field (which
+        echoes the original alias the client sent) is the same with
+        or without the event. The model echo is preserved.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial"),
+                _response("c\nREFLECT_CONFIDENCE: 0.5"),
+                _response("revised"),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+            original_model="coder-pro",
+            resolved_model="minimax-m3:cloud",
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        assert ctx.upstream_response is not None
+        assert ctx.upstream_response.model == "coder-pro"
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_event_does_not_change_headers_minus_event(self):
+        """VAL-M8-003 (d): the ``build_response_headers`` output is
+        the same with or without ``fresh_context=True`` (the new
+        ``reflect_fresh_context`` event does NOT add a new header —
+        it is only observable in the event log, not in the HTTP
+        response headers). The only observable difference is in
+        ``ctx.events`` itself.
+        """
+        script = [
+            _response("initial", prompt_tokens=5, completion_tokens=2),
+            _response(
+                "c\nREFLECT_CONFIDENCE: 0.5",
+                prompt_tokens=4,
+                completion_tokens=6,
+            ),
+            _response("revised", prompt_tokens=4, completion_tokens=6),
+        ]
+        adapter_off = ScriptedAdapter(list(script))
+        route_off = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=False,
+        )
+        ctx_off = _build_context(route_off, request_id="req-fc-off")
+        await Orchestrator(adapter_off).run(ctx_off)
+        headers_off = build_response_headers(ctx_off, request_id="req-fc-off")
+
+        adapter_on = ScriptedAdapter(list(script))
+        route_on = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx_on = _build_context(route_on, request_id="req-fc-on")
+        await Orchestrator(adapter_on).run(ctx_on)
+        headers_on = build_response_headers(ctx_on, request_id="req-fc-on")
+
+        # The header dicts are equal (the x-moaxy-* keys, the values
+        # — the new event is not surfaced as a header). The request_id
+        # differs by construction (test labels), so compare the
+        # *other* keys via ``x-moaxy-alias-resolved`` (which carries
+        # the same value) and the ``x-moaxy-reflect-turns`` /
+        # ``x-moaxy-reflect-confidence`` observability surfaces.
+        assert (
+            headers_off["x-moaxy-alias-resolved"]
+            == headers_on["x-moaxy-alias-resolved"]
+        )
+        assert (
+            headers_off["x-moaxy-reflect-turns"]
+            == headers_on["x-moaxy-reflect-turns"]
+        )
+        assert (
+            headers_off["x-moaxy-reflect-confidence"]
+            == headers_on["x-moaxy-reflect-confidence"]
+        )
+        assert (
+            headers_off["x-moaxy-fallbacks-used"]
+            == headers_on["x-moaxy-fallbacks-used"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_event_does_not_change_usage(self):
+        """VAL-M8-003 (d): the token usage accumulator is the same
+        with or without the ``reflect_fresh_context`` event. The
+        event is an observability hook; it does not trigger an
+        extra LLM call.
+        """
+        script = [
+            _response("initial", prompt_tokens=10, completion_tokens=5),
+            _response(
+                "c\nREFLECT_CONFIDENCE: 0.5",
+                prompt_tokens=20,
+                completion_tokens=8,
+            ),
+            _response("revised", prompt_tokens=20, completion_tokens=8),
+        ]
+        adapter_off = ScriptedAdapter(list(script))
+        route_off = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=False,
+        )
+        ctx_off = _build_context(route_off)
+        await Orchestrator(adapter_off).run(ctx_off)
+        snap_off = ctx_off.usage.snapshot()
+
+        adapter_on = ScriptedAdapter(list(script))
+        route_on = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx_on = _build_context(route_on)
+        await Orchestrator(adapter_on).run(ctx_on)
+        snap_on = ctx_on.usage.snapshot()
+
+        # The usage snapshot MUST be identical.
+        assert snap_off.prompt_tokens == snap_on.prompt_tokens
+        assert snap_off.completion_tokens == snap_on.completion_tokens
+        assert snap_off.total_tokens == snap_on.total_tokens
+
+    # ── (e) Parallel path: event emitted exactly once ──
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_event_in_parallel_path(self):
+        """VAL-M8-003 (c): the ``reflect_fresh_context`` event is
+        emitted exactly once in the ``reflection.parallel: true``
+        path too. The orchestrator's per-turn coroutines share the
+        same runtime guard so the event is at-most-once per request
+        even when the parallel scheduler runs multiple critique
+        coroutines concurrently.
+        """
+        # The parallel orchestrator's per-turn pair is sequential
+        # in the FakeAdapter's queue (turn N+1 starts after turn
+        # N's critique returns), so the queue order is well-defined.
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c0\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("rev0", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "c1\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("rev1", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        # The test_orchestrator.py's ``_build_route`` does not
+        # expose the ``parallel`` flag. To exercise the parallel
+        # path we mutate the route's reflection config in place.
+        route = _build_route(
+            reflection_turns=2,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        # Switch on parallel on the matched route. ReflectionConfig
+        # is a Pydantic v2 model so we use ``model_copy(update=...)``.
+        new_reflection = route.route.reflection.model_copy(
+            update={"parallel": True}
+        )
+        new_route_config = route.route.model_copy(
+            update={"reflection": new_reflection}
+        )
+        from moaxy.routing.matcher import RouteMatch
+        parallel_route = RouteMatch(
+            route=new_route_config,
+            original_model=route.original_model,
+            resolved_model=route.resolved_model,
+            backend=route.backend,
+            path=route.path,
+            reflection=new_reflection,
+            advisor=route.advisor,
+            fallbacks=route.fallbacks,
+            retry=route.retry,
+            aliases=route.aliases,
+        )
+        ctx = _build_context(parallel_route)
+        await Orchestrator(adapter).run(ctx)
+        # Exactly one reflect_fresh_context event in the events list.
+        events = [e for e in ctx.events if e.type == "reflect_fresh_context"]
+        assert len(events) == 1
+        assert events[0].turn == 0
+        assert events[0].text == "True"
+

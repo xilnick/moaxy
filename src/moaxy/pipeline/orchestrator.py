@@ -609,6 +609,27 @@ class Orchestrator:
                 model=critique_response.model or model_chain[0],
                 text=critique_text,
             )
+            # M8: when the matched route's ``reflection.fresh_context``
+            # is ``True``, append a one-shot ``reflect_fresh_context``
+            # event to the structured event log after the first
+            # critique. The event is emitted exactly once per request
+            # (the loop is 0-indexed so the first critique is turn=0);
+            # subsequent turns do not re-emit it. The event's text is
+            # the literal string ``"True"`` so log consumers can grep
+            # for the marker without parsing the boolean. The orchestrator
+            # also stamps a runtime flag on the context for response
+            # handlers and downstream observers that prefer a boolean
+            # over an event-list walk.
+            if (
+                reflect_cfg.fresh_context
+                and not ctx.__dict__.get("reflect_fresh_context_emitted", False)
+            ):
+                ctx.append_event(
+                    "reflect_fresh_context",
+                    turn=turn,
+                    text="True",
+                )
+                ctx.__dict__["reflect_fresh_context_emitted"] = True
             # Remember the last parsed confidence for the response header.
             ctx.__dict__["last_confidence"] = confidence
 
@@ -830,6 +851,31 @@ class Orchestrator:
                 model=critique_response.model or model_chain[0],
                 text=critique_text,
             )
+            # M8: when the matched route's ``reflection.fresh_context``
+            # is ``True``, append a one-shot ``reflect_fresh_context``
+            # event to the structured event log after the first
+            # critique. The event is emitted exactly once per request
+            # (the loop is 0-indexed so the first critique is turn=0);
+            # subsequent turns do not re-emit it. The event's text is
+            # the literal string ``"True"`` so log consumers can grep
+            # for the marker without parsing the boolean. The orchestrator
+            # also stamps a runtime flag on the context for response
+            # handlers and downstream observers that prefer a boolean
+            # over an event-list walk. The flag is also checked in
+            # the sequential path so the event is at-most-once across
+            # the request even if both paths are exercised (which the
+            # M4 contract does not currently do, but the contract
+            # is forward-defensive).
+            if (
+                reflect_cfg.fresh_context
+                and not ctx.__dict__.get("reflect_fresh_context_emitted", False)
+            ):
+                ctx.append_event(
+                    "reflect_fresh_context",
+                    turn=turn,
+                    text="True",
+                )
+                ctx.__dict__["reflect_fresh_context_emitted"] = True
             ctx.__dict__["last_confidence"] = confidence
 
             # DELTA 5 / 6: parse the weighted early-exit signal. The
@@ -1377,6 +1423,24 @@ class Orchestrator:
             model=crit_response.model or model_chain[0],
             text=crit_text,
         )
+        # M8: when the matched route's ``reflection.fresh_context``
+        # is ``True``, append a one-shot ``reflect_fresh_context``
+        # event to the structured event log after the first critique.
+        # The event is emitted exactly once per request; subsequent
+        # turns in the same request do not re-emit it (the
+        # ``reflect_fresh_context_emitted`` runtime flag is the
+        # shared guard between the sequential, parallel, and
+        # self-reflection paths).
+        if (
+            reflect_cfg.fresh_context
+            and not ctx.__dict__.get("reflect_fresh_context_emitted", False)
+        ):
+            ctx.append_event(
+                "reflect_fresh_context",
+                turn=turn,
+                text="True",
+            )
+            ctx.__dict__["reflect_fresh_context_emitted"] = True
         ctx.__dict__["last_confidence"] = confidence
 
         clears_threshold = (
