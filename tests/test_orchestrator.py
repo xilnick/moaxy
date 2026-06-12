@@ -140,6 +140,8 @@ def _build_route(
     original_model: str = "coder-pro",
     resolved_model: str = "minimax-m3:cloud",
     order: str = "reflect_first",
+    fresh_context: bool = False,
+    system_prompt: str | None = None,
 ) -> RouteMatch:
     config_route = RouteConfig(
         name="reflective-coder",
@@ -153,6 +155,8 @@ def _build_route(
             early_exit=early_exit,
             threshold=threshold,
             order=order,
+            fresh_context=fresh_context,
+            system_prompt=system_prompt,
         ),
         advisor=AdvisorConfig(model=advisor_model, turns=advisor_turns),
     )
@@ -2992,3 +2996,783 @@ class TestSelfAdviseWarning:
             and "self-advise" in r.getMessage()
         ]
         assert len(warning_records) == 1
+
+
+# ────────────────────────────────────────────────────────────────────
+# M8 — ReflectionConfig.fresh_context critique prompt
+# (VAL-M8-002 / m8-reflection-fresh-context-prompt)
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestM8FreshContextPrompt:
+    """M8: branch the critique prompt builder on
+    ``ReflectionConfig.fresh_context``.
+
+    When ``fresh_context=True`` the critique prompt is built from
+    the candidate answer and a cold-grading rubric only — the
+    original system prompt, the user request, and the chat history
+    are NOT included. When ``fresh_context=False`` (the default)
+    the existing M1-M7 prompt construction is used unchanged.
+
+    The tests below use a hermetic :class:`ScriptedAdapter` (a
+    FakeAdapter equivalent that records every call's ``messages``)
+    to assert on the exact critique prompt the orchestrator
+    forwards. The full M1-M7 hermetic test suite continues to
+    pass with the default ``fresh_context=False`` path.
+    """
+
+    # ── (a) fresh_context=True → critique omits original system prompt ──
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_critique_omits_original_system_prompt(self):
+        """VAL-M8-002 (a): with fresh_context=True, the critique prompt
+        does NOT contain the original system prompt substring.
+
+        The route's ``reflection.system_prompt`` is *not* used in
+        fresh-context mode — the cold-grading rubric replaces it.
+        The critique sees only the rubric (system) and the
+        candidate answer (user).
+        """
+        original_system = "M8_FRESH_CONTEXT_TEST_ORIGINAL_SYSTEM_PROMPT"
+        user_request = "M8_FRESH_CONTEXT_TEST_USER_REQUEST"
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "cold critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            system_prompt=original_system,  # legacy field on the route
+            fresh_context=True,
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[
+                {"role": "system", "content": original_system},
+                {"role": "user", "content": user_request},
+            ],
+        )
+        await Orchestrator(adapter).run(ctx)
+        # Locate the critique call (the second LLM call, after the initial).
+        assert len(adapter.calls) >= 2
+        critique_call = adapter.calls[1]
+        # The critique's messages list is a list of dicts with
+        # ``role`` and ``content`` keys. Flatten to a single
+        # string for substring assertions.
+        all_text = "\n".join(
+            str(m.get("content", "")) for m in critique_call["messages"]
+        )
+        # The original system prompt substring MUST NOT be present.
+        assert original_system not in all_text, (
+            "M8 fresh_context critique must NOT include the original "
+            "system prompt; got:\n" + all_text
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_critique_omits_user_request(self):
+        """VAL-M8-002 (b): with fresh_context=True, the critique prompt
+        does NOT contain the user request substring.
+        """
+        user_request = "M8_FRESH_CONTEXT_TEST_USER_REQUEST_PLEASE_GRADE_THIS"
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "cold critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[{"role": "user", "content": user_request}],
+        )
+        await Orchestrator(adapter).run(ctx)
+        # Locate the critique call (the second LLM call, after the initial).
+        assert len(adapter.calls) >= 2
+        critique_call = adapter.calls[1]
+        all_text = "\n".join(
+            str(m.get("content", "")) for m in critique_call["messages"]
+        )
+        # The user request substring MUST NOT be present.
+        assert user_request not in all_text, (
+            "M8 fresh_context critique must NOT include the user request; "
+            "got:\n" + all_text
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_critique_omits_chat_history(self):
+        """M8: with fresh_context=True, the critique prompt does NOT
+        include any prior chat history turn — the user request, the
+        assistant's previous answers, and any follow-up turns are all
+        excluded.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "cold critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[
+                {"role": "user", "content": "M8_HISTORY_USER_1"},
+                {"role": "assistant", "content": "M8_HISTORY_ASSISTANT_1"},
+                {"role": "user", "content": "M8_HISTORY_USER_2"},
+            ],
+        )
+        await Orchestrator(adapter).run(ctx)
+        assert len(adapter.calls) >= 2
+        critique_call = adapter.calls[1]
+        all_text = "\n".join(
+            str(m.get("content", "")) for m in critique_call["messages"]
+        )
+        # None of the history substring markers should appear.
+        for marker in (
+            "M8_HISTORY_USER_1",
+            "M8_HISTORY_ASSISTANT_1",
+            "M8_HISTORY_USER_2",
+        ):
+            assert marker not in all_text, (
+                f"M8 fresh_context critique must NOT include history "
+                f"marker {marker!r}; got:\n" + all_text
+            )
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_critique_includes_candidate_answer(self):
+        """M8: the critique prompt DOES include the candidate answer,
+        even in fresh-context mode — that is the only "context" the
+        critic gets to grade.
+        """
+        candidate = "M8_FRESH_CONTEXT_CANDIDATE_ANSWER_TEXT"
+        adapter = ScriptedAdapter(
+            [
+                _response(candidate, prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "cold critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[{"role": "user", "content": "any user request"}],
+        )
+        await Orchestrator(adapter).run(ctx)
+        assert len(adapter.calls) >= 2
+        critique_call = adapter.calls[1]
+        all_text = "\n".join(
+            str(m.get("content", "")) for m in critique_call["messages"]
+        )
+        # The candidate answer text MUST be present.
+        assert candidate in all_text, (
+            "M8 fresh_context critique must include the candidate answer; "
+            "got:\n" + all_text
+        )
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_critique_uses_cold_grading_rubric(self):
+        """M8: the fresh-context critique's system message is the
+        cold-grading rubric, not the route's configured system prompt.
+        The rubric still instructs the model to emit
+        ``REFLECT_CONFIDENCE:`` and ``SCORE:`` markers so the
+        downstream parser contract (VAL-PIPE-010) is preserved.
+        """
+        original_system = "M8_ORIGINAL_SYSTEM_PROMPT_NOT_USED_IN_FRESH_MODE"
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "cold critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            system_prompt=original_system,
+            fresh_context=True,
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[{"role": "user", "content": "any user request"}],
+        )
+        await Orchestrator(adapter).run(ctx)
+        critique_call = adapter.calls[1]
+        # The first message in the critique list is the system
+        # rubric (or, in the M1-M7 path, the route's system prompt).
+        first_msg = critique_call["messages"][0]
+        assert first_msg["role"] == "system"
+        # The route's original system prompt is NOT used.
+        assert original_system not in first_msg["content"]
+        # The cold-grading rubric instructs the model to emit
+        # REFLECT_CONFIDENCE: so the parser contract is preserved.
+        assert "REFLECT_CONFIDENCE:" in first_msg["content"]
+
+    # ── (b) fresh_context=True → critique still asks for REFLECT_CONFIDENCE / SCORE ──
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_critique_still_asks_for_REFLECT_CONFIDENCE(self):
+        """VAL-M8-002: the prompt still asks for the REFLECT_CONFIDENCE
+        line in both modes. The cold-grading rubric embeds the
+        marker so the parser contract is preserved.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "cold critique\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[{"role": "user", "content": "any user request"}],
+        )
+        await Orchestrator(adapter).run(ctx)
+        critique_call = adapter.calls[1]
+        all_text = "\n".join(
+            str(m.get("content", "")) for m in critique_call["messages"]
+        )
+        # The REFLECT_CONFIDENCE: marker is present in the rubric.
+        assert "REFLECT_CONFIDENCE:" in all_text
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_critique_still_asks_for_SCORE(self):
+        """VAL-M8-002: the prompt still asks for the SCORE line in
+        both modes. The cold-grading rubric embeds the marker so
+        the M5 weighted-signal code path is unaffected.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "cold critique\nREFLECT_CONFIDENCE: 0.5\nSCORE: 7",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[{"role": "user", "content": "any user request"}],
+        )
+        await Orchestrator(adapter).run(ctx)
+        critique_call = adapter.calls[1]
+        all_text = "\n".join(
+            str(m.get("content", "")) for m in critique_call["messages"]
+        )
+        # The SCORE: marker is present in the rubric.
+        assert "SCORE:" in all_text
+
+    # ── (c) fresh_context=False (default) → M1-M7 prompt construction preserved ──
+
+    @pytest.mark.asyncio
+    async def test_default_fresh_context_false_includes_original_system_prompt(self):
+        """VAL-M8-002: with fresh_context=False (default), the critique
+        prompt DOES contain the original system prompt substring
+        (M1-M7 behavior preserved byte-for-byte).
+        """
+        original_system = "M8_DEFAULT_FRESH_CONTEXT_FALSE_SYSTEM_PROMPT"
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            system_prompt=original_system,
+            # fresh_context defaults to False; do NOT set it.
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[{"role": "user", "content": "any user request"}],
+        )
+        await Orchestrator(adapter).run(ctx)
+        critique_call = adapter.calls[1]
+        all_text = "\n".join(
+            str(m.get("content", "")) for m in critique_call["messages"]
+        )
+        # The original system prompt substring MUST be present
+        # (M1-M7 behavior preserved).
+        assert original_system in all_text, (
+            "M1-M7 critique must include the original system prompt "
+            "when fresh_context=False; got:\n" + all_text
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_fresh_context_false_includes_user_request(self):
+        """VAL-M8-002: with fresh_context=False (default), the critique
+        prompt DOES contain the user request substring (M1-M7 behavior
+        preserved byte-for-byte).
+        """
+        user_request = "M8_DEFAULT_USER_REQUEST_TEXT_PRESERVED_IN_M1_M7"
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            # fresh_context defaults to False.
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[{"role": "user", "content": user_request}],
+        )
+        await Orchestrator(adapter).run(ctx)
+        critique_call = adapter.calls[1]
+        all_text = "\n".join(
+            str(m.get("content", "")) for m in critique_call["messages"]
+        )
+        # The user request substring MUST be present.
+        assert user_request in all_text, (
+            "M1-M7 critique must include the user request when "
+            "fresh_context=False; got:\n" + all_text
+        )
+
+    @pytest.mark.asyncio
+    async def test_default_fresh_context_false_includes_chat_history(self):
+        """VAL-M8-002: with fresh_context=False (default), the critique
+        prompt DOES contain the chat history (M1-M7 behavior
+        preserved byte-for-byte).
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            # fresh_context defaults to False.
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[
+                {"role": "system", "content": "M8_HISTORY_SYS_KEEP_ME"},
+                {"role": "user", "content": "M8_HISTORY_USER_KEEP_ME"},
+            ],
+        )
+        await Orchestrator(adapter).run(ctx)
+        critique_call = adapter.calls[1]
+        all_text = "\n".join(
+            str(m.get("content", "")) for m in critique_call["messages"]
+        )
+        for marker in ("M8_HISTORY_SYS_KEEP_ME", "M8_HISTORY_USER_KEEP_ME"):
+            assert marker in all_text, (
+                f"M1-M7 critique must include history marker {marker!r} "
+                f"when fresh_context=False; got:\n" + all_text
+            )
+
+    @pytest.mark.asyncio
+    async def test_default_fresh_context_false_uses_route_system_prompt(self):
+        """VAL-M8-002: with fresh_context=False (default), the critique's
+        first system message is the route's configured
+        ``reflection.system_prompt`` (or the default
+        ``DEFAULT_REFLECT_PROMPT`` when no override), not the
+        cold-grading rubric (M1-M7 behavior preserved).
+        """
+        from moaxy.pipeline.prompts import DEFAULT_REFLECT_PROMPT
+
+        original_system = "M8_ROUTE_SYSTEM_PROMPT_FOR_DEFAULT_PATH"
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            system_prompt=original_system,
+            # fresh_context defaults to False.
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[{"role": "user", "content": "any user request"}],
+        )
+        await Orchestrator(adapter).run(ctx)
+        critique_call = adapter.calls[1]
+        first_msg = critique_call["messages"][0]
+        assert first_msg["role"] == "system"
+        # The route's configured system prompt is the first system
+        # message (M1-M7 behavior preserved).
+        assert first_msg["content"] == original_system
+        # The cold-grading rubric is NOT used in the default path.
+        assert "in isolation" not in first_msg["content"]
+        # Belt-and-braces: the default reflect prompt substring is
+        # absent because the route override wins.
+        assert DEFAULT_REFLECT_PROMPT != first_msg["content"]
+
+    # ── (d) byte-for-byte preservation of M1-M7 default behavior ──
+
+    @pytest.mark.asyncio
+    async def test_default_fresh_context_preserves_m1_m7_byte_for_byte(self):
+        """M8 backward-compat invariant: ``fresh_context: false`` produces
+        a critique message list byte-for-byte identical to the M1-M7
+        construction.
+
+        The M1-M7 path prepends the system message, copies the
+        client history, and appends the critique user-role prompt.
+        The fresh-context path omits the system message and the
+        history, and replaces the user prompt with the rubric-only
+        variant. The two paths must NOT share the same ``messages``
+        list shape.
+        """
+        request_messages = [
+            {"role": "system", "content": "M8_BASELINE_SYSTEM"},
+            {"role": "user", "content": "M8_BASELINE_USER"},
+        ]
+        # Run twice: once with fresh_context=False (default), once
+        # with fresh_context=True. The two critique message lists
+        # must differ.
+        adapter_default = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route_default = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            # fresh_context=False (default).
+        )
+        ctx_default = _build_context(
+            route_default, request_messages=request_messages
+        )
+        await Orchestrator(adapter_default).run(ctx_default)
+        critique_default = list(adapter_default.calls[1]["messages"])
+
+        adapter_fresh = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route_fresh = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx_fresh = _build_context(route_fresh, request_messages=request_messages)
+        await Orchestrator(adapter_fresh).run(ctx_fresh)
+        critique_fresh = list(adapter_fresh.calls[1]["messages"])
+
+        # The two message lists MUST differ: the default path has 3
+        # messages (system, history-user, critique-user) while the
+        # fresh-context path has 2 messages (system-rubric,
+        # critique-user). Different message counts are the simplest
+        # invariant.
+        assert len(critique_default) != len(critique_fresh), (
+            "Default and fresh-context critique message lists must differ "
+            f"(default={len(critique_default)}, "
+            f"fresh={len(critique_fresh)})"
+        )
+        # The default path includes the client history; the
+        # fresh-context path does not.
+        assert len(critique_default) > len(critique_fresh)
+
+    # ── (e) revision call also branches on fresh_context ──
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_revision_omits_original_system_prompt(self):
+        """M8: the revision call in fresh-context mode also omits the
+        original system prompt and chat history. The model stays in
+        isolated-grading mode across the critique+revision pair.
+        """
+        original_system = "M8_REVISION_ORIGINAL_SYSTEM_PROMPT_NOT_USED"
+        user_request = "M8_REVISION_USER_REQUEST_NOT_USED"
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised in fresh mode", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            system_prompt=original_system,
+            fresh_context=True,
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[{"role": "user", "content": user_request}],
+        )
+        await Orchestrator(adapter).run(ctx)
+        # The third call is the revision call.
+        assert len(adapter.calls) >= 3
+        revision_call = adapter.calls[2]
+        all_text = "\n".join(
+            str(m.get("content", "")) for m in revision_call["messages"]
+        )
+        # The original system prompt and user request are NOT in
+        # the revision prompt.
+        assert original_system not in all_text
+        assert user_request not in all_text
+
+    # ── (f) end-to-end pipeline semantics preserved in fresh-context mode ──
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_preserves_event_ordering(self):
+        """M8: the events list ordering is the same in fresh-context
+        mode as in the default mode. The flag changes the prompt
+        content but not the orchestration semantics.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[{"role": "user", "content": "any user request"}],
+        )
+        await Orchestrator(adapter).run(ctx)
+        # 3 LLM calls (initial, critique, revised) and 3 events.
+        assert len(adapter.calls) == 3
+        assert [e.type for e in ctx.events] == [
+            "initial",
+            "reflect_critique",
+            "reflect_revised",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_preserves_early_exit_path(self):
+        """M8: the early-exit threshold check still works in
+        fresh-context mode. When the critique reports a confidence
+        >= threshold, the revision is short-circuited and the
+        initial answer is returned.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial answer", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.95",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[{"role": "user", "content": "any user request"}],
+        )
+        await Orchestrator(adapter).run(ctx)
+        # 2 LLM calls (initial + critique); no revision.
+        assert len(adapter.calls) == 2
+        assert [e.type for e in ctx.events] == [
+            "initial",
+            "reflect_critique",
+            "reflect_early_exit",
+        ]
+        # The final response is the initial answer.
+        assert ctx.upstream_response is not None
+        assert ctx.upstream_response.message.content == "initial answer"
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_does_not_mutate_request_messages(self):
+        """M8: the fresh-context critique path also preserves the
+        request messages list (VAL-PIPE-039 invariant).
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            fresh_context=True,
+        )
+        original = [
+            {"role": "system", "content": "M8_KEEP_ME_IN_REQUEST"},
+            {"role": "user", "content": "M8_KEEP_ME_USER"},
+        ]
+        snapshot = json.dumps(original)
+        ctx = _build_context(route, request_messages=list(original))
+        await Orchestrator(adapter).run(ctx)
+        # The request body still carries the original messages verbatim.
+        assert json.dumps(ctx.request["messages"]) == snapshot
+
+    @pytest.mark.asyncio
+    async def test_fresh_context_two_turns_omits_history_in_both_critiques(self):
+        """M8: with ``turns=2`` and ``fresh_context=True``, BOTH
+        critique calls omit the original system prompt and chat
+        history. The fresh-context isolation applies to every
+        turn, not just the first.
+        """
+        original_system = "M8_TURNS_2_ORIGINAL_SYSTEM_PROMPT"
+        user_request = "M8_TURNS_2_USER_REQUEST"
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c1\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("rev1", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "c2\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("rev2", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=2,
+            early_exit=False,
+            threshold=0.85,
+            system_prompt=original_system,
+            fresh_context=True,
+        )
+        ctx = _build_context(
+            route,
+            request_messages=[{"role": "user", "content": user_request}],
+        )
+        await Orchestrator(adapter).run(ctx)
+        # 5 LLM calls: initial, c1, rev1, c2, rev2.
+        assert len(adapter.calls) == 5
+        # Critique calls are the 2nd and 4th (0-indexed).
+        for idx in (1, 3):
+            critique_call = adapter.calls[idx]
+            all_text = "\n".join(
+                str(m.get("content", "")) for m in critique_call["messages"]
+            )
+            assert original_system not in all_text, (
+                f"M8 fresh_context critique #{idx} must NOT include the "
+                f"original system prompt; got:\n" + all_text
+            )
+            assert user_request not in all_text, (
+                f"M8 fresh_context critique #{idx} must NOT include the "
+                f"user request; got:\n" + all_text
+            )

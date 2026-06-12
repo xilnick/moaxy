@@ -423,6 +423,14 @@ class Orchestrator:
         Builds the critique message list, dispatches via the fallback
         walker, and parses the confidence off the response text.
         Returns ``(response, critique_text, confidence, fallbacks_used)``.
+
+        M8: when the matched route's ``reflection.fresh_context`` is
+        ``True``, the critique message list is built in "type 2
+        reflection" mode — only the candidate answer and a
+        cold-grading rubric, with the original system prompt, chat
+        history, and user request excluded. The default
+        (``fresh_context: false``) preserves the M1-M7 prompt
+        construction byte-for-byte.
         """
         assert ctx.route is not None
         kwargs = _sampling_kwargs(ctx.request)
@@ -430,6 +438,7 @@ class Orchestrator:
             history=history,
             answer=current_answer,
             system_prompt=_reflect_system_prompt(ctx),
+            fresh_context=ctx.route.reflection.fresh_context,
         )
         response, fallbacks_used = await call_with_fallbacks(
             self.adapter,
@@ -456,6 +465,14 @@ class Orchestrator:
         Builds the revision message list (history + critique), dispatches
         via the fallback walker, and returns the new response and the
         fallback models actually used.
+
+        M8: when the matched route's ``reflection.fresh_context`` is
+        ``True``, the revision message list is also built in
+        "type 2 reflection" mode — the rubric is the cold-grading
+        rubric and the original system prompt, chat history, and
+        user request are excluded. The default
+        (``fresh_context: false``) preserves the M1-M7 prompt
+        construction byte-for-byte.
         """
         assert ctx.route is not None
         kwargs = _sampling_kwargs(ctx.request)
@@ -464,6 +481,7 @@ class Orchestrator:
             answer=answer,
             critique=critique,
             system_prompt=_reflect_system_prompt(ctx),
+            fresh_context=ctx.route.reflection.fresh_context,
         )
         response, fallbacks_used = await call_with_fallbacks(
             self.adapter,
@@ -1341,6 +1359,7 @@ class Orchestrator:
             history=history,
             answer=initial_answer,
             system_prompt=_reflect_system_prompt(ctx),
+            fresh_context=reflect_cfg.fresh_context,
         )
         crit_response, crit_fb = await call_with_fallbacks(
             self.adapter,
@@ -1376,6 +1395,7 @@ class Orchestrator:
             answer=initial_answer,
             critique=crit_text,
             system_prompt=_reflect_system_prompt(ctx),
+            fresh_context=reflect_cfg.fresh_context,
         )
         rev_response, rev_fb = await call_with_fallbacks(
             self.adapter,

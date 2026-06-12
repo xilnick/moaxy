@@ -197,6 +197,7 @@ async def reflect_turn(
     current_answer: str,
     *,
     system_prompt: str | None = None,
+    fresh_context: bool = False,
 ) -> tuple[str, float]:
     """Run one self-reflection turn and return ``(critique_text, confidence)``.
 
@@ -225,7 +226,10 @@ async def reflect_turn(
             understands.
         history: The conversation history to include in the critique
             message list. The list is not mutated; the builder deep
-            copies it before forwarding.
+            copies it before forwarding. *Ignored* when
+            ``fresh_context: true`` — the M8 "type 2 reflection"
+            contract is that the critique is built from the candidate
+            answer and a cold-grading rubric only.
         current_answer: The model's previous answer to critique. The
             builder embeds it verbatim in the trailing user-role
             message.
@@ -233,6 +237,16 @@ async def reflect_turn(
             ``None`` or empty, no system message is prepended; the
             default used by the orchestrator is
             :data:`moaxy.pipeline.prompts.DEFAULT_REFLECT_PROMPT`.
+            *Ignored* when ``fresh_context: true`` — the
+            :data:`_FRESH_CONTEXT_RUBRIC` is used instead so the
+            critique is genuinely isolated from the original
+            request context.
+        fresh_context: M8 "type 2 reflection" toggle. When ``True``,
+            the critique message list excludes the client's system
+            prompt, the chat history, and the user request. The list
+            contains only a cold-grading rubric (system) and the
+            candidate answer (user). When ``False`` (default), the
+            existing M1-M7 prompt construction is used unchanged.
 
     Returns:
         A ``(critique_text, confidence)`` tuple. ``critique_text`` is
@@ -255,6 +269,7 @@ async def reflect_turn(
         history=history,
         answer=current_answer,
         system_prompt=system_prompt,
+        fresh_context=fresh_context,
     )
     response = await adapter.chat(model=model, messages=messages)
     text = response.message.content
