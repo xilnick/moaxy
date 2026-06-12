@@ -28,6 +28,13 @@ table-driven test that catches any regression in one place.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
 import httpx
 import pytest
 
@@ -3095,3 +3102,407 @@ class TestReportGeneratorContract:
         per_cell_section = report[per_cell_start:next_section_idx]
         assert cell_with_none.model in per_cell_section
 
+
+# ────────────────────────────────────────────────────────────────────
+# CLI entry point (VAL-BENCH-008)
+# ────────────────────────────────────────────────────────────────────
+#
+# M7 feature m7-benchmark-cli: the
+# :mod:`moaxy.benchmark.run` module owns the CLI entry point
+# (`python -m moaxy.benchmark.run`). The contract
+# (VAL-BENCH-008) requires:
+#
+# * The CLI is a real Python entry point: the function
+#   ``moaxy.benchmark.run.main`` is importable and is a
+#   synchronous callable that returns an integer exit code.
+# * Invoking the CLI with
+#   ``--models <m1>,<m2> --configs <c1>,<c2>,<c3>,<c4> --output <dir> --fake-adapter``
+#   exits 0 and writes ``<output>/results.json`` (8 cells) and
+#   ``<output>/report.md`` (per-cell table with 8 rows).
+# * The hermetic ``--fake-adapter`` path runs without a real
+#   ``OPENROUTER_API_KEY`` in the environment.
+#
+# The :class:`TestCLIEntryPoint` test class exercises the
+# CLI via :func:`subprocess.run` so the test mirrors the
+# production invocation (``python -m moaxy.benchmark.run ...``)
+# exactly. The hermetic path is the contract-pinned surface,
+# so the test class does not require a real OpenRouter key.
+
+
+REPO_ROOT_FOR_CLI_TESTS: Path = Path(__file__).resolve().parent.parent
+"""The absolute path of the moaxy repository root.
+
+The CLI test invokes ``python -m moaxy.benchmark.run`` via
+:func:`subprocess.run` with ``cwd=REPO_ROOT_FOR_CLI_TESTS`` so
+the subprocess sees the canonical project layout. Pinning the
+path in a single constant keeps every CLI test in lockstep
+with the project root and makes a future move of the test
+file a single-edit change.
+"""
+
+
+def _run_cli_hermetic(
+    tmp_dir: Path,
+    *,
+    extra_args: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Invoke the benchmark CLI in hermetic mode via :func:`subprocess.run`.
+
+    The helper is the single source of truth for the
+    hermetic CLI invocation pattern. Every test in the
+    :class:`TestCLIEntryPoint` class uses it so a future
+    edit to the CLI's argument surface (e.g. renaming
+    ``--fake-adapter`` to ``--use-fake-adapter``) is a
+    single-edit change.
+
+    Args:
+        tmp_dir: The temporary directory the CLI writes
+            its output to. The helper passes
+            ``--output <tmp_dir>`` to the CLI; the CLI
+            appends a ``m7-run-YYYYMMDD-HHMMSS`` segment
+            to that path, so the test inspects the
+            ``<tmp_dir>`` tree to find the actual
+            output directory.
+        extra_args: Additional CLI arguments to pass.
+            Defaults to ``None`` (no extra args). The
+            ``--models``, ``--configs``, ``--output``,
+            and ``--fake-adapter`` arguments are set by
+            the helper; the caller only needs to add
+            flags that vary between tests (e.g. an
+            invalid model alias for the argument-error
+            test).
+
+    Returns:
+        The :class:`subprocess.CompletedProcess` for the
+        CLI invocation. The test asserts on
+        ``returncode``, ``stdout``, and ``stderr`` as
+        needed; the helper does not raise on a
+        non-zero exit code (so the test can assert on
+        the failure mode).
+    """
+    cmd = [
+        sys.executable,
+        "-m",
+        "moaxy.benchmark.run",
+        "--models",
+        "minimax-m3,mimo-v2.5-pro",
+        "--configs",
+        "baseline,reflection,advisor,both",
+        "--output",
+        str(tmp_dir),
+        "--fake-adapter",
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+    # The CLI does not require a real ``OPENROUTER_API_KEY``
+    # in hermetic mode. We strip it from the subprocess's
+    # environment to prove the hermetic path works without
+    # the key. A side-effect-free run is a contract pin:
+    # the user can run the CLI on a worker with no key set.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k != "OPENROUTER_API_KEY"
+    }
+    return subprocess.run(
+        cmd,
+        cwd=str(REPO_ROOT_FOR_CLI_TESTS),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+
+
+class TestCLIEntryPoint:
+    """VAL-BENCH-008: the CLI entry point is invokable.
+
+    The class exercises the
+    ``python -m moaxy.benchmark.run`` entry point end-to-end
+    via :func:`subprocess.run`. Every test method targets a
+    single contract invariant so a failure message points
+    directly at the broken invariant.
+
+    The hermetic path (``--fake-adapter``) is the
+    contract-pinned surface: it runs without a real
+    ``OPENROUTER_API_KEY``, so the test class is safe to run
+    on a worker that does not have the live OpenRouter
+    configured. The CLI's output is written to a per-test
+    :class:`tempfile.TemporaryDirectory` and inspected for
+    the contract-pinned files (``results.json`` and
+    ``report.md``) and the contract-pinned content
+    (8 cells in the JSON, 8 data rows in the report's
+    per-cell table).
+    """
+
+    def test_cli_main_is_importable(self):
+        # Contract: ``moaxy.benchmark.run.main`` is a real
+        # Python entry point. The test imports the function
+        # by its full path and asserts it is callable (not a
+        # module, not a class). The test also asserts the
+        # ``moaxy.benchmark.run`` module is the canonical
+        # submodule path the production invocation
+        # (``python -m moaxy.benchmark.run``) uses.
+        from moaxy.benchmark import run as run_module
+
+        assert hasattr(run_module, "main"), (
+            "moaxy.benchmark.run must expose a 'main' function; "
+            "the contract (VAL-BENCH-008) pins "
+            "'importable as moaxy.benchmark.run.main'"
+        )
+        assert callable(run_module.main), (
+            "moaxy.benchmark.run.main must be callable; "
+            f"got {type(run_module.main).__name__}"
+        )
+
+    def test_cli_main_is_re_exported_from_package(self):
+        # Contract: the package's ``__init__`` re-exports
+        # the CLI's ``main`` function. Pin the re-export so
+        # a future edit to the package facade does not
+        # silently break the convenience import path
+        # (``from moaxy.benchmark import main``).
+        from moaxy.benchmark import main as main_reexport
+        from moaxy.benchmark import run as run_module
+
+        assert main_reexport is run_module.main, (
+            "moaxy.benchmark.main must re-export "
+            "moaxy.benchmark.run.main; the contract pins the "
+            "convenience import path for downstream consumers"
+        )
+
+    def test_cli_main_returns_int(self):
+        # Contract: ``moaxy.benchmark.run.main(argv)`` is a
+        # synchronous callable that returns an integer exit
+        # code. The test calls the function in-process with
+        # a hermetic arg vector and asserts the return type
+        # and the canonical success value (0). The in-process
+        # call is faster than a subprocess and pins the
+        # function's contract directly.
+        from moaxy.benchmark.run import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            exit_code = main(
+                [
+                    "--models",
+                    "minimax-m3,mimo-v2.5-pro",
+                    "--configs",
+                    "baseline,reflection,advisor,both",
+                    "--output",
+                    str(Path(tmp) / "inproc-out"),
+                    "--fake-adapter",
+                ]
+            )
+        assert isinstance(exit_code, int), (
+            f"main() must return int, got {type(exit_code).__name__}"
+        )
+        assert exit_code == 0, (
+            f"hermetic main() must exit 0, got {exit_code}"
+        )
+
+    def test_cli_subprocess_hermetic_exits_zero(self, tmp_path):
+        # Contract: invoking the CLI via
+        # ``python -m moaxy.benchmark.run`` with
+        # ``--fake-adapter`` exits 0. The test asserts the
+        # subprocess returncode and confirms the stdout
+        # message the CLI prints on success.
+        result = _run_cli_hermetic(tmp_path)
+        assert result.returncode == 0, (
+            f"hermetic CLI must exit 0, got {result.returncode}; "
+            f"stdout: {result.stdout!r}; stderr: {result.stderr!r}"
+        )
+        assert "wrote 8 cells" in result.stdout, (
+            f"CLI stdout must confirm 8 cells were written; "
+            f"got {result.stdout!r}"
+        )
+
+    def test_cli_subprocess_hermetic_writes_results_json(self, tmp_path):
+        # Contract: the CLI writes ``<output>/results.json``
+        # with 8 cells of data. The test runs the CLI
+        # hermetically, locates the timestamped output
+        # directory the CLI created under ``tmp_path``,
+        # and asserts ``results.json`` exists and contains
+        # the 8 (model, variant) cells.
+        result = _run_cli_hermetic(tmp_path)
+        assert result.returncode == 0, (
+            f"hermetic CLI must exit 0, got {result.returncode}; "
+            f"stderr: {result.stderr!r}"
+        )
+        results_json = _find_output_file(tmp_path, "results.json")
+        assert results_json is not None, (
+            f"CLI did not write results.json under {tmp_path}; "
+            f"stdout: {result.stdout!r}; stderr: {result.stderr!r}"
+        )
+        with open(results_json, encoding="utf-8") as fh:
+            payload = json.load(fh)
+        cells = payload.get("cells", [])
+        assert len(cells) == 8, (
+            f"results.json must contain 8 cells (one per "
+            f"(model, variant) pair), got {len(cells)}; the "
+            "contract (VAL-BENCH-008) pins the 8-cell invariant"
+        )
+        # The 8 cells must cover the 2x4 Cartesian product
+        # (2 models x 4 variants). The test asserts the
+        # exact set of (model, variant) pairs is present.
+        seen = {(c["model"], c["variant"]) for c in cells}
+        expected_models = {"minimax-m3", "mimo-v2.5-pro"}
+        expected_variants = {
+            "baseline",
+            "reflection_only",
+            "advisor_only",
+            "both",
+        }
+        expected = {
+            (m, v)
+            for m in expected_models
+            for v in expected_variants
+        }
+        assert seen == expected, (
+            f"results.json cells must be the full 2x4 Cartesian "
+            f"product; expected {expected!r}, got {seen!r}"
+        )
+
+    def test_cli_subprocess_hermetic_writes_report_md(self, tmp_path):
+        # Contract: the CLI writes ``<output>/report.md``
+        # with a per-cell table containing 8 rows. The
+        # test runs the CLI hermetically, locates the
+        # timestamped output directory, and asserts
+        # ``report.md`` exists and contains a per-cell
+        # table with exactly 8 data rows.
+        result = _run_cli_hermetic(tmp_path)
+        assert result.returncode == 0, (
+            f"hermetic CLI must exit 0, got {result.returncode}; "
+            f"stderr: {result.stderr!r}"
+        )
+        report_md = _find_output_file(tmp_path, "report.md")
+        assert report_md is not None, (
+            f"CLI did not write report.md under {tmp_path}; "
+            f"stdout: {result.stdout!r}; stderr: {result.stderr!r}"
+        )
+        with open(report_md, encoding="utf-8") as fh:
+            report_text = fh.read()
+        # The report's per-cell table must have exactly 8
+        # data rows. The test slices the report to the
+        # per-cell section (between the per-cell header
+        # and the next section header) and counts the
+        # table lines that look like data rows.
+        per_cell_start = report_text.index("## Per-Cell Results")
+        next_section_idx = report_text.index(
+            "## Best Configuration per Model"
+        )
+        per_cell_section = report_text[
+            per_cell_start:next_section_idx
+        ]
+        data_rows = [
+            line
+            for line in per_cell_section.splitlines()
+            if line.startswith("| ")
+            and not line.startswith("|---")
+            and "Model" not in line
+            and "Mean Quality" not in line
+        ]
+        assert len(data_rows) == 8, (
+            f"report.md per-cell table must have 8 data rows, "
+            f"got {len(data_rows)}; the contract (VAL-BENCH-008) "
+            "pins the 8-row per-cell-table invariant"
+        )
+
+    def test_cli_subprocess_rejects_unknown_model(self, tmp_path):
+        # Belt-and-braces: the CLI must exit non-zero with
+        # a clear error message when the user supplies an
+        # unknown model alias. The test drives the CLI
+        # directly via subprocess.run (the helper pins the
+        # canonical hermetic command, so the bad-model
+        # case is constructed inline) and asserts the
+        # argument-error path (exit code != 0; the error
+        # message names the unknown alias) so a future
+        # edit that silently passes an unknown model is
+        # caught here.
+        bad_cmd = [
+            sys.executable,
+            "-m",
+            "moaxy.benchmark.run",
+            "--models",
+            "not-a-real-model",
+            "--configs",
+            "baseline,reflection,advisor,both",
+            "--output",
+            str(tmp_path / "bad-model"),
+            "--fake-adapter",
+        ]
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k != "OPENROUTER_API_KEY"
+        }
+        bad = subprocess.run(
+            bad_cmd,
+            cwd=str(REPO_ROOT_FOR_CLI_TESTS),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert bad.returncode != 0, (
+            "CLI must exit non-zero on an unknown model alias; "
+            f"got returncode=0, stdout={bad.stdout!r}, "
+            f"stderr={bad.stderr!r}"
+        )
+        assert (
+            "not-a-real-model" in bad.stderr
+            or "not-a-real-model" in bad.stdout
+        ), (
+            f"CLI error must name the offending model alias; "
+            f"stdout={bad.stdout!r}, stderr={bad.stderr!r}"
+        )
+
+    def test_cli_subprocess_hermetic_does_not_need_openrouter_key(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ):
+        # Contract: the hermetic path (``--fake-adapter``)
+        # runs without a real ``OPENROUTER_API_KEY`` in the
+        # environment. The test removes the env var from
+        # the test process (so the subprocess inherits
+        # ``OPENROUTER_API_KEY``-less) and asserts the CLI
+        # still exits 0. A regression that accidentally
+        # makes the hermetic path read the env var at
+        # request time surfaces here with a clear failure
+        # message.
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        result = _run_cli_hermetic(tmp_path)
+        assert result.returncode == 0, (
+            f"hermetic CLI must run without OPENROUTER_API_KEY; "
+            f"got returncode={result.returncode}, "
+            f"stderr={result.stderr!r}"
+        )
+
+
+def _find_output_file(tmp_dir: Path, name: str) -> Path | None:
+    """Return the on-disk path of ``name`` under ``tmp_dir``.
+
+    The CLI appends a ``m7-run-YYYYMMDD-HHMMSS`` segment to
+    the ``--output`` value the user supplies, so the
+    caller-supplied ``tmp_dir`` is a *parent* of the
+    actual output directory. The helper walks the
+    immediate children of ``tmp_dir`` and returns the
+    first ``<child>/<name>`` it finds. When the file is
+    not present under any child, the helper returns
+    ``None`` so the test can assert on the absence.
+
+    Args:
+        tmp_dir: The temporary directory the test passed
+            to ``--output``.
+        name: The base name of the file to find
+            (``"results.json"`` or ``"report.md"``).
+
+    Returns:
+        The on-disk :class:`Path` of the file, or
+        ``None`` when the file is not present under any
+        child of ``tmp_dir``.
+    """
+    if not tmp_dir.exists():
+        return None
+    for child in tmp_dir.iterdir():
+        candidate = child / name
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
