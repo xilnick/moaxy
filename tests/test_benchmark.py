@@ -34,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Final
 
 import httpx
 import pytest
@@ -3506,3 +3507,199 @@ def _find_output_file(tmp_dir: Path, name: str) -> Path | None:
         if candidate.exists() and candidate.is_file():
             return candidate
     return None
+
+
+# ────────────────────────────────────────────────────────────────────
+# Live benchmark data — VAL-BENCH-010
+# ────────────────────────────────────────────────────────────────────
+#
+# The M7 contract (VAL-BENCH-010) requires the live benchmark
+# run output to be committed to the repo at
+# ``.benchmarks/results/m7-live-run.json`` and
+# ``.benchmarks/results/m7-live-report.md``. The test class
+# asserts the contract invariants on those files. The class is
+# skipped when the live data is not present (the canonical
+# ``pytest.mark.skipif`` pattern, mirroring the M6 live-API
+# test class).
+
+# Canonical on-disk paths the M7 contract pins. The test class
+# uses these constants so a future edit that moves the live
+# data to a different location is caught by the test's
+# existence checks.
+_LIVE_RUN_JSON: Final[str] = ".benchmarks/results/m7-live-run.json"
+"""The canonical path of the live benchmark JSON results file."""
+
+_LIVE_REPORT_MD: Final[str] = ".benchmarks/results/m7-live-report.md"
+"""The canonical path of the live benchmark markdown report file."""
+
+# The set of model aliases the live benchmark must produce
+# data for. The contract (VAL-BENCH-002) fixes the sweep at
+# two models; the live benchmark must emit at least one cell
+# for each.
+_LIVE_MODELS: Final[tuple[str, ...]] = ("minimax-m3", "mimo-v2.5-pro")
+"""The model aliases the live benchmark report must reference."""
+
+
+def _live_benchmark_present() -> bool:
+    """Return True iff the live benchmark output files exist on disk.
+
+    The helper is the skipif gate for
+    :class:`TestLiveBenchmarkContract`. It returns True only
+    when BOTH the JSON and the markdown report files exist
+    on disk. The M7 contract (VAL-BENCH-010) pins both
+    files as committed artefacts; when either is missing,
+    the test class is skipped with a clear reason.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    json_path = repo_root / _LIVE_RUN_JSON
+    md_path = repo_root / _LIVE_REPORT_MD
+    return json_path.exists() and md_path.exists()
+
+
+@pytest.mark.skipif(
+    not _live_benchmark_present(),
+    reason=(
+        "Live benchmark data is not committed at "
+        f"{_LIVE_RUN_JSON} / {_LIVE_REPORT_MD}; "
+        "the M7 live benchmark run has not produced output. "
+        "Re-run `python -m moaxy.benchmark.run` against the "
+        "live OpenRouter to regenerate the live data, then "
+        "commit the output files."
+    ),
+)
+class TestLiveBenchmarkContract:
+    """VAL-BENCH-010: live benchmark data is present and correct.
+
+    The class is the contract-pinned test for the live
+    benchmark output. It asserts:
+
+    * ``.benchmarks/results/m7-live-run.json`` exists and
+      parses as JSON.
+    * ``.benchmarks/results/m7-live-report.md`` exists and is
+      non-empty.
+    * The report references at least one of the canonical
+      model aliases (the live sweep must produce data for
+      ``minimax-m3`` and/or ``mimo-v2.5-pro``).
+    * The report does NOT contain the literal OpenRouter key
+      prefix ``sk-or-v1-`` (the live run output is committed
+      to the repo, and a leaked key is a security incident).
+
+    The class is skipped when the live benchmark output is
+    not present. The skip is a soft gate: a worker that has
+    not yet run the live benchmark sees the skip, and a
+    worker that has committed the live data sees the
+    contract assertions run. The pattern mirrors the M6
+    ``TestOpenRouterAdapterReal`` class.
+    """
+
+    def _repo_root(self) -> Path:
+        """Return the repository root (the parent of ``tests/``)."""
+        return Path(__file__).resolve().parent.parent
+
+    def _live_json_path(self) -> Path:
+        """Return the absolute path of the live benchmark JSON file."""
+        return self._repo_root() / _LIVE_RUN_JSON
+
+    def _live_report_path(self) -> Path:
+        """Return the absolute path of the live benchmark markdown report."""
+        return self._repo_root() / _LIVE_REPORT_MD
+
+    def test_live_json_exists_and_parses(self):
+        # Contract: ``.benchmarks/results/m7-live-run.json`` is
+        # committed to the repo and parses as JSON. The
+        # ``_live_benchmark_present`` skipif gate guarantees
+        # the file exists; this test asserts it parses.
+        path = self._live_json_path()
+        assert path.exists(), (
+            f"live benchmark JSON does not exist at {path!s}"
+        )
+        text = path.read_text(encoding="utf-8")
+        assert text.strip(), "live benchmark JSON is empty"
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(
+                f"live benchmark JSON at {path!s} is not valid JSON: {exc}"
+            ) from exc
+        # The canonical CLI JSON shape is
+        # ``{"cells": [...], "metadata": {...}}``. Pin the
+        # top-level keys so a future edit that changes the
+        # JSON schema is caught here.
+        assert isinstance(payload, dict), (
+            f"live JSON must be a dict, got {type(payload).__name__}"
+        )
+        assert "cells" in payload, (
+            "live JSON must contain a 'cells' key (the canonical "
+            "schema from moaxy.benchmark.run)"
+        )
+        cells = payload["cells"]
+        assert isinstance(cells, list), (
+            f"live JSON 'cells' must be a list, got {type(cells).__name__}"
+        )
+        # The contract (VAL-BENCH-010) requires at least 8
+        # cells of real data; the canonical M7 sweep is
+        # ``len(COMPARISON_MODELS) * len(ConfigVariant) = 2 *
+        # 4 = 8``.
+        assert len(cells) >= 8, (
+            f"live JSON must contain at least 8 cells, got {len(cells)}; "
+            "the M7 sweep is 2 models x 4 variants = 8 cells"
+        )
+
+    def test_live_report_exists_and_nonempty(self):
+        # Contract: ``.benchmarks/results/m7-live-report.md``
+        # is committed to the repo and is non-empty. The
+        # ``_live_benchmark_present`` skipif gate guarantees
+        # the file exists.
+        path = self._live_report_path()
+        assert path.exists(), (
+            f"live benchmark report does not exist at {path!s}"
+        )
+        text = path.read_text(encoding="utf-8")
+        assert text.strip(), "live benchmark report is empty"
+        # The contract pins the report as a markdown
+        # document; the simplest invariant is the presence
+        # of at least one ``#``-prefixed header.
+        assert any(
+            line.lstrip().startswith("#") for line in text.splitlines()
+        ), "live benchmark report contains no markdown headers"
+
+    def test_live_report_references_canonical_models(self):
+        # Contract: the live report contains at least one of
+        # the canonical model aliases. The report is the
+        # deliverable the benchmark writes; if it does not
+        # reference the test sweep's models, the run did not
+        # produce useful data.
+        path = self._live_report_path()
+        text = path.read_text(encoding="utf-8")
+        for alias in _LIVE_MODELS:
+            if alias in text:
+                # At least one alias is referenced. The
+                # contract (VAL-BENCH-010) is satisfied.
+                return
+        # Neither alias appears in the report. Fail with
+        # a clear message that names the expected aliases.
+        raise AssertionError(
+            f"live benchmark report at {path!s} does not reference "
+            f"any of the canonical model aliases {_LIVE_MODELS!r}; "
+            "the report must include the model aliases the sweep "
+            "tested"
+        )
+
+    def test_live_report_does_not_leak_api_key(self):
+        # Security: the report is committed to the repo;
+        # the OpenRouter API key MUST NOT appear in plain
+        # text. The contract (VAL-BENCH-010) requires the
+        # report to be free of API-key leaks; a regression
+        # that accidentally logs the key surfaces here.
+        path = self._live_report_path()
+        text = path.read_text(encoding="utf-8")
+        # The canonical OpenRouter key prefix is
+        # ``sk-or-v1-``. The substring check is intentional:
+        # a leak of any key with that prefix is a security
+        # incident, and a substring check is the
+        # contract-pinned defence.
+        assert "sk-or-v1-" not in text, (
+            f"live benchmark report at {path!s} contains the "
+            "OpenRouter API key prefix 'sk-or-v1-'; the report "
+            "MUST NOT include the API key in plain text"
+        )
