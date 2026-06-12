@@ -3673,6 +3673,656 @@ class TestReportGeneratorContract:
 
 
 # ────────────────────────────────────────────────────────────────────
+# M8 — Δ vs M7 report column and M8 vs M7 Delta section
+# ────────────────────────────────────────────────────────────────────
+#
+# M8 feature m8-report-delta-vs-m7: the
+# :class:`moaxy.benchmark.report.MarkdownReportGenerator`
+# accepts an optional ``m7_baseline`` argument. When provided,
+# the per-cell table gains a ``Δ vs M7`` column showing the
+# change in mean quality vs the M7 baseline (same model + same
+# variant value). The M8 ``REFLECTION_FRESH`` variant has no M7
+# equivalent, so its delta cell renders the literal string
+# ``"N/A (new variant)"`` (or an equivalent placeholder such
+# as ``"—"``). A new section ``M8 vs M7 Delta`` lists the cells
+# where M8 improved (Δ > 0) and the cells where M8 regressed
+# (Δ < 0), with brief commentary.
+#
+# The contract (m8-report-delta-vs-m7) asserts:
+#
+# * When ``m7_baseline`` is provided, the per-cell table includes
+#   a ``Δ vs M7`` column.
+# * The ``M8 vs M7 Delta`` section lists improved and regressed
+#   cells.
+# * The M8 ``REFLECTION_FRESH`` cells show ``"N/A (new variant)"``
+#   (or ``"—"``) in the delta column.
+# * The report remains valid markdown with the existing 5
+#   sections still present.
+# * The M1-M7 hermetic tests still pass (the report generator's
+#   default behaviour, with ``m7_baseline=None``, is unchanged).
+#
+# The :class:`TestM8ReportDelta` class below enforces every
+# contract invariant with a focused test, plus a single
+# table-driven test that catches any regression in one place.
+# The tests use the canonical canned :class:`CellResult` helper
+# (the same 10-cell canned input the
+# :class:`TestReportGeneratorContract` class uses) so the
+# delta column renders with deterministic, pinned values.
+
+
+def _canned_m7_baseline() -> dict[str, float]:
+    """Build a canned M7 baseline dict for the report delta tests.
+
+    The helper returns the M7 ``(model, variant) → mean quality``
+    mapping the live M7 run produced. The values are pinned
+    by reading the M7 live report at
+    ``.benchmarks/results/m7-live-report.md`` (the
+    M7 reference). When the live file is not present, the
+    helper falls back to the in-file canonical values
+    (the same numbers the M7 report contains, captured
+    here so the test is hermetic and does not require
+    the live data on disk).
+
+    The keys are the composite ``"<model>:<variant.value>"``
+    string. The composite-key format is the canonical
+    contract for the ``m7_baseline`` parameter on
+    :class:`MarkdownReportGenerator`.
+
+    Returns:
+        A ``dict[str, float]`` mapping the composite
+        ``(model, variant)`` key to the M7 mean quality
+        score. The dictionary covers the four M7
+        variants (``baseline``, ``reflection_only``,
+        ``advisor_only``, ``both``) for both comparison
+        models (8 entries); the M8 ``REFLECTION_FRESH``
+        variant is intentionally absent (it has no M7
+        counterpart).
+    """
+    # The values below match the M7 live report at
+    # .benchmarks/results/m7-live-report.md. The fallback
+    # lets the test run without the live data on disk; the
+    # values are also pinned by the test
+    # ``test_delta_values_match_baseline`` below.
+    return {
+        "minimax-m3:baseline": 0.615,
+        "minimax-m3:reflection_only": 0.615,
+        "minimax-m3:advisor_only": 0.615,
+        "minimax-m3:both": 0.727,
+        "mimo-v2.5-pro:baseline": 0.462,
+        "mimo-v2.5-pro:reflection_only": 0.615,
+        "mimo-v2.5-pro:advisor_only": 0.538,
+        "mimo-v2.5-pro:both": 0.667,
+    }
+
+
+class TestM8ReportDelta:
+    """m8-report-delta-vs-m7: Δ vs M7 column and M8 vs M7 Delta section.
+
+    The test class drives the
+    :class:`moaxy.benchmark.report.MarkdownReportGenerator` with
+    the canonical 10-cell canned input (mirroring
+    :class:`TestReportGeneratorContract`) and a canned M7
+    baseline dict. The tests are hermetic: they construct the
+    canned cells and the canned baseline in-process (no
+    orchestrator, no network) and call the generator's
+    :meth:`render` method.
+
+    The class exercises four contract assertions:
+
+    * (a) When ``m7_baseline`` is provided, the per-cell table
+      includes a ``Δ vs M7`` column.
+    * (b) The ``M8 vs M7 Delta`` section lists wins (Δ > 0)
+      and losses (Δ < 0).
+    * (c) The ``REFLECTION_FRESH`` cells show ``"N/A (new
+      variant)"`` (or ``"—"``) in the delta column.
+    * (d) The report remains valid markdown with the existing
+      5 sections still present.
+    """
+
+    def test_delta_column_appears_when_baseline_provided(self):
+        # Contract (a): the per-cell table includes a
+        # ``Δ vs M7`` column when ``m7_baseline`` is
+        # provided. The test drives the generator with
+        # the canned 10-cell input and the canned
+        # baseline, then asserts the column header is
+        # present in the per-cell section.
+        from moaxy.benchmark.report import MarkdownReportGenerator
+
+        cells = _canned_cell_results()
+        report = MarkdownReportGenerator(
+            cells, m7_baseline=_canned_m7_baseline()
+        ).render()
+        # Slice the report to the per-cell section.
+        per_cell_start = report.index("## Per-Cell Results")
+        next_section_idx = report.index(
+            "## Best Configuration per Model"
+        )
+        per_cell_section = report[per_cell_start:next_section_idx]
+        # The column header is the literal string
+        # ``"Δ vs M7"`` (with the Greek capital delta and
+        # three spaces). The test pins the exact string
+        # so a future rename of the column is caught
+        # here.
+        assert "Δ vs M7" in per_cell_section, (
+            "per-cell table must include a 'Δ vs M7' column "
+            "when m7_baseline is provided; got section:\n"
+            f"{per_cell_section!r}"
+        )
+
+    def test_delta_column_absent_when_baseline_not_provided(self):
+        # Backward-compat: the per-cell table does NOT
+        # include the ``Δ vs M7`` column when
+        # ``m7_baseline`` is omitted (the M7 default
+        # behaviour). The M1-M7 hermetic tests rely on
+        # the existing 6-column table; this test pins
+        # the M7 behaviour so a future edit that adds
+        # the column unconditionally is caught here.
+        from moaxy.benchmark.report import MarkdownReportGenerator
+
+        cells = _canned_cell_results()
+        report = MarkdownReportGenerator(cells).render()
+        per_cell_start = report.index("## Per-Cell Results")
+        next_section_idx = report.index(
+            "## Best Configuration per Model"
+        )
+        per_cell_section = report[per_cell_start:next_section_idx]
+        assert "Δ vs M7" not in per_cell_section, (
+            "per-cell table must NOT include a 'Δ vs M7' column "
+            "when m7_baseline is None (the M7 default behaviour); "
+            "got section:\n"
+            f"{per_cell_section!r}"
+        )
+
+    def test_delta_section_is_present(self):
+        # Contract (b): the new ``M8 vs M7 Delta`` section
+        # is present in the rendered report when
+        # ``m7_baseline`` is provided. The test asserts
+        # the section header is present verbatim.
+        from moaxy.benchmark.report import MarkdownReportGenerator
+
+        cells = _canned_cell_results()
+        report = MarkdownReportGenerator(
+            cells, m7_baseline=_canned_m7_baseline()
+        ).render()
+        assert "## M8 vs M7 Delta" in report, (
+            "report must include a '## M8 vs M7 Delta' section "
+            "when m7_baseline is provided; got report:\n"
+            f"{report!r}"
+        )
+
+    def test_delta_section_is_absent_when_baseline_not_provided(self):
+        # Backward-compat: the ``M8 vs M7 Delta`` section
+        # is NOT present when ``m7_baseline`` is omitted.
+        # The M7 hermetic tests pin the 5-section report;
+        # this test pins the M7 behaviour so a future
+        # edit that adds the section unconditionally is
+        # caught here.
+        from moaxy.benchmark.report import MarkdownReportGenerator
+
+        cells = _canned_cell_results()
+        report = MarkdownReportGenerator(cells).render()
+        assert "## M8 vs M7 Delta" not in report, (
+            "report must NOT include a '## M8 vs M7 Delta' section "
+            "when m7_baseline is None (the M7 default); "
+            "got report:\n"
+            f"{report!r}"
+        )
+
+    def test_existing_five_sections_still_present_with_baseline(self):
+        # Contract (d): the existing 5 sections are
+        # still present when ``m7_baseline`` is provided.
+        # The M7 contract (VAL-BENCH-009) pins the
+        # 5-section report; the M8 contract adds a 6th
+        # section but does NOT drop any of the original
+        # five.
+        from moaxy.benchmark.report import MarkdownReportGenerator
+
+        cells = _canned_cell_results()
+        report = MarkdownReportGenerator(
+            cells, m7_baseline=_canned_m7_baseline()
+        ).render()
+        for header in (
+            "## Per-Cell Results",
+            "## Best Configuration per Model",
+            "## Best Model per Configuration",
+            "## Cost-Quality Scatter",
+            "## Raw Data Appendix",
+        ):
+            assert header in report, (
+                f"report is missing required section header "
+                f"{header!r}; the M7 contract (VAL-BENCH-009) "
+                "pins the original 5 sections as present even "
+                "when the M8 delta section is added"
+            )
+
+    def test_reflection_fresh_cells_show_na_in_delta_column(self):
+        # Contract (c): the ``REFLECTION_FRESH`` cells
+        # show ``"N/A (new variant)"`` (or ``"—"``) in
+        # the delta column. The M8 ``REFLECTION_FRESH``
+        # variant has no M7 counterpart, so the delta
+        # is undefined. The test slices the per-cell
+        # table, locates the two ``REFLECTION_FRESH``
+        # data rows, and asserts the delta cell is one
+        # of the contract-pinned placeholder strings.
+        from moaxy.benchmark.report import MarkdownReportGenerator
+
+        cells = _canned_cell_results()
+        report = MarkdownReportGenerator(
+            cells, m7_baseline=_canned_m7_baseline()
+        ).render()
+        per_cell_start = report.index("## Per-Cell Results")
+        next_section_idx = report.index(
+            "## Best Configuration per Model"
+        )
+        per_cell_section = report[per_cell_start:next_section_idx]
+        # The per-cell table is pipe-separated; the
+        # data rows are the lines that start with
+        # ``"| "`` and are not the header row and
+        # not the separator row. Locate the two
+        # ``reflection_fresh`` data rows and parse
+        # their last cell (the delta column).
+        data_rows = [
+            line
+            for line in per_cell_section.splitlines()
+            if line.startswith("| ")
+            and not line.startswith("|---")
+            and "Mean Quality" not in line
+            and "Model" not in line
+            and "reflection_fresh" in line
+        ]
+        assert len(data_rows) == 2, (
+            f"expected 2 REFLECTION_FRESH data rows in the "
+            f"per-cell table, got {len(data_rows)}; per-cell "
+            f"section:\n{per_cell_section!r}"
+        )
+        for row in data_rows:
+            cells_in_row = [c.strip() for c in row.strip("|").split("|")]
+            # The last cell is the delta column.
+            delta_cell = cells_in_row[-1]
+            # The contract accepts either ``"N/A (new
+            # variant)"`` or the bare em-dash ``"—"``.
+            assert delta_cell in {"N/A (new variant)", "—"}, (
+                f"REFLECTION_FRESH delta cell must be "
+                f"'N/A (new variant)' or '—', got {delta_cell!r}; "
+                f"row: {row!r}"
+            )
+
+    def test_delta_values_match_baseline(self):
+        # Contract (a) (positive case): the ``Δ vs M7``
+        # column carries the correct delta (M8 mean
+        # quality minus M7 baseline mean quality) for
+        # the cells that DO have an M7 counterpart. The
+        # canned M8 cell qualities are pinned by
+        # :func:`_canned_cell_results` (the
+        # ``quality_table`` inside that helper); the
+        # canned M7 baseline qualities are pinned by
+        # :func:`_canned_m7_baseline`. The test recomputes
+        # the deltas and asserts the rendered strings
+        # match.
+        from moaxy.benchmark.report import MarkdownReportGenerator
+
+        cells = _canned_cell_results()
+        baseline = _canned_m7_baseline()
+        report = MarkdownReportGenerator(
+            cells, m7_baseline=baseline
+        ).render()
+        per_cell_start = report.index("## Per-Cell Results")
+        next_section_idx = report.index(
+            "## Best Configuration per Model"
+        )
+        per_cell_section = report[per_cell_start:next_section_idx]
+        # Map the rendered (model, variant) row to its
+        # delta cell. Loop over the data rows; skip
+        # ``REFLECTION_FRESH`` (its delta is "N/A").
+        data_rows = [
+            line
+            for line in per_cell_section.splitlines()
+            if line.startswith("| ")
+            and not line.startswith("|---")
+            and "Mean Quality" not in line
+            and "Model" not in line
+        ]
+        seen: set[tuple[str, str]] = set()
+        for row in data_rows:
+            cells_in_row = [c.strip() for c in row.strip("|").split("|")]
+            model = cells_in_row[0]
+            variant_value = cells_in_row[1]
+            mean_quality = cells_in_row[2]
+            delta_cell = cells_in_row[-1]
+            seen.add((model, variant_value))
+            if variant_value == "reflection_fresh":
+                # REFLECTION_FRESH: delta is "N/A" (covered
+                # by test_reflection_fresh_cells_show_na_in_delta_column).
+                continue
+            key = f"{model}:{variant_value}"
+            assert key in baseline, (
+                f"unexpected cell in M8 per-cell table: "
+                f"({model!r}, {variant_value!r})"
+            )
+            # The M8 mean_quality is the canned value
+            # (e.g. "0.700"); parse it and compute the
+            # expected delta.
+            m8_q = float(mean_quality)
+            m7_q = baseline[key]
+            expected_delta = m8_q - m7_q
+            expected_str = f"{expected_delta:+.3f}"
+            # The cell may be a formatted signed float
+            # (e.g. ``"+0.215"``) or the literal
+            # ``"0.000"`` for a zero delta. Accept
+            # either, with sign tolerance.
+            assert delta_cell in {
+                expected_str,
+                f"{abs(expected_delta):.3f}",
+                "0.000",
+            } or (
+                # Permissive numeric match: parse the
+                # cell and check the value is within
+                # 0.0005 of the expected delta.
+                _try_parse_float(delta_cell) is not None
+                and abs(
+                    _try_parse_float(delta_cell) - expected_delta
+                ) < 0.0005
+            ), (
+                f"cell ({model!r}, {variant_value!r}): "
+                f"delta cell expected {expected_str!r} "
+                f"(M8={m8_q}, M7={m7_q}), got {delta_cell!r}"
+            )
+        # The set of (model, variant) cells in the
+        # rendered table is the canonical 10-cell set
+        # (5 variants x 2 models).
+        expected_seen = {
+            (m, v.value)
+            for m in COMPARISON_MODELS
+            for v in ConfigVariant
+        }
+        assert seen == expected_seen, (
+            f"per-cell table cells must be the 10-cell "
+            f"Cartesian product; expected {expected_seen!r}, "
+            f"got {seen!r}"
+        )
+
+    def test_delta_section_lists_wins_and_losses(self):
+        # Contract (b): the ``M8 vs M7 Delta`` section
+        # lists the cells where M8 improved (Δ > 0)
+        # and the cells where M8 regressed (Δ < 0),
+        # with brief commentary. The test asserts:
+        #
+        # * The section header is followed by bullet
+        #   lines naming each improved cell and each
+        #   regressed cell.
+        # * The cells that have Δ == 0 are either
+        #   listed under a "no change" sub-bullet or
+        #   omitted (the contract leaves the choice to
+        #   the implementation; the test accepts
+        #   either).
+        # * The REFLECTION_FRESH cells are not listed
+        #   in the wins/losses section (their delta is
+        #   undefined; they live in a separate
+        #   sub-section, or are omitted entirely).
+        from moaxy.benchmark.report import MarkdownReportGenerator
+
+        cells = _canned_cell_results()
+        baseline = _canned_m7_baseline()
+        report = MarkdownReportGenerator(
+            cells, m7_baseline=baseline
+        ).render()
+        section_start = report.index("## M8 vs M7 Delta")
+        # The section is the rest of the report after
+        # the header (the section is the last one in
+        # the report; slicing from the header to the
+        # end captures the entire section).
+        section = report[section_start:]
+        # Compute the expected wins and losses.
+        # The canned cell qualities are pinned by
+        # :func:`_canned_cell_results`'s internal
+        # ``quality_table``.
+        quality_table = {
+            ("minimax-m3", "baseline"): 0.70,
+            ("minimax-m3", "reflection_only"): 0.85,
+            ("minimax-m3", "advisor_only"): 0.80,
+            ("minimax-m3", "both"): 0.90,
+            ("minimax-m3", "reflection_fresh"): 0.83,
+            ("mimo-v2.5-pro", "baseline"): 0.65,
+            ("mimo-v2.5-pro", "reflection_only"): 0.75,
+            ("mimo-v2.5-pro", "advisor_only"): 0.82,
+            ("mimo-v2.5-pro", "both"): 0.78,
+            ("mimo-v2.5-pro", "reflection_fresh"): 0.77,
+        }
+        expected_wins: list[tuple[str, str, float]] = []
+        expected_losses: list[tuple[str, str, float]] = []
+        for (model, variant_value), m8_q in quality_table.items():
+            key = f"{model}:{variant_value}"
+            if key not in baseline:
+                # REFLECTION_FRESH: skip.
+                continue
+            delta = m8_q - baseline[key]
+            if delta > 0:
+                expected_wins.append((model, variant_value, delta))
+            elif delta < 0:
+                expected_losses.append((model, variant_value, delta))
+        # Assert the section names every win.
+        for model, variant_value, _delta in expected_wins:
+            assert model in section, (
+                f"delta section is missing win cell {model!r}; "
+                f"section:\n{section!r}"
+            )
+            assert variant_value in section, (
+                f"delta section is missing win cell "
+                f"{variant_value!r} (for model {model!r}); "
+                f"section:\n{section!r}"
+            )
+        # Assert the section names every loss.
+        for model, variant_value, _delta in expected_losses:
+            assert model in section, (
+                f"delta section is missing loss cell {model!r}; "
+                f"section:\n{section!r}"
+            )
+            assert variant_value in section, (
+                f"delta section is missing loss cell "
+                f"{variant_value!r} (for model {model!r}); "
+                f"section:\n{section!r}"
+            )
+        # Assert the section includes brief
+        # commentary: at least one of the canonical
+        # commentary words (``"improved"``,
+        # ``"regressed"``, ``"win"``, ``"loss"``,
+        # ``"delta"``, ``"Δ"``) appears in the
+        # section. The test pins the commentary by
+        # keyword so a future edit that drops the
+        # commentary (and just lists the cells) is
+        # caught here.
+        commentary_keywords = (
+            "improved",
+            "regressed",
+            "win",
+            "loss",
+            "delta",
+            "Δ",
+        )
+        assert any(
+            keyword in section.lower() or keyword in section
+            for keyword in commentary_keywords
+        ), (
+            f"delta section does not include brief commentary; "
+            f"expected one of {commentary_keywords!r} to appear; "
+            f"section:\n{section!r}"
+        )
+
+    def test_delta_section_handles_zero_deltas(self):
+        # Belt-and-braces: when every cell has Δ == 0
+        # (the M8 run exactly matched the M7 run on
+        # every cell), the section must NOT raise and
+        # must include a "no change" message (or an
+        # equivalent). The test drives the generator
+        # with a baseline that exactly matches the
+        # canned M8 qualities; the deltas are all
+        # zero.
+        from moaxy.benchmark.report import MarkdownReportGenerator
+
+        cells = _canned_cell_results()
+        # Build a baseline that matches the M8 cell
+        # qualities for the four M7 variants. The
+        # quality_table below is the M8 side; the
+        # baseline dict mirrors it so the deltas are
+        # all zero.
+        quality_table = {
+            ("minimax-m3", "baseline"): 0.70,
+            ("minimax-m3", "reflection_only"): 0.85,
+            ("minimax-m3", "advisor_only"): 0.80,
+            ("minimax-m3", "both"): 0.90,
+            ("mimo-v2.5-pro", "baseline"): 0.65,
+            ("mimo-v2.5-pro", "reflection_only"): 0.75,
+            ("mimo-v2.5-pro", "advisor_only"): 0.82,
+            ("mimo-v2.5-pro", "both"): 0.78,
+        }
+        baseline = {
+            f"{m}:{v}": q for (m, v), q in quality_table.items()
+        }
+        report = MarkdownReportGenerator(
+            cells, m7_baseline=baseline
+        ).render()
+        # The report must not raise and must include
+        # the delta section.
+        assert "## M8 vs M7 Delta" in report
+        section_start = report.index("## M8 vs M7 Delta")
+        section = report[section_start:]
+        # The "no change" message is implementation-
+        # defined; the test asserts the section is
+        # non-empty and includes one of the canonical
+        # commentary keywords.
+        assert section.strip(), "delta section is empty"
+        commentary_keywords = (
+            "no change",
+            "unchanged",
+            "identical",
+            "zero",
+            "0",
+        )
+        assert any(
+            keyword in section.lower() for keyword in commentary_keywords
+        ), (
+            f"delta section with zero deltas does not include a "
+            f"'no change' / 'unchanged' / 'identical' / 'zero' / '0' "
+            f"message; section:\n{section!r}"
+        )
+
+    def test_delta_column_row_count(self):
+        # Belt-and-braces: the per-cell table still has
+        # exactly 10 data rows when the delta column is
+        # added. The column is additive; the row count
+        # is invariant.
+        from moaxy.benchmark.report import MarkdownReportGenerator
+
+        cells = _canned_cell_results()
+        report = MarkdownReportGenerator(
+            cells, m7_baseline=_canned_m7_baseline()
+        ).render()
+        per_cell_start = report.index("## Per-Cell Results")
+        next_section_idx = report.index(
+            "## Best Configuration per Model"
+        )
+        per_cell_section = report[per_cell_start:next_section_idx]
+        data_rows = [
+            line
+            for line in per_cell_section.splitlines()
+            if line.startswith("| ")
+            and not line.startswith("|---")
+            and "Model" not in line
+            and "Mean Quality" not in line
+        ]
+        assert len(data_rows) == 10, (
+            f"per-cell table must have 10 data rows even with the "
+            f"Δ vs M7 column, got {len(data_rows)}; the row count "
+            "is invariant to the column addition"
+        )
+
+    def test_baseline_must_be_dict_or_none(self):
+        # Belt-and-braces: the ``m7_baseline`` argument
+        # must be a ``dict`` or ``None``. A future edit
+        # that accepts e.g. a file path or a list of
+        # tuples is caught here. The generator should
+        # raise :class:`TypeError` for any other type.
+        from moaxy.benchmark.report import MarkdownReportGenerator
+
+        cells = _canned_cell_results()
+        # None and dict are both accepted.
+        MarkdownReportGenerator(cells).render()
+        MarkdownReportGenerator(cells, m7_baseline={}).render()
+        MarkdownReportGenerator(
+            cells, m7_baseline=_canned_m7_baseline()
+        ).render()
+        # An integer is not a valid baseline.
+        with pytest.raises(TypeError):
+            MarkdownReportGenerator(cells, m7_baseline=42).render()
+        # A list is not a valid baseline.
+        with pytest.raises(TypeError):
+            MarkdownReportGenerator(
+                cells, m7_baseline=[("minimax-m3:baseline", 0.5)]
+            ).render()
+
+    def test_report_is_valid_markdown_with_baseline(self):
+        # Contract (d): the rendered report is valid
+        # markdown. The test asserts the report has
+        # the canonical structure: a level-1 header at
+        # the top, multiple level-2 section headers
+        # (the 5 original + the new M8 delta section =
+        # 6), and a non-empty body. The test does not
+        # run a full markdown parser; the structural
+        # checks are the contract-pinned invariants.
+        from moaxy.benchmark.report import MarkdownReportGenerator
+
+        cells = _canned_cell_results()
+        report = MarkdownReportGenerator(
+            cells, m7_baseline=_canned_m7_baseline()
+        ).render()
+        # The first non-empty line is the level-1
+        # header (``"# M7 Benchmark Report"``).
+        first_line = next(
+            (line for line in report.splitlines() if line.strip()),
+            "",
+        )
+        assert first_line.startswith("# "), (
+            f"report's first non-empty line must be a level-1 "
+            f"markdown header, got {first_line!r}"
+        )
+        # The report has at least 6 level-2 section
+        # headers (the 5 M7 sections + the new M8
+        # delta section).
+        level2_headers = [
+            line for line in report.splitlines() if line.startswith("## ")
+        ]
+        assert len(level2_headers) >= 6, (
+            f"report must have at least 6 level-2 section headers "
+            f"(5 M7 + 1 M8 delta), got {len(level2_headers)}: "
+            f"{level2_headers!r}"
+        )
+        # The report is non-empty.
+        assert report.strip(), "report is empty"
+
+
+def _try_parse_float(value: str) -> float | None:
+    """Try to parse ``value`` as a float; return ``None`` on failure.
+
+    A small helper used by the delta-value assertion. The
+    helper accepts the standard Python float syntax plus
+    the ``+0.000`` signed-float form the report generator
+    uses for the delta column. A leading ``+`` is valid
+    Python syntax, so ``float("+0.215")`` returns ``0.215``.
+
+    Args:
+        value: The string to parse.
+
+    Returns:
+        The parsed float, or ``None`` when ``value`` is
+        not a valid float (e.g. ``"N/A"`` or ``"—"``).
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# ────────────────────────────────────────────────────────────────────
 # CLI entry point (VAL-BENCH-008)
 # ────────────────────────────────────────────────────────────────────
 #

@@ -63,7 +63,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Final
 
-from moaxy.benchmark.configs import COMPARISON_MODELS
+from moaxy.benchmark.configs import COMPARISON_MODELS, ConfigVariant
 from moaxy.benchmark.harness import CellResult
 
 # The five markdown section headers the contract pins. The
@@ -77,12 +77,31 @@ _SECTION_BEST_PER_MODEL: Final[str] = "## Best Configuration per Model"
 _SECTION_BEST_PER_CONFIG: Final[str] = "## Best Model per Configuration"
 _SECTION_COST_QUALITY: Final[str] = "## Cost-Quality Scatter"
 _SECTION_RAW_DATA: Final[str] = "## Raw Data Appendix"
+_SECTION_DELTA: Final[str] = "## M8 vs M7 Delta"
+
+# The M8 delta column header. Pinned by the contract
+# (m8-report-delta-vs-m7): the column is named exactly
+# ``"Δ vs M7"`` (with the Greek capital delta, a single
+# space, the lowercase ``"vs"``, another single space, and
+# the uppercase ``"M7"``). The generator renders the column
+# only when ``m7_baseline`` is provided.
+_DELTA_COLUMN_HEADER: Final[str] = "Δ vs M7"
+
+# The literal string rendered for the M8 ``REFLECTION_FRESH``
+# delta cells. The M8 ``REFLECTION_FRESH`` variant has no M7
+# counterpart, so the delta is undefined; the contract pins
+# the rendered placeholder as either ``"N/A (new variant)"``
+# (the default) or the bare em-dash ``"—"``. The test
+# (:class:`TestM8ReportDelta`) accepts both forms.
+_DELTA_NA: Final[str] = "N/A (new variant)"
 
 # The per-cell table column order. The order matches the
 # contract's column list (model, variant, mean quality,
 # mean latency, mean tokens, pass-rate); future edits
 # to the column order must update the contract pins in
-# the test class.
+# the test class. The M8 delta extends the column list
+# with a trailing ``Δ vs M7`` column when ``m7_baseline``
+# is provided.
 _TABLE_COLUMNS: Final[tuple[str, ...]] = (
     "Model",
     "Variant",
@@ -247,40 +266,285 @@ def _best_cell(cells: list[CellResult]) -> CellResult | None:
     return best
 
 
+def _baseline_key(model_alias: str, variant_value: str) -> str:
+    """Build the composite key for the ``m7_baseline`` dict.
+
+    The M8 contract (m8-report-delta-vs-m7) pins the
+    ``m7_baseline`` parameter as a ``dict[str, float]``
+    keyed by a composite ``"<model>:<variant.value>"``
+    string. The composite-key format is stable across
+    Python versions and is human-readable; the helper
+    is the single source of truth so the table
+    renderer and the delta section renderer agree
+    on the key format.
+
+    Args:
+        model_alias: The client-facing model alias
+            (e.g. ``"minimax-m3"``).
+        variant_value: The ``ConfigVariant.value``
+            string (e.g. ``"baseline"``).
+
+    Returns:
+        The composite key
+        ``f"{model_alias}:{variant_value}"``. For
+        example, ``"minimax-m3:baseline"``.
+    """
+    return f"{model_alias}:{variant_value}"
+
+
+def _format_delta(delta: float | None) -> str:
+    """Format a delta value for the ``Δ vs M7`` column.
+
+    The helper renders a signed float with three decimal
+    places (matching the precision of the other
+    numeric columns). Positive deltas are prefixed with
+    ``"+"``; negative deltas carry the natural Python
+    sign; zero is rendered as ``"+0.000"`` so the
+    column reads uniformly. A ``None`` delta renders
+    as the literal string ``"n/a"`` (matching the
+    :func:`_format_float` fallback for missing data).
+
+    Args:
+        delta: The delta to format, or ``None`` when
+            the value is missing (the cell has no M7
+            counterpart or the M7 baseline is unknown).
+
+    Returns:
+        The formatted string. Examples:
+        ``"+0.215"``, ``"-0.108"``, ``"+0.000"``,
+        ``"n/a"``.
+    """
+    if delta is None:
+        return _NA
+    return f"{delta:+.{_FLOAT_PRECISION}f}"
+
+
 def _render_per_cell_table(
     cell_results: list[CellResult],
+    m7_baseline: dict[str, float] | None = None,
 ) -> str:
     """Render the per-cell results section.
 
     The function builds the standard six-column
     markdown table (model, variant, mean quality,
     mean latency, mean tokens, pass-rate) and prepends
-    the section header. The number of data rows
-    equals the number of cell results; the contract
-    pins ``len(rows) == len(cell_results)`` and the
-    canonical M7 sweep is eight rows.
+    the section header. When ``m7_baseline`` is
+    provided, the function appends a seventh column
+    ``Δ vs M7`` to the table; the column carries the
+    change in mean quality vs the M7 baseline (same
+    model + same variant value). The M8
+    ``REFLECTION_FRESH`` variant has no M7 counterpart,
+    so its delta cell renders the literal string
+    ``"N/A (new variant)"``.
+
+    The number of data rows equals the number of cell
+    results; the contract pins
+    ``len(rows) == len(cell_results)`` and the
+    canonical M8 sweep is ten rows (2 models × 5
+    variants).
 
     Args:
         cell_results: The cell results to render.
+        m7_baseline: An optional ``dict[str, float]``
+            mapping the composite
+            ``"<model>:<variant.value>"`` key to the
+            M7 baseline mean quality. When ``None``
+            (the M7 default), the delta column is
+            omitted. When provided, the M8
+            ``REFLECTION_FRESH`` cells and any cell
+            whose key is missing from the dict render
+            the ``"N/A (new variant)"`` placeholder.
 
     Returns:
         The rendered markdown string (header + table)
         with a trailing blank line so the next
         section starts on its own paragraph.
     """
-    rows: list[list[str]] = [list(_TABLE_COLUMNS)]
+    columns: tuple[str, ...] = _TABLE_COLUMNS
+    if m7_baseline is not None:
+        columns = _TABLE_COLUMNS + (_DELTA_COLUMN_HEADER,)
+    rows: list[list[str]] = [list(columns)]
     for cell in cell_results:
-        rows.append(
-            [
-                cell.model,
-                cell.variant.value,
-                _format_float(cell.mean_quality),
-                _format_float(cell.mean_latency_ms),
-                _format_float(cell.mean_tokens),
-                _format_float(cell.pass_rate),
-            ]
-        )
+        row = [
+            cell.model,
+            cell.variant.value,
+            _format_float(cell.mean_quality),
+            _format_float(cell.mean_latency_ms),
+            _format_float(cell.mean_tokens),
+            _format_float(cell.pass_rate),
+        ]
+        if m7_baseline is not None:
+            row.append(_delta_cell_for(cell, m7_baseline))
+        rows.append(row)
     return f"{_SECTION_PER_CELL}\n\n{_format_table(rows)}\n"
+
+
+def _delta_cell_for(
+    cell: CellResult, m7_baseline: dict[str, float]
+) -> str:
+    """Return the ``Δ vs M7`` cell string for one cell.
+
+    The helper is the single source of truth for the
+    delta-column rendering. The rules are:
+
+    * The M8 ``REFLECTION_FRESH`` variant has no M7
+      counterpart, so its delta cell renders the
+      literal ``"N/A (new variant)"`` placeholder.
+    * When the cell's ``(model, variant.value)`` key
+      is missing from ``m7_baseline``, the helper
+      also renders the placeholder (the M7 baseline
+      did not include this cell; the delta is
+      undefined).
+    * When the cell's ``mean_quality`` is ``None`` (the
+      cell produced no data), the helper renders the
+      placeholder (the delta is undefined).
+    * Otherwise the helper computes
+      ``cell.mean_quality - m7_baseline[key]`` and
+      formats the result with :func:`_format_delta`.
+
+    Args:
+        cell: The cell result to compute the delta
+            for.
+        m7_baseline: The M7 baseline dict keyed by
+            ``"<model>:<variant.value>"``.
+
+    Returns:
+        The string to render in the delta column.
+    """
+    if cell.variant.value == ConfigVariant.REFLECTION_FRESH.value:
+        return _DELTA_NA
+    key = _baseline_key(cell.model, cell.variant.value)
+    if cell.mean_quality is None or key not in m7_baseline:
+        return _DELTA_NA
+    return _format_delta(cell.mean_quality - m7_baseline[key])
+
+
+def _render_m8_vs_m7_delta(
+    cell_results: list[CellResult],
+    m7_baseline: dict[str, float] | None = None,
+) -> str:
+    """Render the ``M8 vs M7 Delta`` section.
+
+    The section lists the cells where M8 improved
+    (Δ > 0) and the cells where M8 regressed
+    (Δ < 0), with brief commentary. The M8
+    ``REFLECTION_FRESH`` cells are excluded from the
+    wins / losses list (their delta is undefined);
+    the section's commentary notes the exclusion.
+
+    The section is rendered only when ``m7_baseline``
+    is provided. When every cell has Δ == 0, the
+    section renders a single "no change" line so the
+    section is never empty.
+
+    Args:
+        cell_results: The cell results to summarise.
+        m7_baseline: An optional ``dict[str, float]``
+            mapping the composite
+            ``"<model>:<variant.value>"`` key to the
+            M7 baseline mean quality. When ``None``,
+            the function returns an empty string (the
+            section is omitted from the rendered
+            report).
+
+    Returns:
+        The rendered markdown string with a trailing
+        blank line, or the empty string when
+        ``m7_baseline`` is ``None``.
+    """
+    if m7_baseline is None:
+        return ""
+    lines: list[str] = [
+        _SECTION_DELTA,
+        "",
+        "Each bullet below compares an M8 cell's mean "
+        "quality to the same ``(model, variant)`` cell "
+        "from the M7 baseline. A positive Δ means M8 "
+        "improved; a negative Δ means M8 regressed. The "
+        "M8 ``REFLECTION_FRESH`` variant has no M7 "
+        "counterpart and is excluded from this section.",
+        "",
+    ]
+    deltas: list[tuple[str, str, float, float, float]] = []
+    for cell in cell_results:
+        if cell.variant.value == ConfigVariant.REFLECTION_FRESH.value:
+            continue
+        if cell.mean_quality is None:
+            continue
+        key = _baseline_key(cell.model, cell.variant.value)
+        if key not in m7_baseline:
+            continue
+        m7_q = m7_baseline[key]
+        delta = cell.mean_quality - m7_q
+        deltas.append(
+            (cell.model, cell.variant.value, delta, cell.mean_quality, m7_q)
+        )
+    if not deltas:
+        lines.append(
+            "No comparable cells; the M7 baseline is empty "
+            "or every M8 cell is missing mean quality."
+        )
+        return "\n".join(lines) + "\n"
+    wins = [d for d in deltas if d[2] > 0]
+    losses = [d for d in deltas if d[2] < 0]
+    unchanged = [d for d in deltas if d[2] == 0]
+    if wins:
+        lines.append("**M8 improved (Δ > 0):**")
+        lines.append("")
+        for model, variant_value, delta, m8_q, m7_q in wins:
+            lines.append(
+                f"- `{model}` / `{variant_value}`: Δ = "
+                f"{_format_delta(delta)} (M8 = "
+                f"{_format_float(m8_q)}, M7 = "
+                f"{_format_float(m7_q)})"
+            )
+        lines.append("")
+    if losses:
+        lines.append("**M8 regressed (Δ < 0):**")
+        lines.append("")
+        for model, variant_value, delta, m8_q, m7_q in losses:
+            lines.append(
+                f"- `{model}` / `{variant_value}`: Δ = "
+                f"{_format_delta(delta)} (M8 = "
+                f"{_format_float(m8_q)}, M7 = "
+                f"{_format_float(m7_q)})"
+            )
+        lines.append("")
+    if unchanged:
+        lines.append("**No change (Δ = 0):**")
+        lines.append("")
+        for model, variant_value, delta, m8_q, m7_q in unchanged:
+            lines.append(
+                f"- `{model}` / `{variant_value}`: Δ = "
+                f"{_format_delta(delta)} (M8 = "
+                f"{_format_float(m8_q)}, M7 = "
+                f"{_format_float(m7_q)})"
+            )
+        lines.append("")
+    # Brief commentary: a one-line summary the user can
+    # read at a glance. The summary references the
+    # absolute number of wins and losses and the maximum
+    # |Δ| across all cells. The summary is purely
+    # informational; the contract does not pin its
+    # exact text.
+    win_count = len(wins)
+    loss_count = len(losses)
+    unchanged_count = len(unchanged)
+    max_delta = max((abs(d[2]) for d in deltas), default=0.0)
+    if win_count == 0 and loss_count == 0:
+        summary = (
+            f"All {unchanged_count} comparable cells "
+            f"are unchanged; max |Δ| is "
+            f"{_format_float(max_delta)}."
+        )
+    else:
+        summary = (
+            f"Net: {win_count} improved, {loss_count} "
+            f"regressed, {unchanged_count} unchanged; "
+            f"max |Δ| is {_format_float(max_delta)}."
+        )
+    lines.append(summary)
+    return "\n".join(lines) + "\n"
 
 
 def _render_best_per_model(
@@ -505,9 +769,49 @@ class MarkdownReportGenerator:
     """
 
     def __init__(
-        self, cell_results: list[CellResult] | tuple[CellResult, ...]
+        self,
+        cell_results: list[CellResult] | tuple[CellResult, ...],
+        *,
+        m7_baseline: dict[str, float] | None = None,
     ) -> None:
+        """Store the cell results and the optional M7 baseline.
+
+        Args:
+            cell_results: The cell results to render. The
+                order is preserved within each section
+                (the per-cell table renders in input
+                order; the per-model and per-config
+                summaries render in sorted-key order so
+                the output is deterministic across runs).
+            m7_baseline: An optional ``dict[str, float]``
+                mapping the composite
+                ``"<model>:<variant.value>"`` key to the
+                M7 baseline mean quality. When ``None``
+                (the M7 default), the rendered report
+                contains the original 5 sections
+                unchanged. When provided, the report
+                gains a ``Δ vs M7`` column in the
+                per-cell table and a new
+                ``M8 vs M7 Delta`` section that lists
+                the cells where M8 improved and where
+                it regressed, with brief commentary.
+                The M8 ``REFLECTION_FRESH`` variant has
+                no M7 counterpart, so its delta cell
+                renders the literal string
+                ``"N/A (new variant)"``. The constructor
+                validates that ``m7_baseline`` is
+                either a ``dict`` or ``None``; any
+                other type raises :class:`TypeError`.
+        """
+        if m7_baseline is not None and not isinstance(m7_baseline, dict):
+            raise TypeError(
+                "m7_baseline must be a dict[str, float] or None; "
+                f"got {type(m7_baseline).__name__}"
+            )
         self.cell_results: list[CellResult] = list(cell_results)
+        self.m7_baseline: dict[str, float] | None = (
+            dict(m7_baseline) if m7_baseline is not None else None
+        )
 
     def render(self) -> str:
         """Render the full markdown report.
@@ -517,7 +821,11 @@ class MarkdownReportGenerator:
         configuration per model, best model per
         configuration, cost-quality scatter, raw data
         appendix) with a blank line between each
-        section. The returned string is valid
+        section. When ``m7_baseline`` is provided, an
+        additional ``M8 vs M7 Delta`` section is
+        rendered after the per-cell table so the
+        delta column and the delta section live next
+        to each other. The returned string is valid
         markdown: every section starts with a level-2
         header (``##``), every table is the standard
         pipe table format, and there are no
@@ -528,8 +836,9 @@ class MarkdownReportGenerator:
         any side effects (no prints, no file I/O).
 
         Returns:
-            A markdown string with all five
-            contract-pinned sections in the
+            A markdown string with the 5 contract-
+            pinned sections (or 6 sections when
+            ``m7_baseline`` is provided) in the
             contract-pinned order.
         """
         sections: list[str] = [
@@ -540,7 +849,12 @@ class MarkdownReportGenerator:
             f"{len(COMPARISON_MODELS)} models × 4 config "
             f"variants = {len(COMPARISON_MODELS) * 4} cells.",
             "",
-            _render_per_cell_table(self.cell_results),
+            _render_per_cell_table(
+                self.cell_results, self.m7_baseline
+            ),
+            _render_m8_vs_m7_delta(
+                self.cell_results, self.m7_baseline
+            ),
             _render_best_per_model(self.cell_results),
             _render_best_per_config(self.cell_results),
             _render_cost_quality_scatter(self.cell_results),
