@@ -315,7 +315,7 @@ class TestDelta1ConditionalAdvisorSkip:
         assert "advisor_revised" not in types
         # Headers: skip header is set; advisor-model is NOT set.
         headers = build_response_headers(ctx, request_id=ctx.request_id)
-        assert headers["x-moaxy-advisor-skipped"] == "1/confidence=0.9"
+        assert headers["x-moaxy-advisor-skipped"] == "1"
         assert "x-moaxy-advisor-model" not in headers
         # The runtime attributes are stamped on the context.
         assert ctx.__dict__.get("advisor_skipped") is True
@@ -396,7 +396,7 @@ class TestDelta1ConditionalAdvisorSkip:
         await Orchestrator(adapter_ran).run(ctx)
         headers = build_response_headers(ctx, request_id=ctx.request_id)
         assert "x-moaxy-advisor-skipped" in headers
-        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+        assert headers["x-moaxy-advisor-skipped"] == "0"
 
         # Skipped case (separate route with early_exit=True).
         adapter_skip = ScriptedAdapter(
@@ -416,7 +416,7 @@ class TestDelta1ConditionalAdvisorSkip:
         await Orchestrator(adapter_skip).run(ctx2)
         headers2 = build_response_headers(ctx2, request_id=ctx2.request_id)
         assert "x-moaxy-advisor-skipped" in headers2
-        assert headers2["x-moaxy-advisor-skipped"] == "1/confidence=0.95"
+        assert headers2["x-moaxy-advisor-skipped"] == "1"
 
     @pytest.mark.asyncio
     async def test_extra_023_skip_saves_one_round_trip(self):
@@ -476,7 +476,7 @@ class TestDelta1ConditionalAdvisorSkip:
         assert len(adapter.calls) == 2
         assert "advisor" in [e.type for e in ctx.events]
         headers = build_response_headers(ctx, request_id=ctx.request_id)
-        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+        assert headers["x-moaxy-advisor-skipped"] == "0"
 
     def test_extra_030_skip_logs_info_message(self, caplog):
         # When the advisor is skipped, an INFO log line is emitted
@@ -1217,7 +1217,7 @@ class TestDelta6ScoreEventsAndHeaders:
         await Orchestrator(adapter).run(ctx)
         headers = build_response_headers(ctx, request_id=ctx.request_id)
         # The skip header is set with the parsed confidence.
-        assert headers["x-moaxy-advisor-skipped"] == "1/confidence=0.95"
+        assert headers["x-moaxy-advisor-skipped"] == "1"
         # The advisor-model header is NOT set on a skip.
         assert "x-moaxy-advisor-model" not in headers
 
@@ -1272,7 +1272,7 @@ class TestDelta6ScoreEventsAndHeaders:
         assert headers["x-moaxy-advisor-score"] == "7"
         # 0.6 formats as "0.6" via the :g format.
         assert headers["x-moaxy-reflect-confidence"] == "0.6"
-        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+        assert headers["x-moaxy-advisor-skipped"] == "0"
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -1478,7 +1478,7 @@ class TestDeltaStreamingParity:
                     continue
         assert trailer_payload is not None
         x_moaxy = trailer_payload["x_moaxy"]
-        assert x_moaxy["x-moaxy-advisor-skipped"] == "1/confidence=0.9"
+        assert x_moaxy["x-moaxy-advisor-skipped"] == "1"
 
 
 def _chunks_to_text(chunks: list[bytes]) -> str:

@@ -866,7 +866,7 @@ class TestStreamingM5TrailingTrailer:
         #   is absent)
         # - x-moaxy-advisor-model (absent when no advisor ran)
         # - x-moaxy-advisor-score (absent when no advisor ran)
-        # - x-moaxy-advisor-skipped (always present; "0/no" when
+        # - x-moaxy-advisor-skipped (always present; "0" when
         #   the advisor was disabled)
         # We assert the always-present ones and leave the
         # optional-when-disabled ones to dedicated tests.
@@ -876,8 +876,8 @@ class TestStreamingM5TrailingTrailer:
         assert x_moaxy["x-moaxy-reflect-turns"] == "0"
         assert x_moaxy["x-moaxy-reflect-confidence"] == "0"
         # The advisor is disabled on a non-advisor route, so the
-        # advisor-skipped header is the always-present "0/no".
-        assert x_moaxy["x-moaxy-advisor-skipped"] == "0/no"
+        # advisor-skipped header is the always-present "0".
+        assert x_moaxy["x-moaxy-advisor-skipped"] == "0"
 
     @pytest.mark.asyncio
     async def test_trailer_event_is_chat_completion_chunk_shaped(self):
@@ -986,10 +986,12 @@ class TestStreamingM5TrailingTrailer:
                 ),
             )
 
-        # Critique emits REFLECT_CONFIDENCE + SCORE so the trailer
-        # carries ``x-moaxy-reflect-score``. Advisor emits
-        # ADVISOR_APPROVE (no ADVISOR_SCORE:) so the trailer
-        # carries the default ``x-moaxy-advisor-score: 0``. (The
+        # Critique emits REFLECT_CONFIDENCE + a low SCORE so the
+        # trailer carries ``x-moaxy-reflect-score`` AND the M8
+        # score-aware skip does NOT fire (SCORE: 5 is below the
+        # M8 threshold of 8). Advisor emits ADVISOR_APPROVE (no
+        # ADVISOR_SCORE:) so the trailer carries the default
+        # ``x-moaxy-advisor-score: 0``. (The
         # ``m5-delta-advisor-score-event`` feature is a separate
         # future feature; this test pins the streaming trailer
         # surface and the default value, NOT the full
@@ -998,10 +1000,13 @@ class TestStreamingM5TrailingTrailer:
             stream_script=[["Hello, ", "world!"]],
             responses=[
                 # Reflection critique: emits both REFLECT_CONFIDENCE
-                # and SCORE so the score event is emitted and the
-                # trailer carries ``x-moaxy-reflect-score``.
+                # (below 0.85) and SCORE (below 8) so neither the
+                # M5 confidence skip nor the M8 score-aware skip
+                # fires. The trailer carries the default
+                # ``x-moaxy-advisor-skipped: 0`` and the advisor
+                # runs normally.
                 _chat_response(
-                    "c\nREFLECT_CONFIDENCE: 0.5\nSCORE: 8",
+                    "c\nREFLECT_CONFIDENCE: 0.5\nSCORE: 5",
                     model="minimax-m3:cloud",
                 ),
                 # Reflection revision.
@@ -1060,8 +1065,10 @@ class TestStreamingM5TrailingTrailer:
         events = _parse_sse_events(response.text)
         trailer = json.loads(events[-2][1])
         x_moaxy = trailer["x_moaxy"]
-        # The reflect-score header carries the parsed integer.
-        assert x_moaxy["x-moaxy-reflect-score"] == "8"
+        # The reflect-score header carries the parsed integer
+        # (M8: the score is 5, below the M8 skip threshold of 8,
+        # so the advisor still runs).
+        assert x_moaxy["x-moaxy-reflect-score"] == "5"
         # The advisor-score header carries the default ``"0"``
         # (the advisor ran but did not emit an ADVISOR_SCORE:
         # line; the ``m5-delta-advisor-score-event`` feature is
@@ -1073,9 +1080,9 @@ class TestStreamingM5TrailingTrailer:
         # The advisor-model header carries the configured advisor
         # model name.
         assert x_moaxy["x-moaxy-advisor-model"] == "deepseek-v4-pro:cloud"
-        # The advisor-skipped header is "0/no" because the
+        # The advisor-skipped header is "0" because the
         # advisor ran (confidence was 0.5, below 0.85 threshold).
-        assert x_moaxy["x-moaxy-advisor-skipped"] == "0/no"
+        assert x_moaxy["x-moaxy-advisor-skipped"] == "0"
 
 
 class TestStreamingM5ConditionalAdvisorSkip:
@@ -1184,7 +1191,7 @@ class TestStreamingM5ConditionalAdvisorSkip:
         x_moaxy = trailer["x_moaxy"]
         # 0.9 is the parsed confidence; the skip header reports
         # the inclusive boundary at 0.85.
-        assert x_moaxy["x-moaxy-advisor-skipped"] == "1/confidence=0.9"
+        assert x_moaxy["x-moaxy-advisor-skipped"] == "1"
         # The advisor-model header is NOT set on a skip.
         assert "x-moaxy-advisor-model" not in x_moaxy
         # The adapter call count for the chat (non-stream) path:
@@ -1742,8 +1749,8 @@ class TestStreamingM5ReflectAndAdvisorScoreEvents:
         assert x_moaxy["x-moaxy-advisor-score"] == "7"
         # The advisor-model header is set (advisor ran).
         assert x_moaxy["x-moaxy-advisor-model"] == "deepseek-v4-pro:cloud"
-        # The advisor-skipped header is "0/no" (advisor ran).
-        assert x_moaxy["x-moaxy-advisor-skipped"] == "0/no"
+        # The advisor-skipped header is "0" (advisor ran).
+        assert x_moaxy["x-moaxy-advisor-skipped"] == "0"
 
 
 # ────────────────────────────────────────────────────────────────────

@@ -157,49 +157,136 @@ def _advisor_model_chain(ctx: PipelineContext) -> list[str]:
 # runs. The boundary is inclusive: ``confidence >= 0.85`` skips.
 ADVISOR_SKIP_CONFIDENCE_THRESHOLD = 0.85
 
+# M8: the score-aware skip threshold. When the parsed SCORE: value
+# from the reflection critique (carried in
+# ``ctx.__dict__["last_score"]``) is greater than or equal to this
+# value AND the parsed confidence is below the M5 threshold
+# (0.85), the advisor is skipped with the
+# ``x-moaxy-skip-reason: high_score`` reason. The threshold is
+# hardcoded at 8 (a strong "I'm confident this is good" signal
+# on the 0..10 scale). When the score is exactly 8 the skip fires
+# (with the high_score reason); at 7 the skip does not fire on
+# score alone. The boundary is inclusive: ``score >= 8`` skips.
+ADVISOR_SKIP_SCORE_THRESHOLD = 8
+
+# M8: the three skip_reason values emitted via the
+# ``x-moaxy-skip-reason`` response header. ``confidence`` and
+# ``high_score`` mean the advisor was short-circuited; the legacy
+# ``x-moaxy-advisor-skipped`` boolean header carries ``1`` for
+# both. ``insufficient_signal`` means the advisor was not skipped
+# (it either ran, was disabled, or the reflection signal was
+# missing/too low); the legacy boolean header carries ``0``.
+SKIP_REASON_CONFIDENCE = "confidence"
+SKIP_REASON_HIGH_SCORE = "high_score"
+SKIP_REASON_INSUFFICIENT_SIGNAL = "insufficient_signal"
+
+
+def _compute_skip_reason(ctx: PipelineContext) -> str:
+    """Return the M8 ``skip_reason`` string for the current request.
+
+    The helper encodes the M5 + M8 advisor-skip semantics as a
+    three-valued enum string suitable for the
+    ``x-moaxy-skip-reason`` response header:
+
+    * ``"confidence"`` — :attr:`PipelineContext.__dict__["last_confidence"]`
+      is ``>= 0.85`` (the M5 :data:`ADVISOR_SKIP_CONFIDENCE_THRESHOLD`).
+      The advisor is short-circuited because the model itself
+      reported high confidence in its own answer.
+    * ``"high_score"`` — :attr:`PipelineContext.__dict__["last_score"]`
+      is ``>= 8`` (the M8 :data:`ADVISOR_SKIP_SCORE_THRESHOLD`) AND
+      the parsed confidence is below 0.85. The advisor is
+      short-circuited because the model's explicit 0..10 score
+      was a strong "this is good" signal even though the verbal
+      confidence was muted. The score branch wins over the
+      "advisor runs" path but loses to the confidence branch
+      (when both fire, the reason is ``"confidence"``).
+    * ``"insufficient_signal"`` — the advisor was NOT skipped.
+      This is the fallback reason: the confidence was below 0.85
+      AND either the score was below 8 or the score was ``None``
+      (preserving the M5 "no SCORE: line" behavior), OR
+      reflection was disabled (``turns=0``), OR the route's
+      advisor is not configured.
+
+    The helper does NOT consult the route configuration directly;
+    it reads the runtime attributes stamped on the context by the
+    reflection loop (``last_confidence``, ``last_score``) and the
+    events list (``reflect_critique`` count). When the route's
+    advisor is disabled (``advisor.turns < 1`` or no
+    ``advisor.model``) the helper still returns
+    ``"insufficient_signal"`` so the header is always present with
+    a valid value.
+    """
+    route = ctx.route
+    if route is None:
+        return SKIP_REASON_INSUFFICIENT_SIGNAL
+    advisor_cfg = route.advisor
+    if advisor_cfg.turns < 1 or not advisor_cfg.model:
+        return SKIP_REASON_INSUFFICIENT_SIGNAL
+    # The skip requires a real reflection signal. When the
+    # reflection loop did not run (``turns < 1`` OR no
+    # ``reflect_critique`` event was emitted), there is no
+    # confidence / score to evaluate; the reason is
+    # ``insufficient_signal`` (preserving the M5 "no
+    # confidence reported" invariant).
+    if route.reflection.turns < 1:
+        return SKIP_REASON_INSUFFICIENT_SIGNAL
+    has_critique = any(
+        e.type == "reflect_critique" for e in ctx.events
+    )
+    if not has_critique:
+        return SKIP_REASON_INSUFFICIENT_SIGNAL
+    last_confidence = ctx.__dict__.get("last_confidence", 0.0) or 0.0
+    # Confidence wins (when confidence is high, the reason is
+    # ``"confidence"`` regardless of the score).
+    if last_confidence >= ADVISOR_SKIP_CONFIDENCE_THRESHOLD:
+        return SKIP_REASON_CONFIDENCE
+    # Score-aware skip: fires when the score was parsed AND is
+    # at or above the M8 threshold (8). When the score is
+    # ``None`` (the model did not emit a ``SCORE:`` line) the
+    # skip does NOT fire (preserving the M5 behavior — the
+    # ``x-moaxy-skip-reason`` is ``"insufficient_signal"`` and
+    # the advisor runs).
+    last_score = ctx.__dict__.get("last_score", None)
+    if last_score is not None and last_score >= ADVISOR_SKIP_SCORE_THRESHOLD:
+        return SKIP_REASON_HIGH_SCORE
+    return SKIP_REASON_INSUFFICIENT_SIGNAL
+
 
 def _should_skip_advisor(ctx: PipelineContext) -> bool:
-    """Return True when the DELTA 1 advisor-skip conditions all hold.
+    """Return True when the advisor-skip conditions all hold.
 
     The conditional skip is engaged when ALL of the following are true:
 
     1. The reflection loop produced a parsed
        :attr:`PipelineContext.__dict__["last_confidence"]` that is
-       greater than or equal to the hardcoded threshold (0.85).
+       greater than or equal to the hardcoded threshold (0.85)
+       OR the parsed ``last_score`` is greater than or equal to 8
+       (the M8 score-aware skip).
     2. The route's advisor is configured (``advisor.turns >= 1``
        and ``advisor.model`` is set).
-    3. The reflection loop ran at least one turn (so the confidence
+    3. The reflection loop ran at least one turn (so a confidence
        signal exists; the value is the default 0.0 when reflection
        was disabled, in which case the skip is NOT engaged).
+
+    M8 change: the M5 "confidence-only" rule is extended with a
+    score-aware branch — the helper now also returns ``True`` when
+    ``last_score >= 8`` AND ``last_confidence < 0.85``. The
+    confidence branch is checked first (priority), so when both
+    fire the reason is ``"confidence"``; when only the score
+    branch fires the reason is ``"high_score"``. The exact
+    reason is returned by :func:`_compute_skip_reason`; this
+    helper is a boolean shortcut used by the orchestrator's
+    "should I even consider skipping" check.
 
     When the helper returns ``True``, the orchestrator MUST skip
     the advisor LLM call entirely. The caller is responsible for
     appending the ``advisor_skipped`` event and setting the
     ``advisor_skipped`` / ``advisor_skip_confidence`` runtime
-    attributes on the context for the response builder.
+    attributes on the context for the response builder. The
+    M8 ``advisor_skip_reason`` runtime attribute is set alongside
+    the boolean.
     """
-    route = ctx.route
-    if route is None:
-        return False
-    advisor_cfg = route.advisor
-    if advisor_cfg.turns < 1 or not advisor_cfg.model:
-        return False
-    # DELTA 1: the skip requires a real confidence signal. When the
-    # reflection loop did not run (turns=0), the runtime attribute
-    # is the dataclass default 0.0; the helper must NOT skip in
-    # that case (no confidence was reported, so the model's
-    # confidence is unknown). The "no reflection ran" case is
-    # distinguished by ``last_confidence == 0.0`` AND the absence
-    # of any reflect_critique event in ``ctx.events``.
-    if route.reflection.turns < 1:
-        return False
-    has_critique = any(
-        e.type == "reflect_critique" for e in ctx.events
-    )
-    if not has_critique:
-        return False
-    last_confidence = ctx.__dict__.get("last_confidence", 0.0) or 0.0
-    return last_confidence >= ADVISOR_SKIP_CONFIDENCE_THRESHOLD
+    return _compute_skip_reason(ctx) != SKIP_REASON_INSUFFICIENT_SIGNAL
 
 
 def _resolve_advisor_model_name(ctx: PipelineContext) -> str:
@@ -235,17 +322,38 @@ def _record_advisor_skipped(
     ctx: PipelineContext,
     *,
     confidence: float,
+    reason: str = SKIP_REASON_CONFIDENCE,
 ) -> None:
     """Append the ``advisor_skipped`` event and stamp runtime attributes.
 
-    The orchestrator calls this when the DELTA 1 conditional skip
+    The orchestrator calls this when the M5/M8 conditional skip
     fires. The event makes the skip observable in the structured
     log / events list, and the runtime attributes are read by
     :func:`build_response_headers` to emit the
-    ``x-moaxy-advisor-skipped: 1/confidence=<x>`` response header.
-    The log line is an INFO record so operators can confirm the
-    skip happened and inspect the parsed confidence that triggered
+    ``x-moaxy-advisor-skipped: 0|1`` and the new M8
+    ``x-moaxy-skip-reason: <reason>`` response headers. The log
+    line is an INFO record so operators can confirm the skip
+    happened and inspect the parsed confidence that triggered
     it.
+
+    Args:
+        ctx: The :class:`PipelineContext` to mutate.
+        confidence: The parsed REFLECT_CONFIDENCE that triggered
+            the skip. Carried on the event's ``text`` field and
+            on the ``advisor_skip_confidence`` runtime attribute
+            for the legacy ``x-moaxy-advisor-skipped`` header
+            (``"1"``; the M5 ``1/confidence=<x>`` verbose format
+            was replaced by the M8 pure ``0|1`` boolean — the
+            parsed confidence is exposed on the M8
+            ``x-moaxy-skip-reason`` header and on the
+            ``advisor_skip_confidence`` runtime attribute for
+            downstream consumers that want the value).
+        reason: The M8 skip reason. Defaults to
+            :data:`SKIP_REASON_CONFIDENCE` (the M5 behavior).
+            Callers that trigger the score-aware branch pass
+            :data:`SKIP_REASON_HIGH_SCORE` so the response
+            header ``x-moaxy-skip-reason`` carries
+            ``"high_score"`` instead of ``"confidence"``.
     """
     ctx.append_event(
         "advisor_skipped",
@@ -253,10 +361,18 @@ def _record_advisor_skipped(
     )
     ctx.__dict__["advisor_skipped"] = True
     ctx.__dict__["advisor_skip_confidence"] = confidence
+    # M8: stamp the skip_reason runtime attribute on the context.
+    # ``build_response_headers`` reads it to emit the new
+    # ``x-moaxy-skip-reason`` header. The default is
+    # ``"confidence"`` (preserving the M5 behavior) but the
+    # orchestrator passes the actual reason from
+    # :func:`_compute_skip_reason` so the score-aware branch
+    # produces ``"high_score"`` in the header.
+    ctx.__dict__["advisor_skip_reason"] = reason
     logger.info(
-        "orchestrator: advisor skipped (confidence=%.3f >= %.2f) on model=%s",
+        "orchestrator: advisor skipped (reason=%s, confidence=%.3f) on model=%s",
+        reason,
         confidence,
-        ADVISOR_SKIP_CONFIDENCE_THRESHOLD,
         _resolve_advisor_model_name(ctx),
     )
 
@@ -1090,13 +1206,26 @@ class Orchestrator:
         # post-reflection answer unchanged. The orchestrator
         # records the skip via :func:`_record_advisor_skipped` so
         # operators can see the skip in the structured log and
-        # the response header (``x-moaxy-advisor-skipped:
-        # 1/confidence=<x>``) carries the parsed confidence.
+        # the response header (``x-moaxy-advisor-skipped: 1``,
+        # the M8 pure boolean; the M5 ``1/confidence=<x>``
+        # verbose format was replaced). The parsed confidence
+        # is on the M8 ``x-moaxy-skip-reason`` header and the
+        # ``advisor_skip_confidence`` runtime attribute.
+        #
+        # M8: the skip is extended to also fire when the parsed
+        # SCORE: is ``>= 8`` AND the confidence is below 0.85.
+        # The exact reason is computed by
+        # :func:`_compute_skip_reason` and stamped on the
+        # context for :func:`build_response_headers` to emit the
+        # new ``x-moaxy-skip-reason`` header.
         if _should_skip_advisor(ctx):
             confidence = (
                 ctx.__dict__.get("last_confidence", 0.0) or 0.0
             )
-            _record_advisor_skipped(ctx, confidence=confidence)
+            reason = _compute_skip_reason(ctx)
+            _record_advisor_skipped(
+                ctx, confidence=confidence, reason=reason
+            )
             return answer, []
 
         # DELTA 1 (self-advise warning): when the configured
@@ -1288,11 +1417,20 @@ class Orchestrator:
         # parallel self-reflection path) is short-circuited. The
         # orchestrator records the skip and returns the
         # post-reflection answer unchanged.
+        #
+        # M8: the skip is extended to also fire when the parsed
+        # SCORE: is ``>= 8`` AND the confidence is below 0.85.
+        # The exact reason is computed by
+        # :func:`_compute_skip_reason` and stamped on the
+        # context for the response builder.
         if _should_skip_advisor(ctx):
             confidence = (
                 ctx.__dict__.get("last_confidence", 0.0) or 0.0
             )
-            _record_advisor_skipped(ctx, confidence=confidence)
+            reason = _compute_skip_reason(ctx)
+            _record_advisor_skipped(
+                ctx, confidence=confidence, reason=reason
+            )
             return current_answer, []
 
         # DELTA 1 (self-advise warning): one-shot WARNING per
@@ -2274,14 +2412,17 @@ def build_response_headers(ctx: PipelineContext, *, request_id: str) -> dict[str
         fallback models the walker actually used. Contains
         ``x-moaxy-reflect-turns``, ``x-moaxy-reflect-confidence``,
         ``x-moaxy-advisor-model`` when reflection and/or advisor ran.
-        Always contains ``x-moaxy-advisor-skipped`` (``1/confidence=<x>``
-        when the advisor was skipped, ``0/no`` otherwise). Contains
-        ``x-moaxy-reflect-score`` when at least one reflection turn
-        ran (value is the last parsed ``SCORE:`` as a string, or
-        ``0`` when no score was parsed). Contains
-        ``x-moaxy-advisor-score`` when an advisor pass ran (value is
-        the parsed ``ADVISOR_SCORE:`` as a string, or ``0`` when
-        none was parsed).
+        Always contains ``x-moaxy-advisor-skipped`` as a ``0|1``
+        boolean (preserved for backward compat — ``1`` when the
+        advisor was skipped, ``0`` otherwise). M8 adds the always-on
+        ``x-moaxy-skip-reason`` header with one of three values:
+        ``"confidence"``, ``"high_score"``, or
+        ``"insufficient_signal"``. Contains ``x-moaxy-reflect-score``
+        when at least one reflection turn ran (value is the last
+        parsed ``SCORE:`` as a string, or ``0`` when no score was
+        parsed). Contains ``x-moaxy-advisor-score`` when an advisor
+        pass ran (value is the parsed ``ADVISOR_SCORE:`` as a string,
+        or ``0`` when none was parsed).
     """
     headers: dict[str, str] = {"x-moaxy-request-id": request_id}
 
@@ -2334,24 +2475,53 @@ def build_response_headers(ctx: PipelineContext, *, request_id: str) -> dict[str
             ctx.__dict__.get("advisor_score", 0) or 0
         )
 
-    # DELTA 1: the ``x-moaxy-advisor-skipped`` header is ALWAYS
-    # present (consistent observability). The value is
-    # ``1/confidence=<x>`` when the advisor was skipped, and
-    # ``0/no`` when the advisor ran (or was disabled). The header
-    # is derived from the ``advisor_skipped`` runtime attribute
-    # on the context; the orchestrator sets the attribute (and
-    # appends the ``advisor_skipped`` event) when the conditional
-    # skip fires in :meth:`_run_advisor` /
-    # :meth:`_run_advisor_parallel`.
+    # DELTA 1 / M8: the ``x-moaxy-advisor-skipped`` header is ALWAYS
+    # present (consistent observability). The value is a pure
+    # ``0|1`` boolean for backward compat — ``1`` when the advisor
+    # was skipped (M5 confidence skip OR M8 score-aware skip),
+    # ``0`` otherwise. M8 introduces a separate header
+    # (``x-moaxy-skip-reason``) that carries the richer enum
+    # ``"confidence" | "high_score" | "insufficient_signal"`` so
+    # clients can distinguish WHY the advisor was (or was not)
+    # skipped. The boolean header is preserved unchanged for
+    # clients that already parse ``0|1``; the new header is
+    # additive.
     if ctx.__dict__.get("advisor_skipped"):
-        skip_confidence = ctx.__dict__.get(
-            "advisor_skip_confidence", 0.0
-        ) or 0.0
-        headers["x-moaxy-advisor-skipped"] = (
-            f"1/confidence={skip_confidence:g}"
-        )
+        headers["x-moaxy-advisor-skipped"] = "1"
     else:
-        headers["x-moaxy-advisor-skipped"] = "0/no"
+        headers["x-moaxy-advisor-skipped"] = "0"
+
+    # M8: the ``x-moaxy-skip-reason`` header is ALWAYS present
+    # (every ``/v1/chat/completions`` response carries it). The
+    # value is one of three enum strings:
+
+    # * ``"confidence"`` — advisor skipped because the parsed
+    #   ``REFLECT_CONFIDENCE:`` cleared the M5 threshold (0.85).
+    # * ``"high_score"`` — advisor skipped because the parsed
+    #   ``SCORE:`` cleared the M8 threshold (8) AND the confidence
+    #   was below 0.85. The confidence branch has priority: when
+    #   both fire, the reason is ``"confidence"``.
+    # * ``"insufficient_signal"`` — advisor was NOT skipped
+    #   (it ran, was disabled, or the reflection signal was
+    #   missing/too low). This is the fallback reason for every
+    #   other case.
+    #
+    # The header value is derived from the ``advisor_skip_reason``
+    # runtime attribute when the skip fired (set by
+    # :func:`_record_advisor_skipped`); when the skip did not
+    # fire, the helper computes the reason from
+    # :func:`_compute_skip_reason` so the header is still
+    # populated with a valid value.
+    skip_reason = ctx.__dict__.get("advisor_skip_reason")
+    if skip_reason is None:
+        skip_reason = _compute_skip_reason(ctx)
+    if skip_reason not in (
+        SKIP_REASON_CONFIDENCE,
+        SKIP_REASON_HIGH_SCORE,
+        SKIP_REASON_INSUFFICIENT_SIGNAL,
+    ):
+        skip_reason = SKIP_REASON_INSUFFICIENT_SIGNAL
+    headers["x-moaxy-skip-reason"] = skip_reason
 
     return headers
 

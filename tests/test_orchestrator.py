@@ -1228,9 +1228,17 @@ class TestM5DeltaResponseHeaders:
     The M5 contract adds three new response headers on top of the
     v1-v4 set:
 
-    * ``x-moaxy-advisor-skipped`` — always present. Value is
-      ``1/confidence=<x>`` when the advisor was skipped (DELTA 1
-      conditional skip fired) and ``0/no`` otherwise.
+    * ``x-moaxy-advisor-skipped`` — always present. M5 emitted
+      ``1/confidence=<x>`` (skip) or ``0/no`` (no skip). M8
+      preserves the header for backward compat but the value is
+      a pure ``0|1`` boolean; the parsed confidence and the M8
+      skip reason are surfaced separately on the
+      ``x-moaxy-skip-reason`` header (always on) and the
+      ``advisor_skip_confidence`` / ``advisor_skip_reason``
+      runtime attributes on the context.
+    * ``x-moaxy-skip-reason`` — M8 always-on observability
+      header. Value is one of ``"confidence"``,
+      ``"high_score"``, or ``"insufficient_signal"``.
     * ``x-moaxy-reflect-score`` — present when at least one
       reflection turn ran. Value is the last parsed ``SCORE:``
       (the runtime attribute ``ctx.__dict__["last_score"]``),
@@ -1246,7 +1254,7 @@ class TestM5DeltaResponseHeaders:
     """
 
     def test_x_moaxy_advisor_skipped_zero_no_when_advisor_ran(self):
-        """When the advisor ran, the header is always ``0/no``."""
+        """When the advisor ran, the header is always ``0`` (boolean)."""
         adapter = ScriptedAdapter(
             [
                 _response("initial", prompt_tokens=5, completion_tokens=2),
@@ -1278,13 +1286,21 @@ class TestM5DeltaResponseHeaders:
 
         asyncio.run(Orchestrator(adapter).run(ctx))
         headers = build_response_headers(ctx, request_id=ctx.request_id)
-        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+        # M8: the legacy boolean header is ``"0"`` (was ``"0/no"``
+        # in M5; the verbose suffix is dropped for backward
+        # compat with the new pure-boolean contract).
+        assert headers["x-moaxy-advisor-skipped"] == "0"
+        # The new M8 header is always present with the
+        # ``insufficient_signal`` reason (advisor ran).
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
         # The advisor_skipped runtime attribute is unset.
         assert not ctx.__dict__.get("advisor_skipped")
 
     def test_x_moaxy_advisor_skipped_one_confidence_when_skipped(self):
-        """When the orchestrator skipped the advisor, the header is
-        ``1/confidence=<x>`` where ``<x>`` is the parsed confidence.
+        """When the orchestrator skipped the advisor, the legacy
+        boolean header is ``"1"`` (was ``"1/confidence=0.92"`` in
+        M5). The new M8 ``x-moaxy-skip-reason`` header carries the
+        richer enum string (``"confidence"`` here).
         """
         adapter = ScriptedAdapter(
             [
@@ -1312,12 +1328,18 @@ class TestM5DeltaResponseHeaders:
         assert ctx.__dict__.get("advisor_skipped") is True
         assert ctx.__dict__.get("advisor_skip_confidence") == 0.92
         headers = build_response_headers(ctx, request_id=ctx.request_id)
-        assert (
-            headers["x-moaxy-advisor-skipped"] == "1/confidence=0.92"
-        )
+        # M8: the legacy header is a pure ``"1"`` boolean. The
+        # parsed confidence is on the M8 skip-reason runtime
+        # attribute (not the header) and on the M5-style
+        # ``advisor_skip_confidence`` attribute for downstream
+        # consumers that want the value.
+        assert headers["x-moaxy-advisor-skipped"] == "1"
+        # The new M8 header carries ``"confidence"`` (the
+        # confidence branch of the skip fired).
+        assert headers["x-moaxy-skip-reason"] == "confidence"
 
     def test_x_moaxy_advisor_skipped_zero_no_when_advisor_disabled(self):
-        """When advisor.turns=0, the skip never fires; header is ``0/no``."""
+        """When advisor.turns=0, the skip never fires; legacy header is ``"0"``."""
         adapter = ScriptedAdapter([_response("x", prompt_tokens=1, completion_tokens=1)])
         route = _build_route(reflection_turns=0, advisor_turns=0)
         ctx = _build_context(route)
@@ -1325,9 +1347,14 @@ class TestM5DeltaResponseHeaders:
 
         asyncio.run(Orchestrator(adapter).run(ctx))
         headers = build_response_headers(ctx, request_id=ctx.request_id)
-        # The header is ALWAYS present.
+        # The header is ALWAYS present. M8: the value is a pure
+        # ``"0"`` boolean (was ``"0/no"`` in M5; the verbose
+        # suffix is dropped for backward compat with the new
+        # pure-boolean contract). The skip reason defaults to
+        # ``insufficient_signal`` when the advisor is disabled.
         assert "x-moaxy-advisor-skipped" in headers
-        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+        assert headers["x-moaxy-advisor-skipped"] == "0"
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
 
     def test_x_moaxy_reflect_score_zero_when_no_reflection(self):
         """With reflection disabled, the header is absent."""
@@ -2403,8 +2430,12 @@ class TestConditionalAdvisorSkip:
     * Stamps ``ctx.__dict__["advisor_skipped"] = True`` and
       ``ctx.__dict__["advisor_skip_confidence"]`` for the response
       builder.
-    * The ``x-moaxy-advisor-skipped`` response header carries the
-      value ``1/confidence=<x>``.
+    * The ``x-moaxy-advisor-skipped`` legacy response header
+      carries the value ``1`` (a pure ``0|1`` boolean; the
+      M5 ``1/confidence=<x>`` verbose format is replaced by
+      the M8 simpler form — the parsed confidence is exposed
+      on the M8 ``x-moaxy-skip-reason`` runtime attribute
+      and the new ``x-moaxy-skip-reason`` response header).
     """
 
     @pytest.mark.asyncio
@@ -2447,9 +2478,12 @@ class TestConditionalAdvisorSkip:
         # Runtime attributes are stamped for the response builder.
         assert ctx.__dict__.get("advisor_skipped") is True
         assert ctx.__dict__.get("advisor_skip_confidence") == 0.9
-        # The header builder emits ``1/confidence=0.9``.
+        # The header builder emits ``"1"`` (M8 boolean; was
+        # ``"1/confidence=0.9"`` in M5) and the new
+        # ``x-moaxy-skip-reason`` header carries ``"confidence"``.
         headers = build_response_headers(ctx, request_id=ctx.request_id)
-        assert headers["x-moaxy-advisor-skipped"] == "1/confidence=0.9"
+        assert headers["x-moaxy-advisor-skipped"] == "1"
+        assert headers["x-moaxy-skip-reason"] == "confidence"
         # The advisor-model header is NOT set on a skip.
         assert "x-moaxy-advisor-model" not in headers
 
@@ -2491,9 +2525,10 @@ class TestConditionalAdvisorSkip:
         assert "advisor_approve" in types
         # The skip attribute is NOT set.
         assert not ctx.__dict__.get("advisor_skipped")
-        # The header is ``0/no``.
+        # The header is ``"0"`` (M8 boolean; was ``"0/no"`` in M5).
         headers = build_response_headers(ctx, request_id=ctx.request_id)
-        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+        assert headers["x-moaxy-advisor-skipped"] == "0"
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
 
     @pytest.mark.asyncio
     async def test_skip_at_exactly_threshold_0p85(self):
@@ -2522,7 +2557,10 @@ class TestConditionalAdvisorSkip:
         assert ctx.__dict__.get("advisor_skipped") is True
         assert ctx.__dict__.get("advisor_skip_confidence") == 0.85
         headers = build_response_headers(ctx, request_id=ctx.request_id)
-        assert headers["x-moaxy-advisor-skipped"] == "1/confidence=0.85"
+        # M8: the legacy boolean header is ``"1"`` and the new
+        # skip-reason header is ``"confidence"``.
+        assert headers["x-moaxy-advisor-skipped"] == "1"
+        assert headers["x-moaxy-skip-reason"] == "confidence"
 
     @pytest.mark.asyncio
     async def test_run_at_0p849_just_below_threshold(self):
@@ -2557,7 +2595,10 @@ class TestConditionalAdvisorSkip:
         assert "advisor" in [e.type for e in ctx.events]
         assert not ctx.__dict__.get("advisor_skipped")
         headers = build_response_headers(ctx, request_id=ctx.request_id)
-        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+        # M8: the legacy boolean header is ``"0"`` and the new
+        # skip-reason header is ``"insufficient_signal"``.
+        assert headers["x-moaxy-advisor-skipped"] == "0"
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
 
     @pytest.mark.asyncio
     async def test_no_skip_when_reflection_disabled(self):
@@ -2588,10 +2629,11 @@ class TestConditionalAdvisorSkip:
         # The advisor ran.
         assert len(adapter.calls) == 2
         assert "advisor" in [e.type for e in ctx.events]
-        # The skip is NOT set; the header is ``0/no``.
+        # The skip is NOT set; the header is ``"0"`` (M8 boolean).
         assert not ctx.__dict__.get("advisor_skipped")
         headers = build_response_headers(ctx, request_id=ctx.request_id)
-        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+        assert headers["x-moaxy-advisor-skipped"] == "0"
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
 
     @pytest.mark.asyncio
     async def test_skip_saves_one_llm_round_trip(self):
@@ -2779,7 +2821,7 @@ class TestConditionalAdvisorSkip:
 
     @pytest.mark.asyncio
     async def test_skip_header_absent_in_run_case(self):
-        """VAL-PIPE-EXTRA-003: header value is ``0/no`` in the run case."""
+        """VAL-PIPE-EXTRA-003: header value is ``"0"`` in the run case (M8 boolean)."""
         adapter = ScriptedAdapter(
             [
                 _response("initial", prompt_tokens=5, completion_tokens=2),
@@ -2807,9 +2849,10 @@ class TestConditionalAdvisorSkip:
         await Orchestrator(adapter).run(ctx)
         headers = build_response_headers(ctx, request_id=ctx.request_id)
         # The header is present in both states (consistent
-        # observability); the run-case value is ``0/no``.
+        # observability); the run-case value is ``"0"`` (M8).
         assert "x-moaxy-advisor-skipped" in headers
-        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+        assert headers["x-moaxy-advisor-skipped"] == "0"
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
 
     @pytest.mark.asyncio
     async def test_no_skip_when_advisor_not_configured(self):
@@ -2817,7 +2860,8 @@ class TestConditionalAdvisorSkip:
 
         The skip requires ``advisor.turns >= 1`` and
         ``advisor.model`` set. When the advisor is disabled, the
-        skip is a no-op and the header value is ``0/no``.
+        skip is a no-op and the legacy header value is ``"0"`` (M8
+        boolean; was ``"0/no"`` in M5).
         """
         adapter = ScriptedAdapter(
             [
@@ -2841,8 +2885,11 @@ class TestConditionalAdvisorSkip:
         # The advisor is disabled; the skip is a no-op.
         assert not ctx.__dict__.get("advisor_skipped")
         headers = build_response_headers(ctx, request_id=ctx.request_id)
-        # The header is still emitted (``0/no``).
-        assert headers["x-moaxy-advisor-skipped"] == "0/no"
+        # The header is still emitted (``"0"`` boolean; the new
+        # M8 ``x-moaxy-skip-reason`` carries
+        # ``"insufficient_signal"``).
+        assert headers["x-moaxy-advisor-skipped"] == "0"
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
 
 
 class TestSelfAdviseWarning:
@@ -4392,4 +4439,806 @@ class TestM8FreshContextOrchestratorEvent:
         assert len(events) == 1
         assert events[0].turn == 0
         assert events[0].text == "True"
+
+
+class TestM8SkipReason:
+    """M8: the ``x-moaxy-skip-reason`` response header is always
+    present on every ``/v1/chat/completions`` response, with one
+    of three values:
+
+    * ``"confidence"`` — advisor was skipped because the parsed
+      ``REFLECT_CONFIDENCE:`` cleared the M5 threshold (0.85).
+    * ``"high_score"`` — advisor was skipped because the parsed
+      ``SCORE:`` cleared the M8 threshold (8) AND the confidence
+      was below 0.85. The score branch wins over the
+      "advisor runs" path but loses to the confidence branch
+      (when both fire, the reason is ``"confidence"``).
+    * ``"insufficient_signal"`` — advisor was NOT skipped (it
+      ran, was disabled, or the reflection signal was missing
+      or too low). This is the fallback reason for every other
+      case, including the disabled-advisor case (where the
+      route's ``advisor.turns == 0``).
+
+    The legacy ``x-moaxy-advisor-skipped`` header is preserved
+    as a pure ``0|1`` boolean for backward compat — ``1`` when
+    ``skip_reason != "insufficient_signal"``, ``0`` otherwise.
+
+    The contract pins three behaviors:
+
+    * All three reasons fire correctly: the orchestrator
+      produces each of the three values in a scripted scenario
+      that exercises that branch.
+    * The header is always present: every
+      ``/v1/chat/completions`` response carries the header,
+      regardless of whether the advisor was skipped, ran, or
+      was disabled.
+    * The boolean header is consistent with ``skip_reason``:
+      the legacy ``0|1`` header is ``"1"`` exactly when the
+      new ``x-moaxy-skip-reason`` is not
+      ``"insufficient_signal"``, and ``"0"`` otherwise.
+
+    The tests below use a hermetic :class:`ScriptedAdapter` (a
+    FakeAdapter equivalent that records every call) to drive
+    the orchestrator and assert on the resulting headers.
+    """
+
+    # ── (a) All three reasons fire correctly ──
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_confidence_when_above_threshold(self):
+        """VAL-M8-006 (a): ``last_confidence >= 0.85`` →
+        ``x-moaxy-skip-reason == "confidence"``.
+
+        The M5 confidence branch fires when the parsed
+        ``REFLECT_CONFIDENCE:`` is at or above 0.85. The
+        orchestrator short-circuits the advisor and the response
+        header carries ``"confidence"``. The legacy boolean
+        header is ``"1"``.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.9",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The new M8 header carries the confidence reason.
+        assert headers["x-moaxy-skip-reason"] == "confidence"
+        # The legacy boolean header is ``"1"`` (skip fired).
+        assert headers["x-moaxy-advisor-skipped"] == "1"
+        # The skip was recorded on the context.
+        assert ctx.__dict__.get("advisor_skipped") is True
+        assert ctx.__dict__.get("advisor_skip_reason") == "confidence"
+        # The advisor was not called.
+        assert len(adapter.calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_high_score_when_score_above_threshold(self):
+        """VAL-M8-006 (a): ``last_score >= 8`` AND
+        ``last_confidence < 0.85`` → ``x-moaxy-skip-reason ==
+        "high_score"``.
+
+        The M8 score-aware branch fires when the parsed
+        ``SCORE:`` is at or above 8 and the confidence is
+        below the M5 threshold (0.85). The orchestrator
+        short-circuits the advisor with the new
+        ``"high_score"`` reason. The legacy boolean header is
+        still ``"1"`` (the skip fired).
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                # Low confidence (0.5) but a strong score (9);
+                # the M8 score-aware skip fires on the advisor.
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5\nSCORE: 9",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                # The reflection REVISION still runs (the
+                # ``early_exit`` is a separate path from the
+                # M8 score-aware skip). The M5 ``combined``
+                # signal at trust_verbal=0.6, trust_score=0.4
+                # is 0.6*0.5 + 0.4*0.9 = 0.66, below the 0.85
+                # threshold, so the revision runs.
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                # The orchestrator MUST NOT call the advisor
+                # because the score-aware skip fires; the
+                # response carries the post-reflection answer.
+                # (No scripted response for an advisor call —
+                # if the orchestrator tried to call the advisor,
+                # the ScriptedAdapter would raise ``IndexError``.)
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # Only 2 LLM calls (initial + critique). The revision
+        # is not expected because the score-aware skip short-
+        # circuits the advisor — but the revision DID run
+        # because early_exit=False. Total: 3 calls.
+        # Actually, let me re-check: with early_exit=False
+        # and score-aware skip, the reflection runs to
+        # completion (critique + revision), THEN the score
+        # skip fires. Total: initial + critique + revised = 3
+        # calls.
+        assert len(adapter.calls) == 3
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The new M8 header carries the high_score reason.
+        assert headers["x-moaxy-skip-reason"] == "high_score"
+        # The legacy boolean header is ``"1"`` (skip fired).
+        assert headers["x-moaxy-advisor-skipped"] == "1"
+        # The skip was recorded on the context with the
+        # ``"high_score"`` reason.
+        assert ctx.__dict__.get("advisor_skipped") is True
+        assert ctx.__dict__.get("advisor_skip_reason") == "high_score"
+        # The last_score attribute carries the parsed score.
+        assert ctx.__dict__.get("last_score") == 9
+        # The last_confidence attribute carries the parsed
+        # confidence (0.5, below the M5 threshold).
+        assert ctx.__dict__.get("last_confidence") == 0.5
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_insufficient_signal_when_no_skip(self):
+        """VAL-M8-006 (a): confidence < 0.85 AND score < 8 (or
+        None) → ``x-moaxy-skip-reason == "insufficient_signal"``.
+
+        The orchestrator does NOT skip the advisor in this case;
+        the advisor runs and the response header carries the
+        fallback reason ``"insufficient_signal"``. The legacy
+        boolean header is ``"0"``.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                # Low confidence (0.5) and a low score (5) — neither
+                # branch fires; the advisor runs.
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5\nSCORE: 5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # 4 LLM calls: initial + critique + revise + advisor.
+        assert len(adapter.calls) == 4
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The new M8 header carries the insufficient_signal
+        # reason (advisor was NOT skipped).
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
+        # The legacy boolean header is ``"0"``.
+        assert headers["x-moaxy-advisor-skipped"] == "0"
+        # The skip was NOT recorded on the context.
+        assert not ctx.__dict__.get("advisor_skipped")
+        # The advisor_skip_reason attribute is NOT set (the
+        # skip never fired).
+        assert ctx.__dict__.get("advisor_skip_reason") is None
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_confidence_wins_over_high_score(self):
+        """When BOTH branches would fire (confidence >= 0.85
+        AND score >= 8), the confidence branch wins — the
+        reason is ``"confidence"`` (not ``"high_score"``).
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                # High confidence AND high score — both
+                # branches would fire; confidence wins.
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.95\nSCORE: 10",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The confidence branch wins.
+        assert headers["x-moaxy-skip-reason"] == "confidence"
+        assert ctx.__dict__.get("advisor_skip_reason") == "confidence"
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_high_score_at_exactly_8(self):
+        """VAL-M8-006 (boundary): score == 8 is the M8 threshold;
+        the skip fires (boundary inclusive). The confidence is
+        0.5 (below 0.85) so the confidence branch does not
+        fire; the score branch is the only one to fire.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5\nSCORE: 8",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The score branch fires at exactly 8 (boundary inclusive).
+        assert headers["x-moaxy-skip-reason"] == "high_score"
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_high_score_at_7_just_below(self):
+        """VAL-M8-006 (boundary): score == 7 is below the M8
+        threshold; the score branch does NOT fire. The
+        confidence is 0.5 (below 0.85) so the confidence
+        branch also does not fire; the advisor runs and the
+        reason is ``"insufficient_signal"``.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5\nSCORE: 7",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The score branch does NOT fire at 7.
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
+        # The advisor ran.
+        assert len(adapter.calls) == 4
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_no_score_line_preserves_m5_behavior(self):
+        """VAL-M8-005: when the critique does NOT contain a
+        ``SCORE:`` line, the M8 score-aware branch does NOT
+        fire (even when the M5 confidence would also not
+        fire). The M5 behavior is preserved: the advisor
+        runs as if there were no score signal at all.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                # No SCORE: line — the M8 score branch must NOT
+                # fire even when confidence is below 0.85.
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        # The advisor ran.
+        assert len(adapter.calls) == 4
+        # last_score is None (no SCORE: line was parsed).
+        assert ctx.__dict__.get("last_score") is None
+        # The reason is insufficient_signal (the M5 default
+        # when no skip fires).
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
+
+    # ── (b) The header is always present ──
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_present_on_advisor_ran_response(self):
+        """VAL-M8-006 (b): the header is present when the
+        advisor ran (low confidence, low score). The value is
+        ``"insufficient_signal"``.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The header is present.
+        assert "x-moaxy-skip-reason" in headers
+        # The value is the fallback reason.
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_present_when_advisor_disabled(self):
+        """VAL-M8-006 (b) and expectedBehavior (4): the header
+        is present and carries ``"insufficient_signal"`` when
+        the route's ``advisor.turns == 0`` (no advisor
+        configured). The legacy boolean header is ``"0"``.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                # The orchestrator would normally run critique +
+                # revision; the test only needs to assert the
+                # header values, not the call count.
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.95",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            advisor_model=None,  # advisor disabled
+            advisor_turns=0,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The header is present.
+        assert "x-moaxy-skip-reason" in headers
+        # The value is the fallback reason (advisor disabled).
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
+        # The legacy boolean header is ``"0"``.
+        assert headers["x-moaxy-advisor-skipped"] == "0"
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_present_when_reflection_disabled(self):
+        """VAL-M8-006 (b): the header is present when reflection
+        is disabled (``reflection.turns == 0``). The reason is
+        ``"insufficient_signal"`` (no signal to evaluate). The
+        advisor still runs (if configured).
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=0,  # reflection disabled
+            advisor_model="deepseek-v4-pro:cloud",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The header is present.
+        assert "x-moaxy-skip-reason" in headers
+        # The value is the fallback reason (no reflection signal).
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_present_with_every_value_is_valid(self):
+        """VAL-M8-006 (b): the header value is one of the three
+        documented enum strings — no other value is ever
+        produced. The test exercises all three branches in
+        sequence and asserts the value is always in the set.
+        """
+        valid_values = {
+            "confidence",
+            "high_score",
+            "insufficient_signal",
+        }
+        # Script 1: confidence branch.
+        adapter1 = ScriptedAdapter(
+            [
+                _response("i1", prompt_tokens=1, completion_tokens=1),
+                _response(
+                    "c1\nREFLECT_CONFIDENCE: 0.9",
+                    prompt_tokens=1,
+                    completion_tokens=1,
+                ),
+            ]
+        )
+        route1 = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            advisor_model="adv",
+            advisor_turns=1,
+        )
+        ctx1 = _build_context(route1)
+        await Orchestrator(adapter1).run(ctx1)
+        h1 = build_response_headers(ctx1, request_id=ctx1.request_id)
+        assert h1["x-moaxy-skip-reason"] in valid_values
+        assert h1["x-moaxy-skip-reason"] == "confidence"
+        # Script 2: high_score branch.
+        adapter2 = ScriptedAdapter(
+            [
+                _response("i2", prompt_tokens=1, completion_tokens=1),
+                _response(
+                    "c2\nREFLECT_CONFIDENCE: 0.4\nSCORE: 9",
+                    prompt_tokens=1,
+                    completion_tokens=1,
+                ),
+                _response("r2", prompt_tokens=1, completion_tokens=1),
+            ]
+        )
+        route2 = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="adv",
+            advisor_turns=1,
+        )
+        ctx2 = _build_context(route2)
+        await Orchestrator(adapter2).run(ctx2)
+        h2 = build_response_headers(ctx2, request_id=ctx2.request_id)
+        assert h2["x-moaxy-skip-reason"] in valid_values
+        assert h2["x-moaxy-skip-reason"] == "high_score"
+        # Script 3: insufficient_signal branch.
+        adapter3 = ScriptedAdapter(
+            [
+                _response("i3", prompt_tokens=1, completion_tokens=1),
+                _response(
+                    "c3\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=1,
+                    completion_tokens=1,
+                ),
+                _response("r3", prompt_tokens=1, completion_tokens=1),
+                # ADVISOR_APPROVE → no post-advisor revision.
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=1,
+                    completion_tokens=1,
+                ),
+            ]
+        )
+        route3 = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="adv",
+            advisor_turns=1,
+        )
+        ctx3 = _build_context(route3)
+        await Orchestrator(adapter3).run(ctx3)
+        h3 = build_response_headers(ctx3, request_id=ctx3.request_id)
+        assert h3["x-moaxy-skip-reason"] in valid_values
+        assert h3["x-moaxy-skip-reason"] == "insufficient_signal"
+
+    # ── (c) The boolean header is consistent with skip_reason ──
+
+    @pytest.mark.asyncio
+    async def test_boolean_header_one_when_confidence(self):
+        """VAL-M8-006 (c): ``x-moaxy-advisor-skipped == "1"`` when
+        ``x-moaxy-skip-reason == "confidence"``.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.9",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=True,
+            threshold=0.85,
+            advisor_model="adv",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The boolean header is consistent: ``"1"`` when the
+        # reason is ``"confidence"``.
+        assert headers["x-moaxy-skip-reason"] == "confidence"
+        assert headers["x-moaxy-advisor-skipped"] == "1"
+
+    @pytest.mark.asyncio
+    async def test_boolean_header_one_when_high_score(self):
+        """VAL-M8-006 (c): ``x-moaxy-advisor-skipped == "1"`` when
+        ``x-moaxy-skip-reason == "high_score"``. The legacy
+        boolean does not distinguish confidence vs score — it
+        just reports "the advisor was skipped" with a ``1``.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.4\nSCORE: 9",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="adv",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The boolean header is consistent: ``"1"`` when the
+        # reason is ``"high_score"``.
+        assert headers["x-moaxy-skip-reason"] == "high_score"
+        assert headers["x-moaxy-advisor-skipped"] == "1"
+
+    @pytest.mark.asyncio
+    async def test_boolean_header_zero_when_insufficient_signal(self):
+        """VAL-M8-006 (c): ``x-moaxy-advisor-skipped == "0"`` when
+        ``x-moaxy-skip-reason == "insufficient_signal"``. The
+        boolean is consistent with the new enum: a non-skip
+        state is reported as ``"0"``.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.5",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                _response(
+                    "ADVISOR_APPROVE",
+                    prompt_tokens=4,
+                    completion_tokens=2,
+                ),
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="adv",
+            advisor_turns=1,
+        )
+        ctx = _build_context(route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The boolean header is consistent: ``"0"`` when the
+        # reason is ``"insufficient_signal"``.
+        assert headers["x-moaxy-skip-reason"] == "insufficient_signal"
+        assert headers["x-moaxy-advisor-skipped"] == "0"
+
+    @pytest.mark.asyncio
+    async def test_boolean_header_invariant_holds_across_three_scenarios(self):
+        """VAL-M8-006 (c): the invariant
+        ``x-moaxy-advisor-skipped == "1" iff x-moaxy-skip-reason != "insufficient_signal"``
+        holds in all three scripted scenarios.
+        """
+        scenarios = [
+            # Scenario 1: confidence branch.
+            (
+                [
+                    _response("i1", prompt_tokens=1, completion_tokens=1),
+                    _response(
+                        "c1\nREFLECT_CONFIDENCE: 0.9",
+                        prompt_tokens=1,
+                        completion_tokens=1,
+                    ),
+                ],
+                _build_route(
+                    reflection_turns=1,
+                    early_exit=True,
+                    threshold=0.85,
+                    advisor_model="adv",
+                    advisor_turns=1,
+                ),
+            ),
+            # Scenario 2: high_score branch.
+            (
+                [
+                    _response("i2", prompt_tokens=1, completion_tokens=1),
+                    _response(
+                        "c2\nREFLECT_CONFIDENCE: 0.4\nSCORE: 9",
+                        prompt_tokens=1,
+                        completion_tokens=1,
+                    ),
+                    _response("r2", prompt_tokens=1, completion_tokens=1),
+                ],
+                _build_route(
+                    reflection_turns=1,
+                    early_exit=False,
+                    threshold=0.85,
+                    advisor_model="adv",
+                    advisor_turns=1,
+                ),
+            ),
+            # Scenario 3: insufficient_signal branch.
+            (
+                [
+                    _response("i3", prompt_tokens=1, completion_tokens=1),
+                    _response(
+                        "c3\nREFLECT_CONFIDENCE: 0.5",
+                        prompt_tokens=1,
+                        completion_tokens=1,
+                    ),
+                    _response("r3", prompt_tokens=1, completion_tokens=1),
+                    # ADVISOR_APPROVE → no post-advisor revision.
+                    _response(
+                        "ADVISOR_APPROVE",
+                        prompt_tokens=1,
+                        completion_tokens=1,
+                    ),
+                ],
+                _build_route(
+                    reflection_turns=1,
+                    early_exit=False,
+                    threshold=0.85,
+                    advisor_model="adv",
+                    advisor_turns=1,
+                ),
+            ),
+        ]
+        for idx, (script, route) in enumerate(scenarios, start=1):
+            adapter = ScriptedAdapter(script)
+            ctx = _build_context(route)
+            await Orchestrator(adapter).run(ctx)
+            headers = build_response_headers(ctx, request_id=ctx.request_id)
+            reason = headers["x-moaxy-skip-reason"]
+            bool_val = headers["x-moaxy-advisor-skipped"]
+            # The invariant: boolean is ``"1"`` iff the reason
+            # is NOT ``"insufficient_signal"``.
+            if reason != "insufficient_signal":
+                assert bool_val == "1", (
+                    f"scenario {idx}: expected x-moaxy-advisor-skipped="
+                    f"'1' for reason='{reason}', got '{bool_val}'"
+                )
+            else:
+                assert bool_val == "0", (
+                    f"scenario {idx}: expected x-moaxy-advisor-skipped="
+                    f"'0' for reason='{reason}', got '{bool_val}'"
+                )
+
+    # ── (d) M8 score-aware skip applies in the parallel path too ──
+
+    @pytest.mark.asyncio
+    async def test_skip_reason_high_score_in_parallel_path(self):
+        """VAL-M8-006: the score-aware skip also fires in the
+        M4 ``advisor.parallel: true`` + ``reflection.parallel: true``
+        path. The skip-reason header carries ``"high_score"`` and
+        the boolean header is ``"1"``.
+        """
+        adapter = ScriptedAdapter(
+            [
+                _response("initial", prompt_tokens=5, completion_tokens=2),
+                _response(
+                    "c\nREFLECT_CONFIDENCE: 0.4\nSCORE: 9",
+                    prompt_tokens=4,
+                    completion_tokens=6,
+                ),
+                _response("revised", prompt_tokens=4, completion_tokens=6),
+                # The advisor MUST NOT be called when the
+                # score-aware skip fires. If the parallel path
+                # attempted the advisor call, the
+                # ScriptedAdapter would raise ``IndexError``.
+            ]
+        )
+        route = _build_route(
+            reflection_turns=1,
+            early_exit=False,
+            threshold=0.85,
+            advisor_model="adv",
+            advisor_turns=1,
+        )
+        # Switch on parallel on the matched route.
+        new_reflection = route.route.reflection.model_copy(
+            update={"parallel": True}
+        )
+        new_advisor = route.advisor.model_copy(update={"parallel": True})
+        new_route_config = route.route.model_copy(
+            update={"reflection": new_reflection, "advisor": new_advisor}
+        )
+        from moaxy.routing.matcher import RouteMatch
+        parallel_route = RouteMatch(
+            route=new_route_config,
+            original_model=route.original_model,
+            resolved_model=route.resolved_model,
+            backend=route.backend,
+            path=route.path,
+            reflection=new_reflection,
+            advisor=new_advisor,
+            fallbacks=route.fallbacks,
+            retry=route.retry,
+            aliases=route.aliases,
+        )
+        ctx = _build_context(parallel_route)
+        await Orchestrator(adapter).run(ctx)
+        headers = build_response_headers(ctx, request_id=ctx.request_id)
+        # The score-aware skip fired in the parallel path too.
+        assert headers["x-moaxy-skip-reason"] == "high_score"
+        assert headers["x-moaxy-advisor-skipped"] == "1"
 

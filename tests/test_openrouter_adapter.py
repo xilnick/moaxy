@@ -1269,9 +1269,9 @@ class TestOpenRouterStreamingParity:
         assert x_moaxy["x-moaxy-advisor-score"] == "8"
         # Advisor ran (confidence 0.5 < 0.85), so the
         # advisor-model header is the configured advisor name
-        # and the skip header is "0/no".
+        # and the skip header is "0".
         assert x_moaxy["x-moaxy-advisor-model"] == "openai/gpt-4o-mini"
-        assert x_moaxy["x-moaxy-advisor-skipped"] == "0/no"
+        assert x_moaxy["x-moaxy-advisor-skipped"] == "0"
         # The trailer event is ``chat.completion.chunk``-shaped
         # so vanilla OpenAI clients see a well-formed final
         # chunk (empty delta, ``finish_reason: "stop"``) at the
@@ -1375,7 +1375,7 @@ class TestOpenRouterStreamingParity:
         # The trailer carries the skip header.
         trailer = json.loads(events[-2][1])
         x_moaxy = trailer["x_moaxy"]
-        assert x_moaxy["x-moaxy-advisor-skipped"] == "1/confidence=0.9"
+        assert x_moaxy["x-moaxy-advisor-skipped"] == "1"
         # The advisor-model header is NOT set on a skip.
         assert "x-moaxy-advisor-model" not in x_moaxy
         # Adapter call counts: 1 critique chat-call (the initial
@@ -2469,7 +2469,7 @@ class TestM5DeltasOnOpenRouter:
         # skipped).
         assert (
             response.headers["x-moaxy-advisor-skipped"]
-            == "1/confidence=0.9"
+            == "1"
         )
         assert "x-moaxy-advisor-model" not in response.headers
 
@@ -2541,7 +2541,7 @@ class TestM5DeltasOnOpenRouter:
         # The advisor was not configured for this route
         # (turns=0), so the advisor-skipped header is the
         # default 0/no.
-        assert response.headers["x-moaxy-advisor-skipped"] == "0/no"
+        assert response.headers["x-moaxy-advisor-skipped"] == "0"
 
     @pytest.mark.asyncio
     async def test_m5_020_cross_critique_advisor_prompt_on_openrouter(
@@ -2648,7 +2648,7 @@ class TestM5DeltasOnOpenRouter:
             == "anthropic/claude-3-sonnet"
         )
         # The advisor-skipped header is 0/no (advisor ran).
-        assert response.headers["x-moaxy-advisor-skipped"] == "0/no"
+        assert response.headers["x-moaxy-advisor-skipped"] == "0"
         # The OpenRouter route is observed in the alias-resolved
         # header; the request model is the original alias.
         assert (
