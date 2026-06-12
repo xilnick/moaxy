@@ -1005,6 +1005,247 @@ routes:
         assert "trust_score" in str(exc.value)
 
 
+# ── ReflectionConfig M8 fresh_context field ──────────────────────────────
+
+
+class TestReflectionConfigM8FreshContext:
+    """M8 delta 1: ``ReflectionConfig.fresh_context: bool = False``.
+
+    When ``True``, the critique prompt is built from the candidate answer
+    only, with no original system prompt or chat history. The default
+    (``False``) preserves the v1-v7 behaviour. The field is opt-in; loading
+    a YAML config that omits the field is equivalent to loading one with
+    ``fresh_context: false``.
+
+    See ``m8-reflection-fresh-context-config`` in features.json and the
+    "M8 Component Changes > ReflectionConfig.fresh_context" section of
+    architecture.md. The contract assertion VAL-M8-001 pins this exact
+    behaviour.
+    """
+
+    # ── (a) Default: ReflectionConfig(turns=1).fresh_context is False ──
+
+    def test_default_fresh_context_is_false(self):
+        # The most literal statement of the contract: a fresh
+        # ReflectionConfig(turns=1) must report ``fresh_context is False``.
+        r = ReflectionConfig(turns=1)
+        assert r.fresh_context is False
+
+    def test_default_fresh_context_false_when_turns_zero(self):
+        r = ReflectionConfig()
+        assert r.fresh_context is False
+
+    def test_default_fresh_context_false_alongside_other_fields(self):
+        # Default off even when other fields are explicitly set; the
+        # default must be stable independent of the rest of the config.
+        r = ReflectionConfig(
+            turns=2,
+            early_exit=False,
+            threshold=0.5,
+            parallel=True,
+            system_prompt="be terse",
+            order="advise_first",
+            trust_verbal=0.7,
+            trust_score=0.3,
+        )
+        assert r.fresh_context is False
+
+    # ── (b) ReflectionConfig(turns=1, fresh_context=True).fresh_context is True ──
+
+    def test_fresh_context_true_accepted(self):
+        # The exact contract assertion: passing fresh_context=True makes
+        # the attribute read back as True.
+        r = ReflectionConfig(turns=1, fresh_context=True)
+        assert r.fresh_context is True
+
+    def test_fresh_context_true_with_minimal_config(self):
+        r = ReflectionConfig(fresh_context=True)
+        assert r.fresh_context is True
+
+    def test_fresh_context_false_explicit(self):
+        # The explicit-False path mirrors the explicit-True path; this
+        # guards against the default being driven by a truthiness check
+        # somewhere in the validator.
+        r = ReflectionConfig(turns=1, fresh_context=False)
+        assert r.fresh_context is False
+
+    def test_fresh_context_default_preserved_for_yaml_omission(
+        self, tmp_path, monkeypatch
+    ):
+        # The M8 contract: "Loading a YAML config without the field is
+        # equivalent to fresh_context: false". This is the integration
+        # statement of the opt-in invariant.
+        monkeypatch.delenv("MOAXY_CONFIG_PATH", raising=False)
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            """
+backends:
+  - name: b
+    adapter: ollama
+    base_url: http://127.0.0.1:11434
+routes:
+  - name: r
+    match: {model: "*", path: "/v1/chat/completions"}
+    reflection:
+      turns: 1
+""",
+            encoding="utf-8",
+        )
+        from moaxy.config import load_config
+
+        cfg = load_config(path=path)
+        assert cfg.routes[0].reflection.fresh_context is False
+
+    # ── (c) Pydantic JSON schema includes fresh_context as a boolean field ──
+
+    def test_json_schema_includes_fresh_context(self):
+        # The Pydantic v2 JSON schema must advertise ``fresh_context``
+        # as a boolean field, otherwise downstream tooling (e.g. a UI
+        # generator) would not see the new option.
+        schema = ReflectionConfig.model_json_schema()
+        properties = schema.get("properties") or {}
+        assert "fresh_context" in properties, (
+            "ReflectionConfig JSON schema must declare a 'fresh_context' property"
+        )
+        field_schema = properties["fresh_context"]
+        assert field_schema.get("type") == "boolean", (
+            f"fresh_context must be typed as 'boolean' in the JSON schema; "
+            f"got {field_schema.get('type')!r}"
+        )
+
+    def test_json_schema_fresh_context_default_is_false(self):
+        # Pydantic v2 surfaces the default in the JSON schema. The M8
+        # invariant is "default off preserves M1-M7 behaviour", so the
+        # schema's default must be false.
+        schema = ReflectionConfig.model_json_schema()
+        field_schema = schema["properties"]["fresh_context"]
+        assert field_schema.get("default") is False
+
+    def test_json_schema_fresh_context_title(self):
+        # Pydantic-derived field name is the property key; this is a
+        # belt-and-braces assertion that the property key matches the
+        # python attribute name.
+        schema = ReflectionConfig.model_json_schema()
+        assert "fresh_context" in schema["properties"]
+
+    # ── model_dump / round-trip ─────────────────────────────────────────
+
+    def test_model_dump_includes_fresh_context(self):
+        # The Pydantic v2 ``model_dump`` includes the new field so that
+        # callers that serialize configs (e.g. for logging) see it.
+        r = ReflectionConfig(turns=1)
+        dumped = r.model_dump()
+        assert "fresh_context" in dumped
+        assert dumped["fresh_context"] is False
+
+    def test_model_dump_with_fresh_context_true(self):
+        r = ReflectionConfig(turns=1, fresh_context=True)
+        dumped = r.model_dump()
+        assert dumped["fresh_context"] is True
+
+    def test_model_dump_round_trip_default(self):
+        r = ReflectionConfig(turns=1)
+        r2 = ReflectionConfig(**r.model_dump())
+        assert r2.fresh_context is False
+        assert r2.turns == 1
+
+    def test_model_dump_round_trip_true(self):
+        r = ReflectionConfig(turns=1, fresh_context=True)
+        r2 = ReflectionConfig(**r.model_dump())
+        assert r2.fresh_context is True
+
+    def test_model_dump_json_round_trip_true(self):
+        # Round-trip through JSON to mimic config-file semantics.
+        import json
+
+        r = ReflectionConfig(turns=1, fresh_context=True)
+        encoded = json.dumps(r.model_dump())
+        reloaded = ReflectionConfig(**json.loads(encoded))
+        assert reloaded.fresh_context is True
+        assert reloaded.turns == 1
+
+    def test_yaml_load_with_fresh_context_true(self, tmp_path, monkeypatch):
+        # End-to-end: a YAML config that sets fresh_context: true is
+        # loaded into a typed ReflectionConfig with fresh_context=True.
+        monkeypatch.delenv("MOAXY_CONFIG_PATH", raising=False)
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            """
+backends:
+  - name: b
+    adapter: ollama
+    base_url: http://127.0.0.1:11434
+routes:
+  - name: r
+    match: {model: "*", path: "/v1/chat/completions"}
+    reflection:
+      turns: 1
+      fresh_context: true
+""",
+            encoding="utf-8",
+        )
+        from moaxy.config import load_config
+
+        cfg = load_config(path=path)
+        assert cfg.routes[0].reflection.fresh_context is True
+
+    def test_yaml_load_with_fresh_context_false_explicit(self, tmp_path, monkeypatch):
+        # The explicit-false YAML path: fresh_context: false is honoured.
+        monkeypatch.delenv("MOAXY_CONFIG_PATH", raising=False)
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            """
+backends:
+  - name: b
+    adapter: ollama
+    base_url: http://127.0.0.1:11434
+routes:
+  - name: r
+    match: {model: "*", path: "/v1/chat/completions"}
+    reflection:
+      turns: 1
+      fresh_context: false
+""",
+            encoding="utf-8",
+        )
+        from moaxy.config import load_config
+
+        cfg = load_config(path=path)
+        assert cfg.routes[0].reflection.fresh_context is False
+
+    def test_yaml_load_without_fresh_context_defaults_to_false(
+        self, tmp_path, monkeypatch
+    ):
+        # The omission path: no fresh_context key in the YAML.
+        monkeypatch.delenv("MOAXY_CONFIG_PATH", raising=False)
+        path = tmp_path / "cfg.yaml"
+        path.write_text(
+            """
+backends:
+  - name: b
+    adapter: ollama
+    base_url: http://127.0.0.1:11434
+routes:
+  - name: r
+    match: {model: "*", path: "/v1/chat/completions"}
+    reflection:
+      turns: 1
+""",
+            encoding="utf-8",
+        )
+        from moaxy.config import load_config
+
+        cfg = load_config(path=path)
+        assert cfg.routes[0].reflection.fresh_context is False
+
+    def test_fresh_context_does_not_break_extra_forbid(self):
+        # The base class has ``extra='forbid'``; the new field is part
+        # of the declared schema, not an extra. This is a regression
+        # guard: a typo ``fresh_contex`` must still be rejected.
+        with pytest.raises(ValidationError):
+            ReflectionConfig(turns=1, fresh_contex=True)  # type: ignore[call-arg]
+
+
 # ── AdvisorConfig ─────────────────────────────────────────────────────────
 
 
